@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0f1115" />
+  <meta name="description" content="Turn every camera on your phone into a 3D scanner. Capture from all lenses at once and build textured meshes of rooms, people and objects, entirely on your device." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icons/icon-192.png" type="image/png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>Phonogeometry</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/three.module.min.js",
+        "three/addons/controls/OrbitControls.js": "./vendor/three/OrbitControls.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◈</span> Phonogeometry</div>
+    <div class="topbar-actions">
+      <button id="btn-help" class="icon-btn" title="How to scan" aria-label="Help">?</button>
+      <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <!-- ============ Capture ============ -->
+  <main id="screen-capture" class="screen">
+    <section class="panel">
+      <div class="row space-between">
+        <div class="segmented" id="preset" role="radiogroup" aria-label="What are you scanning?">
+          <button data-preset="object" class="active" role="radio" aria-checked="true">Object</button>
+          <button data-preset="person" role="radio" aria-checked="false">Person</button>
+          <button data-preset="room" role="radio" aria-checked="false">Room</button>
+        </div>
+        <label class="quality">Quality
+          <select id="quality">
+            <option value="fast">Fast</option>
+            <option value="balanced" selected>Balanced</option>
+            <option value="high">High</option>
+          </select>
+        </label>
+      </div>
+      <p id="preset-tip" class="tip">Walk slowly around the object and capture every 20–30° with plenty of overlap. Aim for 12–30 shots.</p>
+    </section>
+
+    <section class="panel cameras">
+      <div class="row space-between">
+        <h2>Cameras <span id="camera-count" class="badge">0</span></h2>
+        <button id="btn-start-cameras" class="primary small">Enable all cameras</button>
+      </div>
+      <p id="camera-status" class="status">Tap “Enable all cameras” to discover every lens on this phone.</p>
+      <div id="camera-grid" class="camera-grid"></div>
+    </section>
+
+    <section class="panel shots">
+      <div class="row space-between">
+        <h2>Shots <span id="shot-count" class="badge">0</span> <span class="muted" id="frame-count"></span></h2>
+        <div class="row gap">
+          <button id="btn-import" class="ghost small">Import photos</button>
+          <input id="file-import" type="file" accept="image/*" multiple hidden />
+          <button id="btn-clear" class="ghost small danger">Clear</button>
+        </div>
+      </div>
+      <div id="thumbs" class="thumbs"></div>
+    </section>
+  </main>
+
+  <footer id="capture-bar" class="capture-bar">
+    <button id="btn-reconstruct" class="primary big" disabled>Build 3D mesh</button>
+    <button id="btn-capture" class="shutter" title="Capture from all cameras" aria-label="Capture from all cameras" disabled><span></span></button>
+    <div class="spacer"></div>
+  </footer>
+
+  <!-- ============ Processing ============ -->
+  <main id="screen-process" class="screen" hidden>
+    <section class="panel center">
+      <h2 id="progress-stage">Preparing…</h2>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <p id="progress-message" class="status"></p>
+      <details>
+        <summary>Details</summary>
+        <pre id="progress-log"></pre>
+      </details>
+      <button id="btn-cancel" class="ghost danger">Cancel</button>
+    </section>
+  </main>
+
+  <!-- ============ Viewer ============ -->
+  <main id="screen-view" class="screen viewer-screen" hidden>
+    <div id="viewer" class="viewer"></div>
+    <div class="viewer-toolbar">
+      <div class="segmented" id="view-mode">
+        <button data-mode="solid" class="active">Color</button>
+        <button data-mode="shaded">Shaded</button>
+        <button data-mode="wire">Wire</button>
+        <button data-mode="normals">Normals</button>
+      </div>
+      <div class="row gap wrap">
+        <label class="check"><input type="checkbox" id="chk-points" /> Sparse points</label>
+        <label class="check"><input type="checkbox" id="chk-cameras" checked /> Cameras</label>
+        <label class="check"><input type="checkbox" id="chk-grid" checked /> Grid</label>
+        <button id="btn-fit" class="ghost small">Reset view</button>
+      </div>
+      <div id="stats" class="stats"></div>
+      <div class="row gap wrap">
+        <button id="btn-export-glb" class="primary small">Download GLB</button>
+        <button id="btn-export-ply" class="ghost small">PLY</button>
+        <button id="btn-export-obj" class="ghost small">OBJ</button>
+        <button id="btn-share" class="ghost small" hidden>Share</button>
+      </div>
+      <div class="row gap wrap">
+        <button id="btn-back-capture" class="ghost small">Add more shots</button>
+        <button id="btn-new-scan" class="ghost small danger">New scan</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ============ Settings ============ -->
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <h3>Camera lenses</h3>
+      <p class="tip">Browsers do not report focal lengths, so each camera is mapped to a lens type that sets its field of view. Fix any that are wrong: it improves accuracy.</p>
+      <div id="lens-settings" class="lens-settings"><p class="muted">Enable cameras first.</p></div>
+      <h3>Capture</h3>
+      <label class="field">Capture resolution (long side)
+        <select id="capture-res">
+          <option value="960">960 px (fastest)</option>
+          <option value="1280" selected>1280 px</option>
+          <option value="1920">1920 px</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="chk-sequential" checked /> If a camera cannot stream at the same time as the others, switch to it and capture sequentially</label>
+      <div class="row gap end">
+        <button value="close" class="primary">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="help">
+    <form method="dialog">
+      <h2>How to scan</h2>
+      <ol class="help-list">
+        <li><strong>Enable all cameras.</strong> Every lens the browser exposes (wide, ultra-wide, telephoto, front) shows up as a tile. Each shot captures from all of them at once, so one press covers more of the scene and gives both wide context and sharp detail.</li>
+        <li><strong>Move, then shoot.</strong> Change your position between shots by roughly 20–30° around an object or person, or step sideways about a metre in a room. Parallax from movement is what makes the 3D.</li>
+        <li><strong>Overlap and texture.</strong> Each shot should share at least half of its view with the previous one. Plain white walls and glossy surfaces reconstruct poorly; patterned and matte surfaces reconstruct well.</li>
+        <li><strong>Hold still.</strong> People should stay still while you walk around them. Avoid moving objects.</li>
+        <li><strong>Build.</strong> Processing runs entirely on the phone. Fast quality takes under a minute for a dozen shots; High can take several minutes.</li>
+        <li><strong>Export.</strong> Download GLB (opens in most 3D viewers and AR apps), PLY or OBJ. Scale is arbitrary because a single phone cannot measure absolute size.</li>
+      </ol>
+      <div class="row gap end"><button value="close" class="primary">Got it</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="flash" class="flash" hidden></div>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>

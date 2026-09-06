@@ -1,0 +1,15 @@
+{
+  "name": "phonogeometry",
+  "version": "0.1.0",
+  "description": "Turn every camera on your phone into a 3D scanner: capture from all lenses at once and reconstruct textured meshes of rooms, people and objects, entirely in the browser.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "start:https": "node server.js --https",
+    "test": "node --test \"test/**/*.test.js\"",
+    "icons": "node tools/make-icons.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT",
+  "private": true
+}
