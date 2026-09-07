@@ -2,7 +2,8 @@
 import { CameraManager } from './camera/cameraManager.js';
 import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
 import { readExifFov } from './camera/exif.js';
-import { QUALITY } from './pipeline/reconstruct.js';
+import { rgbaToGray, sharpness } from './vision/image.js';
+import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
 import { toGLB, toPLY, toOBJ, toPointCloudPLY } from './mesh/exporters.js';
 import { ShotStore } from './storage.js';
 
@@ -144,6 +145,18 @@ function renderLensSettings() {
 }
 
 // ---------- Shots ----------
+/** Sharpness of a captured frame, measured on a small copy so it costs nothing. */
+function measureSharpness(canvas) {
+  const t = document.createElement('canvas');
+  const s = Math.min(1, 320 / Math.max(canvas.width, canvas.height));
+  t.width = Math.max(16, Math.round(canvas.width * s));
+  t.height = Math.max(16, Math.round(canvas.height * s));
+  const ctx = t.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, t.width, t.height);
+  const data = ctx.getImageData(0, 0, t.width, t.height).data;
+  return sharpness(rgbaToGray(data, t.width, t.height), t.width, t.height);
+}
+
 function makeThumb(canvas) {
   const t = document.createElement('canvas');
   const s = 168 / Math.max(canvas.width, canvas.height);
@@ -167,12 +180,15 @@ async function captureShot() {
     const frames = [];
     for (const g of grabbed) {
       const blob = await canvasToBlob(g.canvas);
-      frames.push({ blob, thumbUrl: makeThumb(g.canvas), width: g.width, height: g.height, f: g.f, cx: g.cx, cy: g.cy, label: g.cameraLabel, lens: g.lens, key: g.cameraKey, hfov: g.hfov });
+      frames.push({ blob, thumbUrl: makeThumb(g.canvas), width: g.width, height: g.height, f: g.f, cx: g.cx, cy: g.cy, label: g.cameraLabel, lens: g.lens, key: g.cameraKey, hfov: g.hfov, sharpness: measureSharpness(g.canvas) });
     }
     const shot = { id: `shot-${Date.now()}`, createdAt: Date.now(), frames };
     state.shots.push(shot);
     store.saveShot(shot);
+    flagSoftFrames();
     renderShots(); updateCounts();
+    const blurry = frames.filter((f) => f.soft).length;
+    if (blurry) toast(`${blurry === frames.length ? 'That shot looks' : `${blurry} of those frames look`} blurry. Hold still and shoot again.`, 4000);
     if (navigator.vibrate) navigator.vibrate(15);
     $('#camera-status').textContent = `Shot ${state.shots.length}: ${frames.length} frame${frames.length === 1 ? '' : 's'} from ${frames.map((f) => f.label).join(', ')}.`;
   } catch (err) {
@@ -197,7 +213,7 @@ async function importFiles(files) {
       const exif = await readExifFov(file);
       const lens = 'unknown';
       const intr = intrinsicsFor({ lens, hfovOverride: exif?.hfov || null }, canvas.width, canvas.height, 1);
-      frames.push({ blob: await canvasToBlob(canvas), thumbUrl: makeThumb(canvas), width: canvas.width, height: canvas.height, ...intr, label: file.name.replace(/\.[^.]+$/, '').slice(0, 14), lens: exif ? `${exif.focal35}mm eq.` : lens, key: 'import' });
+      frames.push({ blob: await canvasToBlob(canvas), thumbUrl: makeThumb(canvas), width: canvas.width, height: canvas.height, ...intr, label: file.name.replace(/\.[^.]+$/, '').slice(0, 14), lens: exif ? `${exif.focal35}mm eq.` : lens, key: 'import', sharpness: measureSharpness(canvas) });
     } catch (err) {
       toast(`Could not read ${file.name}: ${err.message}`);
     }
@@ -208,8 +224,10 @@ async function importFiles(files) {
     state.shots.push(shot);
     store.saveShot(shot);
   }
+  flagSoftFrames();
   renderShots(); updateCounts();
-  toast(`Imported ${frames.length} photo${frames.length === 1 ? '' : 's'}`);
+  const blurry = state.shots.flatMap((sh) => sh.frames).filter((f) => f.soft).length;
+  toast(`Imported ${frames.length} photo${frames.length === 1 ? '' : 's'}` + (blurry ? ` · ${blurry === 1 ? 'one looks' : `${blurry} look`} blurry` : ''));
 }
 
 function renderShots() {
@@ -221,11 +239,21 @@ function renderShots() {
     row.innerHTML = `<span class="shot-index">${i + 1}</span><div class="shot-frames"></div><button class="shot-delete" title="Delete shot" aria-label="Delete shot">×</button>`;
     const fr = row.querySelector('.shot-frames');
     for (const f of shot.frames) {
-      fr.insertAdjacentHTML('beforeend', `<div class="thumb"><img src="${f.thumbUrl}" alt="${f.label}"><span class="thumb-label">${f.label}</span></div>`);
+      const flags = [];
+      if (f.soft) flags.push('<span class="thumb-flag warn" title="This frame is much blurrier than the others. Retaking it will help.">blurry</span>');
+      if (f.used === false) flags.push('<span class="thumb-flag bad" title="This frame could not be placed in the model.">unused</span>');
+      fr.insertAdjacentHTML('beforeend', `<div class="thumb${f.used === false ? ' unused' : ''}"><img src="${f.thumbUrl}" alt="${f.label}"><span class="thumb-label">${f.label}</span>${flags.join('')}</div>`);
     }
     row.querySelector('.shot-delete').addEventListener('click', () => { store.deleteShot(shot.id); state.shots.splice(i, 1); renderShots(); updateCounts(); });
     box.appendChild(row);
   });
+}
+
+/** Mark frames that are much softer than the others taken with the same camera. */
+function flagSoftFrames() {
+  const all = state.shots.flatMap((sh) => sh.frames).filter((f) => typeof f.sharpness === 'number');
+  if (all.length < 3) return;
+  markSoftFrames(all);
 }
 
 async function restoreShots() {
@@ -328,6 +356,17 @@ async function showResult(result, seconds) {
     state.viewer.setLayer('grid', $('#chk-grid').checked);
   }
   const s = result.stats;
+  if (s.frames) {
+    const byId = new Map(s.frames.map((f) => [f.id, f]));
+    let k2 = 0;
+    for (const shot of state.shots) for (const f of shot.frames) {
+      const info = byId.get(`img-${k2++}`);
+      if (info) { f.used = info.used; f.soft = info.soft; }
+    }
+    renderShots();
+    const unused = s.frames.filter((f) => !f.used);
+    if (unused.length) setProgressLog(`Not placed in the model: ${unused.map((f) => f.label || f.id).join(', ')}`);
+  }
   $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span><span><b>${s.triangles.toLocaleString()}</b> triangles</span><span><b>${s.vertices.toLocaleString()}</b> vertices</span><span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span><span><b>${seconds.toFixed(0)}s</b></span>`;
   if (s.rig?.length) {
     setProgressLog(`Camera rig: ` + s.rig.map((r2) => `${r2.camera} tied to the reference camera from ${r2.shots} shots (${r2.spreadDeg.toFixed(1)}° spread)`).join('; '));

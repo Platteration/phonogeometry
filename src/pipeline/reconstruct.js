@@ -1,6 +1,6 @@
 // End-to-end reconstruction pipeline: images -> features -> matches -> SfM ->
 // plane-sweep depth -> TSDF fusion -> mesh. Platform agnostic (runs in a Worker or Node).
-import { rgbaToGray, resizeGray, resizeRGBA, undistortGray, undistortRGBA } from '../vision/image.js';
+import { rgbaToGray, resizeGray, resizeRGBA, undistortGray, undistortRGBA, sharpness } from '../vision/image.js';
 import { extractORB } from '../vision/orb.js';
 import { matchDescriptors } from '../vision/match.js';
 import { runSfM } from '../vision/sfm.js';
@@ -64,6 +64,35 @@ export function opticalAxesFocus(cameras, centers) {
   // Converging axes pass close to the focus; diverging (room) scans do not.
   if (front < 0.8 * n || meanOffset > 0.35 * meanDistance) return null;
   return { point: P, meanDistance, meanOffset };
+}
+
+/**
+ * Flag frames that are much softer than the others taken with the same camera. Frames are
+ * compared within a camera because different lenses see different things: an ultra-wide
+ * frame of a whole room and a telephoto frame of one object have different amounts of
+ * detail without either being blurred.
+ * @param items objects with `sharpness` and a camera key (`rigKey`, `focalGroup` or `key`)
+ * @param threshold fraction of the camera's median below which a frame counts as soft
+ */
+export function markSoftFrames(items, threshold = 0.7) {
+  const groups = new Map();
+  for (const it of items) {
+    if (typeof it.sharpness !== 'number') continue;
+    const key = it.rigKey ?? it.focalGroup ?? it.key ?? '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
+  }
+  const all = items.filter((it) => typeof it.sharpness === 'number');
+  const globalMedian = all.length ? all.map((it) => it.sharpness).sort((a, b) => a - b)[all.length >> 1] : 0;
+  for (const list of groups.values()) {
+    // Too few frames from this camera to judge it on its own, so use them all
+    const basis = list.length >= 3 ? list.map((it) => it.sharpness).sort((a, b) => a - b)[list.length >> 1] : globalMedian;
+    for (const it of list) {
+      it.softReference = basis;
+      it.soft = basis > 0 && it.sharpness < threshold * basis;
+    }
+  }
+  return items;
 }
 
 function percentile(sortedArr, p) {
@@ -135,6 +164,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const grayFull = rgbaToGray(im.rgba, im.width, im.height);
     const gray = resizeGray(grayFull, im.width, im.height, fw, fh);
     const sx = fw / im.width, sy = fh / im.height;
+    const sharp = sharpness(gray, fw, fh);
     const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures });
     frames.push({
       id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
@@ -142,9 +172,23 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
       width: fw, height: fh, gray, fullW: im.width, fullH: im.height, rgba: im.rgba,
       f: im.f * sx, cx: (im.cx + 0.5) * sx - 0.5, cy: (im.cy + 0.5) * sy - 0.5,
       keypoints: feat.keypoints, count: feat.count, descriptors: feat.descriptors,
+      sharpness: sharp,
       global: globalDescriptor(gray, fw, fh),
     });
-    log(`Frame ${i} (${im.label || im.id}): ${feat.count} features at ${fw}x${fh}`);
+    log(`Frame ${i} (${im.label || im.id}): ${feat.count} features at ${fw}x${fh}, sharpness ${sharp.toFixed(2)}`);
+  }
+
+  // Warn about frames that are much softer than the rest. A blurred frame in the middle of a
+  // sequence often fails to match its neighbours, which breaks the chain of images and can
+  // strand everything on the far side of it: a single frame blurred by three pixels was
+  // measured to cut the number of registered frames in half.
+  markSoftFrames(frames);
+  {
+    const soft = frames.filter((fr) => fr.soft);
+    if (soft.length) {
+      log(`Warning: ${soft.length} frame(s) look blurred next to the others from the same camera ` +
+        `(${soft.map((fr) => `${fr.label || fr.id}: ${fr.sharpness.toFixed(2)} against ${fr.softReference.toFixed(2)}`).join(', ')}). Retaking those shots would help.`);
+    }
   }
 
   // 2. Matching
@@ -371,6 +415,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     stats: {
       images: images.length, registered: sfm.registeredCount, sparsePoints: nSparse, densePoints: nDense,
       rig: (sfm.rig || []).map((r2) => ({ camera: String(r2.key), shots: r2.shots, spreadDeg: r2.spreadDeg })),
+      frames: frames.map((fr, i) => ({ id: fr.id, label: fr.label, used: !!sfm.cameras[i], sharpness: fr.sharpness, soft: !!fr.soft })),
       intrinsics: frames.map((fr, i) => (sfm.cameras[i] ? { label: fr.label, focalPx: fr.f * (fr.fullW / fr.width), k1: fr.k1 || 0 } : null)).filter(Boolean),
       depthMaps: haveDepth.length, vertices: nv, triangles: mesh.indices.length / 3,
       seconds: (Date.now() - t0) / 1000, voxelSize: vol.voxelSize, volumeDims: Array.from(vol.dims),

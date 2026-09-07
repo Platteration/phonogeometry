@@ -13,11 +13,19 @@ function asWords(desc) {
 
 /**
  * Match descriptors A (na x 32 bytes) against B (nb x 32 bytes).
- * @returns {Int32Array} flat pairs [ia, ib, ia, ib, ...] surviving ratio test and mutual best check.
+ *
+ * Filtering is Lowe's ratio test, a Hamming distance bound and a mutual nearest-neighbour
+ * check. Relaxing the ratio test roughly doubles the number of image pairs that pass
+ * geometric verification, which looks like a win pair by pair, but it was measured to wreck
+ * the reconstruction: the extra wrong matches chain unrelated features into the same track
+ * and the track graph collapses. Keep it strict.
+ *
+ * @returns {Int32Array} flat pairs [ia, ib, ia, ib, ...]
  */
 export function matchDescriptors(descA, na, descB, nb, opts = {}) {
   const ratio = opts.ratio ?? 0.8;
   const maxDist = opts.maxDist ?? 64;
+  const crossCheck = opts.crossCheck !== false;
   const A = asWords(descA), B = asWords(descB);
   const bestB = new Int32Array(na).fill(-1);
   const bestBd = new Int32Array(na).fill(1e9);
@@ -43,8 +51,8 @@ export function matchDescriptors(descA, na, descB, nb, opts = {}) {
   for (let i = 0; i < na; i++) {
     const j = bestB[i];
     if (j < 0 || bestBd[i] > maxDist) continue;
-    if (bestBd[i] > ratio * secondBd[i]) continue;
-    if (bestA[j] !== i) continue;
+    if (ratio < 1 && bestBd[i] > ratio * secondBd[i]) continue;
+    if (crossCheck && bestA[j] !== i) continue;
     out.push(i, j);
   }
   return Int32Array.from(out);

@@ -29,6 +29,15 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   `planeSweepGPU` (WebGL2, identical semantics).
 - `src/mesh/` TSDF, surface nets, mesh utilities, exporters (GLB/PLY/OBJ/point PLY).
 
+## Measured behaviour worth knowing
+
+- Relaxing the descriptor ratio test doubles the image pairs that pass geometric verification
+  but wrecks the reconstruction, because the extra wrong matches chain unrelated features into
+  one track. Pairwise metrics mislead here: judge matching changes end to end.
+- One frame blurred by three pixels roughly halves the number of frames that register, so
+  frames are scored for sharpness and flagged rather than silently ruining a scan.
+- Balanced quality is markedly more accurate than fast on the same input, not just denser.
+
 ## Conventions
 
 - Camera model: `Xc = R Xw + t`, pixel = `c + f * distort(Xc.xy / Xc.z)` with

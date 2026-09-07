@@ -186,3 +186,27 @@ test('end-to-end: front and back cameras fired together cover a whole room', asy
   const relSpanNo = spanOf(withoutRig) / scaleOf(withoutRig);
   assert.ok(relSpan > relSpanNo * 1.3, `depth coverage ${relSpan.toFixed(2)} vs ${relSpanNo.toFixed(2)} camera-path units`);
 });
+
+test('a blurred frame is flagged, per camera', async () => {
+  const { markSoftFrames } = await import('../src/pipeline/reconstruct.js');
+  // An ultra-wide sees a whole room and a telephoto one object, so their sharpness differs
+  // for reasons that are not blur. Comparison must stay inside each camera.
+  const items = [
+    ...[9.0, 9.4, 8.7, 9.1].map((v, i) => ({ id: `w${i}`, rigKey: 'wide', sharpness: v })),
+    ...[3.0, 3.2, 2.9, 1.4].map((v, i) => ({ id: `t${i}`, rigKey: 'tele', sharpness: v })),
+  ];
+  markSoftFrames(items);
+  assert.deepEqual(items.filter((i) => i.soft).map((i) => i.id), ['t3'],
+    'only the frame that is soft compared with its own camera should be flagged');
+  // With one camera, everything is judged together
+  const single = [5.0, 5.2, 4.9, 2.0].map((v, i) => ({ id: `s${i}`, rigKey: 'only', sharpness: v }));
+  markSoftFrames(single);
+  assert.deepEqual(single.filter((i) => i.soft).map((i) => i.id), ['s3']);
+  // Fewer than three frames from a camera: fall back to the whole set
+  const mixed = [
+    ...[6.0, 6.1, 5.9].map((v, i) => ({ id: `a${i}`, rigKey: 'a', sharpness: v })),
+    { id: 'b0', rigKey: 'b', sharpness: 2.0 },
+  ];
+  markSoftFrames(mixed);
+  assert.ok(mixed.find((i) => i.id === 'b0').soft);
+});

@@ -4,12 +4,6 @@ import { ransacEssential, recoverPose, triangulate, poseMatrix, ransacPnP, refin
 import { cameraCenter, transpose, matMul, matVec, cross, dot, relativePose, closestRotation, matToRotvec, similarityTransform } from './linalg.js';
 import { bundleAdjust } from './ba.js';
 
-class UnionFind {
-  constructor(n) { this.p = new Int32Array(n); for (let i = 0; i < n; i++) this.p[i] = i; }
-  find(a) { while (this.p[a] !== a) { this.p[a] = this.p[this.p[a]]; a = this.p[a]; } return a; }
-  union(a, b) { a = this.find(a); b = this.find(b); if (a !== b) this.p[b] = a; }
-}
-
 /**
  * @param frames [{f, cx, cy, width, height, keypoints: Float32Array, count}]
  * @param pairs [{i, j, matches: Int32Array}]
@@ -71,36 +65,19 @@ export function runSfM(frames, pairs, opts = {}) {
   log(`Verified ${goodPairs.length}/${pairs.length} image pairs`);
   if (goodPairs.length === 0) return { cameras: frames.map(() => null), points: new Float64Array(0), tracks: [], registeredCount: 0, error: 'No image pair with enough geometrically consistent matches' };
 
-  // Feature tracks
+  // Feature tracks. A track collects keypoints of one scene point across images, so it may
+  // never hold two keypoints of the same image. Rather than building tracks blindly and
+  // discarding the ones that turn out to conflict, which throws away good observations
+  // whenever a few wrong matches chain unrelated features together, conflicting merges are
+  // refused as the tracks are built. Stronger image pairs are merged first so that the most
+  // reliable matches decide the structure.
   const offsets = new Int32Array(nf + 1);
   for (let i = 0; i < nf; i++) offsets[i + 1] = offsets[i] + frames[i].count;
-  const uf = new UnionFind(offsets[nf]);
-  for (const gp of goodPairs) {
-    for (let m = 0; m < gp.inliers.length; m += 2) uf.union(offsets[gp.i] + gp.inliers[m], offsets[gp.j] + gp.inliers[m + 1]);
-  }
-  const rootToTrack = new Map();
-  const tracks = []; // {obs: [{frame, kp, ok}], point: Float64Array|null, bad: boolean}
+  const tracks = []; // {obs: [{frame, kp, ok}], point, bad, frames}
   const nodeTrack = new Int32Array(offsets[nf]).fill(-1);
-  for (const gp of goodPairs) {
-    for (let m = 0; m < gp.inliers.length; m += 2) {
-      for (const [fr, kp] of [[gp.i, gp.inliers[m]], [gp.j, gp.inliers[m + 1]]]) {
-        const node = offsets[fr] + kp;
-        if (nodeTrack[node] >= 0) continue;
-        const root = uf.find(node);
-        let tid = rootToTrack.get(root);
-        if (tid === undefined) { tid = tracks.length; tracks.push({ obs: [], point: null, bad: false, frames: new Set() }); rootToTrack.set(root, tid); }
-        const tr = tracks[tid];
-        if (tr.frames.has(fr)) tr.bad = true; // two keypoints of one image in the same track
-        tr.frames.add(fr);
-        tr.obs.push({ frame: fr, kp, ok: false });
-        nodeTrack[node] = tid;
-      }
-    }
-  }
-  for (const tr of tracks) if (tr.obs.length < 2) tr.bad = true;
-  log(`Built ${tracks.filter((t) => !t.bad).length} feature tracks`);
+  let refusedMerges = 0;
 
-  /** Merge the inlier matches of a newly verified pair into the existing tracks. */
+  /** Add the verified matches of one image pair to the tracks, refusing conflicts. */
   function addPairToTracks(gp) {
     for (let m = 0; m < gp.inliers.length; m += 2) {
       const na = offsets[gp.i] + gp.inliers[m], nb = offsets[gp.j] + gp.inliers[m + 1];
@@ -108,25 +85,32 @@ export function runSfM(frames, pairs, opts = {}) {
       if (ta >= 0 && ta === tb) continue;
       if (ta < 0 && tb < 0) {
         const tid = tracks.length;
-        tracks.push({ obs: [{ frame: gp.i, kp: gp.inliers[m], ok: false }, { frame: gp.j, kp: gp.inliers[m + 1], ok: false }], point: null, bad: false, frames: new Set([gp.i, gp.j]) });
+        tracks.push({
+          obs: [{ frame: gp.i, kp: gp.inliers[m], ok: false }, { frame: gp.j, kp: gp.inliers[m + 1], ok: false }],
+          point: null, bad: false, frames: new Set([gp.i, gp.j]),
+        });
         nodeTrack[na] = tid; nodeTrack[nb] = tid;
         continue;
       }
       if (ta >= 0 && tb >= 0) {
-        // merge tb into ta (a track may not contain two keypoints of one frame)
         const A = tracks[ta], B = tracks[tb];
-        for (const fr of B.frames) if (A.frames.has(fr)) A.bad = true;
+        let clash = false;
+        for (const fr of B.frames) if (A.frames.has(fr)) { clash = true; break; }
+        if (clash) { refusedMerges++; continue; }
         for (const o of B.obs) { A.obs.push(o); A.frames.add(o.frame); nodeTrack[offsets[o.frame] + o.kp] = ta; }
-        B.bad = true; B.obs = []; B.point = null;
-        if (A.bad) A.point = null;
+        B.obs = []; B.frames = new Set(); B.bad = true; B.point = null;
         continue;
       }
       const [tid, node, fr, kp] = ta >= 0 ? [ta, nb, gp.j, gp.inliers[m + 1]] : [tb, na, gp.i, gp.inliers[m]];
       const T = tracks[tid];
-      if (T.frames.has(fr)) { T.bad = true; T.point = null; continue; }
+      if (T.frames.has(fr)) { refusedMerges++; continue; }
       T.frames.add(fr); T.obs.push({ frame: fr, kp, ok: false }); nodeTrack[node] = tid;
     }
   }
+
+  for (const gp of goodPairs.slice().sort((a, b) => b.count - a.count)) addPairToTracks(gp);
+  for (const tr of tracks) if (tr.obs.length < 2) tr.bad = true;
+  log(`Built ${tracks.filter((t) => !t.bad).length} feature tracks` + (refusedMerges ? ` (${refusedMerges} conflicting matches refused)` : ''));
 
   // Initial pair
   const sorted = goodPairs.slice().sort((a, b) => b.count - a.count);

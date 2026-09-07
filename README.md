@@ -56,6 +56,7 @@ Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phone
 - **Person**: they stand still; you circle them at chest height, then add a higher and a lower pass.
 - **Room**: stand near the centre, shoot, step a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
 - Overlap each shot at least 50% with the previous one. Plain walls and glossy surfaces reconstruct poorly.
+- Keep the phone steady. Phonogeometry measures the sharpness of every frame and marks any that are much softer than the others from the same camera, because one blurred shot in the middle of a sequence can fail to match its neighbours and strand everything after it: in testing a single frame blurred by three pixels halved the number of images that could be placed. Retake the ones it flags.
 - Vary your distance to the subject in a few shots (step in, step back). That is what lets the app calibrate each lens's focal length, which browsers do not report.
 - **Fast** quality takes well under a minute for a dozen shots on a recent phone; **High** can take several minutes.
 
@@ -86,6 +87,17 @@ That is what lets a single sweep of a room capture the wall in front of you and 
 behind you at the same time. The few millimetres between the lenses are treated as zero,
 which is far below the voxel size of any scan, so the cameras of one shot end up at the same
 point.
+
+## When a scan comes out wrong
+
+After processing, any photo that could not be placed in the model is greyed out and labelled
+in the shot list, and the Details panel on the processing screen names them. The usual causes,
+in order of how often they bite:
+
+- **A blurred frame**, flagged with a badge as soon as it is captured. Retake it.
+- **Too little overlap** between consecutive shots, so there is nothing to match.
+- **A blank or glossy surface** with no texture to match.
+- **Something moved** between shots.
 
 ## Limits
 
