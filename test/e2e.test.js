@@ -59,3 +59,22 @@ test('end-to-end: textured object in front of a wall', async () => {
   assert.ok(Number.isFinite(eulerCharacteristic(res.mesh.positions, res.mesh.indices)));
   assert.ok(res.cameras.filter((c) => c).length === res.stats.registered);
 });
+
+test('end-to-end: a wrong assumed focal length is corrected by refinement', async () => {
+  const w = 320, h = 240, fTrue = 260, cx = 159.5, cy = 119.5;
+  const images = [];
+  for (let i = 0; i < 7; i++) {
+    const ang = -0.5 + i * (1.0 / 6);
+    // Varying the distance to the subject is what makes the focal length observable
+    const dist = 2.4 + 0.35 * i;
+    const cam = lookAt([Math.sin(ang) * dist, 0.3 * Math.sin(i), -Math.cos(ang) * dist], [0, 0, 0]);
+    const r = renderObject(cam, w, h, fTrue, cx, cy, 1, 3);
+    // All frames come from the same "camera" whose focal length is assumed 15% too short
+    images.push({ id: `cam${i}`, label: `cam ${i}`, width: w, height: h, rgba: r.rgba, f: fTrue * 0.85, cx, cy, shotIndex: i, focalGroup: 'back-wide' });
+  }
+  const logs = [];
+  const res = await reconstruct(images, { quality: 'fast', preset: 'object', debug: true, overrides: { featureWidth: 320, depthWidth: 120 } }, (s, fr, m) => { if (m) logs.push(m); });
+  assert.ok(res.stats.registered >= 6, `registered ${res.stats.registered}`);
+  const refined = res.debug.frames[0].f; // processing resolution equals the input here
+  assert.ok(Math.abs(refined / fTrue - 1) < 0.03, `refined focal ${refined.toFixed(1)} vs true ${fTrue}\n${logs.filter((l) => /Focal|Bundle/.test(l)).join('\n')}`);
+});

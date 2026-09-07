@@ -94,7 +94,10 @@ export function ransacEssential(p1, p2, n, threshold, opts = {}) {
   const s1 = new Float64Array(16), s2 = new Float64Array(16);
   let bestInl = null, bestCount = 0, bestE = null;
   let iters = maxIters;
+  const bailAt = opts.bailAt ?? 120, bailMin = Math.max(10, 0.12 * n);
   for (let it = 0; it < iters; it++) {
+    // Hopeless pairs (mostly wrong matches) are abandoned early instead of exhausting maxIters
+    if (it === bailAt && bestCount < bailMin) break;
     sampleIndices(rng, 8, n, idx);
     for (let k = 0; k < 8; k++) {
       s1[k * 2] = p1[idx[k] * 2]; s1[k * 2 + 1] = p1[idx[k] * 2 + 1];

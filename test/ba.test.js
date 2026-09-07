@@ -37,3 +37,28 @@ test('bundle adjustment reduces reprojection error on a perturbed scene', () => 
     assert.ok(rotationError(cams[i].R, truth[i].R) < 0.003, `cam ${i} rot ${rotationError(cams[i].R, truth[i].R)}`);
   }
 });
+
+test('bundle adjustment recovers a shared focal length error', () => {
+  const r = rng(77);
+  const np = 200, fTrue = 1000, fAssumed = 850; // 15% error in the assumed focal length
+  const X = new Float64Array(np * 3).map(() => r() * 2 - 1);
+  const centers = [[0, 0, -5], [2, 0.5, -4.5], [-2, -0.5, -4.7], [1, 2, -5], [-1.5, 1.5, -4], [0.5, -1.5, -5.5]];
+  const truth = centers.map((c) => lookAt(c, [0, 0, 0]));
+  const camIdx = [], ptIdx = [], xs = [];
+  for (let c = 0; c < truth.length; c++) {
+    for (let p = 0; p < np; p++) {
+      const pr = projectPoint(truth[c].R, truth[c].t, X.subarray(p * 3, p * 3 + 3));
+      // pixel measurement with the true focal, normalised with the assumed (wrong) focal
+      const px = pr[0] * fTrue + gauss(r) * 0.3, py = pr[1] * fTrue + gauss(r) * 0.3;
+      camIdx.push(c); ptIdx.push(p); xs.push(px / fAssumed, py / fAssumed);
+    }
+  }
+  const obs = { cam: Int32Array.from(camIdx), pt: Int32Array.from(ptIdx), x: Float64Array.from(xs) };
+  const cams = truth.map((c, i) => ({ R: Float64Array.from(c.R), t: Float64Array.from(c.t), f: fAssumed, fixed: i === 0, focalGroup: 0 }));
+  const pts = Float64Array.from(X);
+  const res = bundleAdjust(cams, pts, obs, { iterations: 40, refineFocal: true });
+  assert.ok(res.finalRms < 0.6, `final rms ${res.finalRms}`);
+  const est = fAssumed * res.focalScales[0];
+  assert.ok(Math.abs(est / fTrue - 1) < 0.02, `estimated focal ${est.toFixed(1)} vs ${fTrue}`);
+  assert.equal(cams[1].focalScale, res.focalScales[0]);
+});

@@ -5,7 +5,7 @@ import { extractORB } from '../vision/orb.js';
 import { matchDescriptors } from '../vision/match.js';
 import { runSfM } from '../vision/sfm.js';
 import { computeDepthMap, filterDepthConsistency } from '../vision/planeSweep.js';
-import { cameraCenter, relativePose } from '../vision/linalg.js';
+import { cameraCenter, inv3 } from '../vision/linalg.js';
 import { triangulationAngle } from '../vision/geometry.js';
 import { TSDFVolume, fitVolume } from '../mesh/tsdf.js';
 import { surfaceNets } from '../mesh/surfaceNets.js';
@@ -18,10 +18,52 @@ export const QUALITY = {
 };
 
 export const PRESETS = {
-  object: { percentile: 0.04, minComponent: 0.03, truncVoxels: 3, smoothIters: 3, minZncc: 0.55 },
-  person: { percentile: 0.03, minComponent: 0.03, truncVoxels: 3, smoothIters: 4, minZncc: 0.5 },
-  room: { percentile: 0.01, minComponent: 0.01, truncVoxels: 4, smoothIters: 2, minZncc: 0.5 },
+  // focus: radius of the kept region around the cameras' common look-at point, as a fraction
+  // of the mean camera distance (0 = keep everything)
+  object: { percentile: 0.02, minComponent: 0.03, truncVoxels: 3, smoothIters: 3, minZncc: 0.55, focus: 0.55 },
+  person: { percentile: 0.02, minComponent: 0.03, truncVoxels: 3, smoothIters: 4, minZncc: 0.5, focus: 0.6 },
+  room: { percentile: 0.01, minComponent: 0.01, truncVoxels: 4, smoothIters: 2, minZncc: 0.5, focus: 0 },
 };
+
+/**
+ * Least-squares intersection of the cameras' optical axes. Returns null when the axes do
+ * not converge (e.g. a room scanned from its centre), so no cropping is applied.
+ */
+export function opticalAxesFocus(cameras, centers) {
+  const A = new Float64Array(9), b = new Float64Array(3);
+  let n = 0;
+  cameras.forEach((cam, i) => {
+    if (!cam) return;
+    const d = [cam.R[6], cam.R[7], cam.R[8]]; // optical axis in world coordinates
+    const C = centers[i];
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const m = (r === c ? 1 : 0) - d[r] * d[c];
+        A[r * 3 + c] += m;
+        b[r] += m * C[c];
+      }
+    }
+    n++;
+  });
+  if (n < 3) return null;
+  const inv = inv3(A);
+  if (!inv) return null;
+  const P = [0, 1, 2].map((r) => inv[r * 3] * b[0] + inv[r * 3 + 1] * b[1] + inv[r * 3 + 2] * b[2]);
+  let sumDist = 0, sumOff = 0, front = 0;
+  cameras.forEach((cam, i) => {
+    if (!cam) return;
+    const C = centers[i], d = [cam.R[6], cam.R[7], cam.R[8]];
+    const v = [P[0] - C[0], P[1] - C[1], P[2] - C[2]];
+    const along = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+    if (along > 0) front++;
+    const off = Math.hypot(v[0] - along * d[0], v[1] - along * d[1], v[2] - along * d[2]);
+    sumDist += Math.hypot(...v); sumOff += off;
+  });
+  const meanDistance = sumDist / n, meanOffset = sumOff / n;
+  // Converging axes pass close to the focus; diverging (room) scans do not.
+  if (front < 0.8 * n || meanOffset > 0.35 * meanDistance) return null;
+  return { point: P, meanDistance, meanOffset };
+}
 
 function percentile(sortedArr, p) {
   if (sortedArr.length === 0) return 0;
@@ -94,8 +136,8 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const sx = fw / im.width, sy = fh / im.height;
     const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures });
     frames.push({
-      id: im.id, label: im.label, shotIndex: im.shotIndex ?? i,
-      width: fw, height: fh, gray, grayFull, fullW: im.width, fullH: im.height, rgba: im.rgba,
+      id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
+      width: fw, height: fh, gray, fullW: im.width, fullH: im.height, rgba: im.rgba,
       f: im.f * sx, cx: (im.cx + 0.5) * sx - 0.5, cy: (im.cy + 0.5) * sy - 0.5,
       keypoints: feat.keypoints, count: feat.count, descriptors: feat.descriptors,
       global: globalDescriptor(gray, fw, fh),
@@ -112,12 +154,16 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const m = matchDescriptors(frames[i].descriptors, frames[i].count, frames[j].descriptors, frames[j].count);
     if (m.length / 2 >= 20) pairs.push({ i, j, matches: m });
   }
+  for (const fr of frames) fr.descriptors = null; // no longer needed
   log(`${pairs.length}/${candidates.length} pairs have enough matches`);
   if (pairs.length === 0) throw new Error('No overlapping image pairs found. Take photos with more overlap and texture.');
 
   // 3. Structure from motion
   progress('sfm', 0, 'Estimating camera poses');
-  const sfm = runSfM(frames, pairs, { pixelThreshold: 2.0, log });
+  // Frames sharing a physical camera share one focal-length parameter in bundle adjustment
+  const groupIds = new Map();
+  for (const fr of frames) { if (!groupIds.has(fr.focalGroup)) groupIds.set(fr.focalGroup, groupIds.size); fr.focalGroup = groupIds.get(fr.focalGroup); }
+  const sfm = runSfM(frames, pairs, { pixelThreshold: 2.0, refineFocal: options.refineFocal !== false, log });
   if (sfm.registeredCount < 2) throw new Error(sfm.error || 'Could not register the cameras');
   const registered = [];
   sfm.cameras.forEach((c, i) => { if (c) registered.push(i); });
@@ -222,7 +268,20 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     }
   }
   if (dense.length < 300) throw new Error('Too few consistent depth samples to build a surface.');
-  const vol = fitVolume(Float64Array.from(dense), q.voxelRes, { percentile: preset.percentile, margin: 0.06 });
+  let densePts = Float64Array.from(dense);
+  if (preset.focus) {
+    // Object/person scans orbit their subject: crop the volume to where the optical axes converge
+    const focus = opticalAxesFocus(sfm.cameras, centers);
+    if (focus) {
+      const radius = focus.meanDistance * preset.focus;
+      const kept = [];
+      for (let i = 0; i < densePts.length; i += 3) {
+        if (Math.hypot(densePts[i] - focus.point[0], densePts[i + 1] - focus.point[1], densePts[i + 2] - focus.point[2]) <= radius) kept.push(densePts[i], densePts[i + 1], densePts[i + 2]);
+      }
+      if (kept.length >= 300) { densePts = Float64Array.from(kept); log(`Focused on the subject: kept ${(100 * kept.length / dense.length).toFixed(0)}% of depth samples within the scan radius`); }
+    }
+  }
+  const vol = fitVolume(densePts, q.voxelRes, { percentile: preset.percentile, margin: 0.06 });
   const tsdf = new TSDFVolume(vol.origin, vol.dims, vol.voxelSize, vol.voxelSize * preset.truncVoxels);
   let k = 0;
   for (const v of depthViews) {

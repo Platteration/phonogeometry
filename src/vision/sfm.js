@@ -155,8 +155,9 @@ export function runSfM(frames, pairs, opts = {}) {
   triangulateNewTracks(init.j);
   log(`Initial triangulation: ${tracks.filter((t) => t.point).length} points`);
 
-  function runBA(iterations) {
-    const camList = registered.map((fr, idx) => ({ R: camR[fr], t: camT[fr], f: frames[fr].f, fixed: idx === 0 }));
+  const refineFocal = opts.refineFocal !== false;
+  function runBA(iterations, withFocal = false) {
+    const camList = registered.map((fr, idx) => ({ R: camR[fr], t: camT[fr], f: frames[fr].f, fixed: idx === 0, focalGroup: frames[fr].focalGroup ?? fr }));
     const camPos = new Int32Array(nf).fill(-1);
     registered.forEach((fr, idx) => { camPos[fr] = idx; });
     const ptTracks = [];
@@ -172,8 +173,25 @@ export function runSfM(frames, pairs, opts = {}) {
     if (ptTracks.length < 8) return;
     const pts = new Float64Array(ptTracks.length * 3);
     ptTracks.forEach((tid, p) => pts.set(tracks[tid].point, p * 3));
-    const res = bundleAdjust(camList, pts, { cam: Int32Array.from(camIdx), pt: Int32Array.from(ptIdx), x: Float64Array.from(xs) }, { iterations, huber: pxThr * 1.5 });
+    const useFocal = withFocal && refineFocal && registered.length >= 3;
+    const res = bundleAdjust(camList, pts, { cam: Int32Array.from(camIdx), pt: Int32Array.from(ptIdx), x: Float64Array.from(xs) }, { iterations, huber: pxThr * 1.5, refineFocal: useFocal });
     registered.forEach((fr, idx) => { camR[fr] = camList[idx].R; camT[fr] = camList[idx].t; });
+    if (useFocal) {
+      // Apply the estimated focal scales: frames' focal lengths and their normalised keypoints
+      const changed = new Set();
+      registered.forEach((fr, idx) => {
+        const sc = camList[idx].focalScale || 1;
+        if (Math.abs(sc - 1) < 1e-6) return;
+        frames[fr].f *= sc;
+        for (let k = 0; k < nk[fr].length; k++) nk[fr][k] /= sc;
+        changed.add(fr);
+      });
+      if (changed.size) {
+        const groups = new Map();
+        registered.forEach((fr, idx) => { groups.set(frames[fr].focalGroup ?? fr, camList[idx].focalScale || 1); });
+        log(`Focal length refinement: ${Array.from(groups.values()).map((v) => (v * 100).toFixed(1) + '%').join(', ')} of the assumed value`);
+      }
+    }
     ptTracks.forEach((tid, p) => { tracks[tid].point = pts.subarray(p * 3, p * 3 + 3).slice(); });
     // Re-validate observations, drop weak points
     let removed = 0;
@@ -292,8 +310,8 @@ export function runSfM(frames, pairs, opts = {}) {
   }
   // Final refinement: second triangulation pass for tracks that became triangulable
   for (const tr of tracks) if (!tr.bad && !tr.point) tryTriangulate(tr);
-  runBA(25);
-  runBA(10);
+  runBA(25, true);
+  runBA(10, true);
 
   // Output
   const pointList = [], pointTracks = [];
@@ -307,5 +325,5 @@ export function runSfM(frames, pairs, opts = {}) {
   }
   const cameras = frames.map((_, i) => (camR[i] ? { R: camR[i], t: camT[i] } : null));
   log(`SfM done: ${registered.length}/${nf} frames registered, ${pointTracks.length} points`);
-  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length };
+  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length, focals: frames.map((fr) => fr.f) };
 }

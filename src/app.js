@@ -4,6 +4,7 @@ import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics
 import { readExifFov } from './camera/exif.js';
 import { QUALITY } from './pipeline/reconstruct.js';
 import { toGLB, toPLY, toOBJ } from './mesh/exporters.js';
+import { ShotStore } from './storage.js';
 
 const $ = (sel) => document.querySelector(sel);
 const state = {
@@ -15,6 +16,7 @@ const state = {
   cameraTiles: new Map(),
 };
 const cams = new CameraManager();
+const store = new ShotStore();
 
 const PRESET_TIPS = {
   object: 'Walk slowly around the object and capture every 20–30° with plenty of overlap. Aim for 12–30 shots.',
@@ -147,7 +149,9 @@ async function captureShot() {
       const blob = await canvasToBlob(g.canvas);
       frames.push({ blob, thumbUrl: makeThumb(g.canvas), width: g.width, height: g.height, f: g.f, cx: g.cx, cy: g.cy, label: g.cameraLabel, lens: g.lens, key: g.cameraKey, hfov: g.hfov });
     }
-    state.shots.push({ id: `shot-${Date.now()}`, frames });
+    const shot = { id: `shot-${Date.now()}`, createdAt: Date.now(), frames };
+    state.shots.push(shot);
+    store.saveShot(shot);
     renderShots(); updateCounts();
     if (navigator.vibrate) navigator.vibrate(15);
     $('#camera-status').textContent = `Shot ${state.shots.length}: ${frames.length} frame${frames.length === 1 ? '' : 's'} from ${frames.map((f) => f.label).join(', ')}.`;
@@ -179,7 +183,11 @@ async function importFiles(files) {
     }
   }
   // Each imported photo is its own shot (taken at a different time/position)
-  for (const fr of frames) state.shots.push({ id: `import-${Date.now()}-${Math.random()}`, frames: [fr] });
+  for (const fr of frames) {
+    const shot = { id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, createdAt: Date.now(), frames: [fr] };
+    state.shots.push(shot);
+    store.saveShot(shot);
+  }
   renderShots(); updateCounts();
   toast(`Imported ${frames.length} photo${frames.length === 1 ? '' : 's'}`);
 }
@@ -195,9 +203,17 @@ function renderShots() {
     for (const f of shot.frames) {
       fr.insertAdjacentHTML('beforeend', `<div class="thumb"><img src="${f.thumbUrl}" alt="${f.label}"><span class="thumb-label">${f.label}</span></div>`);
     }
-    row.querySelector('.shot-delete').addEventListener('click', () => { state.shots.splice(i, 1); renderShots(); updateCounts(); });
+    row.querySelector('.shot-delete').addEventListener('click', () => { store.deleteShot(shot.id); state.shots.splice(i, 1); renderShots(); updateCounts(); });
     box.appendChild(row);
   });
+}
+
+async function restoreShots() {
+  const saved = await store.loadAll();
+  if (!saved.length) return;
+  state.shots = saved.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
+  renderShots(); updateCounts();
+  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session`, 4000);
 }
 
 // ---------- Reconstruction ----------
@@ -212,7 +228,7 @@ async function decodeForWorker(frame, targetWidth, id, shotIndex) {
   bmp.close?.();
   const data = ctx.getImageData(0, 0, w, h).data;
   const sx = w / frame.width, sy = h / frame.height;
-  return { id, label: frame.label, width: w, height: h, rgba: data, f: frame.f * sx, cx: (frame.cx + 0.5) * sx - 0.5, cy: (frame.cy + 0.5) * sy - 0.5, shotIndex };
+  return { id, label: frame.label, width: w, height: h, rgba: data, f: frame.f * sx, cx: (frame.cx + 0.5) * sx - 0.5, cy: (frame.cy + 0.5) * sy - 0.5, shotIndex, focalGroup: `${frame.key}|${Math.round(frame.hfov || 0)}` };
 }
 
 async function reconstruct() {
@@ -306,7 +322,7 @@ function init() {
   $('#btn-capture').addEventListener('click', captureShot);
   $('#btn-import').addEventListener('click', () => $('#file-import').click());
   $('#file-import').addEventListener('change', (e) => { importFiles(Array.from(e.target.files)); e.target.value = ''; });
-  $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; renderShots(); updateCounts(); } });
+  $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
   $('#btn-cancel').addEventListener('click', () => { if (state.worker) { state.worker.terminate(); state.worker = null; } $('#btn-cancel').textContent = 'Cancel'; showScreen('capture'); });
   $('#btn-settings').addEventListener('click', () => $('#settings').showModal());
@@ -330,10 +346,11 @@ function init() {
     try { if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: 'Phonogeometry scan' }); else toast('Sharing files is not supported here'); } catch { /* cancelled */ }
   });
   $('#btn-back-capture').addEventListener('click', () => showScreen('capture'));
-  $('#btn-new-scan').addEventListener('click', () => { if (confirm('Start a new scan? Current shots and mesh will be discarded.')) { state.shots = []; state.result = null; renderShots(); updateCounts(); showScreen('capture'); } });
+  $('#btn-new-scan').addEventListener('click', () => { if (confirm('Start a new scan? Current shots and mesh will be discarded.')) { state.shots = []; state.result = null; store.clear(); renderShots(); updateCounts(); showScreen('capture'); } });
   document.addEventListener('keydown', (e) => { if (e.code === 'Space' && !$('#screen-capture').hidden && document.activeElement?.tagName !== 'BUTTON') { e.preventDefault(); captureShot(); } });
   window.addEventListener('pagehide', () => cams.closeAll());
   updateCounts();
+  restoreShots();
 
   if (!cams.supported) $('#camera-status').textContent = 'Camera access is not available in this browser or over an insecure (http) connection. You can still import photos.';
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
