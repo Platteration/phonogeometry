@@ -20,9 +20,9 @@ const cams = new CameraManager();
 const store = new ShotStore();
 
 const PRESET_TIPS = {
-  object: 'Walk slowly around the object and capture every 20–30° with plenty of overlap. Aim for 12–30 shots.',
-  person: 'Ask the person to stand still. Circle them at chest height and capture every 20–30°; add a higher and a lower pass for the head and legs.',
-  room: 'Stand near the middle of the room. Capture, step sideways about a metre, capture again; go around the room twice at two heights. Front and back cameras fire together, so each shot covers both walls.',
+  object: 'Circle the object in small steps, about a hand-width of sideways movement between shots, and keep more than half of each view shared with the last one. Aim for 20–40 shots.',
+  person: 'Ask them to stand still. Circle them in small steps at chest height, then add a higher and a lower pass for the head and the legs. Aim for 25–50 shots.',
+  room: 'Stand near the middle, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls. Keep furniture or a corner in view, not just a bare wall.',
 };
 
 // ---------- UI helpers ----------
@@ -45,7 +45,8 @@ function updateCounts() {
   $('#frame-count').textContent = n ? `· ${n} frames${n > 60 ? ' · many frames: Fast quality recommended' : ''}` : '';
   $('#btn-reconstruct').disabled = n < 2;
   // Rough on-phone processing time per frame at each quality level
-  const perFrame = { fast: 1.5, balanced: 4, high: 12 }[$('#quality').value] || 4;
+  // Rough seconds per frame on a phone, from timings on a laptop scaled for slower hardware
+  const perFrame = { fast: 4, balanced: 8, high: 20 }[$('#quality').value] || 8;
   const secs = n * perFrame;
   $('#btn-reconstruct').textContent = n >= 2 ? `Build 3D mesh (~${secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + ' min'})` : 'Build 3D mesh';
 }

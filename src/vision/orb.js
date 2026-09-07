@@ -83,6 +83,7 @@ export function extractORB(gray, w, h, opts = {}) {
   const scaleFactor = opts.scaleFactor ?? 1.25;
   const threshold = opts.threshold ?? 18;
   const gridCells = opts.gridCells ?? 8;
+  const nmsRadius = opts.nmsRadius ?? 3;
 
   const all = [];
   let scale = 1;
@@ -96,7 +97,7 @@ export function extractORB(gray, w, h, opts = {}) {
       lw = nw; lh = nh;
     }
     const blurred = gaussianBlur(lvlImg, lw, lh, 1.2);
-    const corners = detectFAST(lvlImg, lw, lh, threshold, HALF + 2);
+    const corners = detectFAST(lvlImg, lw, lh, threshold, HALF + 2, nmsRadius);
     for (const c of corners) {
       all.push({ x: c.x, y: c.y, score: c.score, lvl, scale, img: blurred, lw, lh });
     }

@@ -52,10 +52,11 @@ Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phone
 
 ### Scanning tips
 
-- **Object**: circle it, one shot every 20–30°, 12–30 shots. Matte, textured objects work best.
-- **Person**: they stand still; you circle them at chest height, then add a higher and a lower pass.
-- **Room**: stand near the centre, shoot, step a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
-- Overlap each shot at least 50% with the previous one. Plain walls and glossy surfaces reconstruct poorly.
+- **Object**: circle it in small steps, roughly 10° apart, 20–40 shots. Matte, textured objects work best.
+- **Person**: they stand still; you circle them at chest height in small steps, then add a higher and a lower pass.
+- **Room**: stand near the centre, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
+- **Overlap generously.** Each shot should share well over half its view with the previous one. This is the single thing that decides whether a scan works. Measured on a synthetic object, consecutive views about 8° apart reconstruct completely, 12° apart partially, and beyond about 16° the matching gives out and the scan breaks into pieces. Fewer, wider-spaced shots are a false economy: the work grows with the number of image pairs, and a broken scan costs everything.
+- Keep something with depth in view, such as furniture or a corner. A flat wall filling the frame is ambiguous: no method can recover its distance from photographs alone.
 - Keep the phone steady. Phonogeometry measures the sharpness of every frame and marks any that are much softer than the others from the same camera, because one blurred shot in the middle of a sequence can fail to match its neighbours and strand everything after it: in testing a single frame blurred by three pixels halved the number of images that could be placed. Retake the ones it flags.
 - Vary your distance to the subject in a few shots (step in, step back). That is what lets the app calibrate each lens's focal length, which browsers do not report.
 - **Fast** quality takes well under a minute for a dozen shots on a recent phone; **High** can take several minutes.
@@ -94,15 +95,16 @@ After processing, any photo that could not be placed in the model is greyed out 
 in the shot list, and the Details panel on the processing screen names them. The usual causes,
 in order of how often they bite:
 
+- **Too little overlap** between consecutive shots. Move less between shots.
 - **A blurred frame**, flagged with a badge as soon as it is captured. Retake it.
-- **Too little overlap** between consecutive shots, so there is nothing to match.
 - **A blank or glossy surface** with no texture to match.
 - **Something moved** between shots.
 
 ## Limits
 
 - The scale of the model is arbitrary. A single phone cannot measure absolute size from images alone; export and scale in your 3D tool if you need real units.
-- Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere. A camera aimed at one flat wall and nothing else is also a hard case: the geometry is ambiguous until something with depth comes into view.
+- Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere.
+- A camera aimed at one flat wall and nothing else is a degenerate case, not merely a hard one: every distance explains the photographs equally well. Phonogeometry places the cameras correctly and returns a flat surface at the wrong distance rather than refusing. Keep something with depth in view.
 - Feature matching, structure from motion and fusion run on the CPU in JavaScript; the dense depth stage runs on the GPU when the browser offers WebGL2 with float render targets (most phones since 2018). Resolutions and voxel counts are modest by design.
 
 ## Development

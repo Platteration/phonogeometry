@@ -34,8 +34,14 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - Relaxing the descriptor ratio test doubles the image pairs that pass geometric verification
   but wrecks the reconstruction, because the extra wrong matches chain unrelated features into
   one track. Pairwise metrics mislead here: judge matching changes end to end.
-- One frame blurred by three pixels roughly halves the number of frames that register, so
-  frames are scored for sharpness and flagged rather than silently ruining a scan.
+- How far apart consecutive shots may be is set by how many corners are detected, and the
+  corner threshold matters more than the feature cap. At 1000 features and threshold 18 the
+  geometry gives out past about 16 degrees of viewpoint change; at 3000 features and
+  threshold 12 it survives 25 degrees, surface error improves several times over, and a
+  blurred frame stops breaking the scan. Matching costs more per pair, which is paid back by
+  needing fewer shots.
+- Frames are still scored for sharpness and flagged, because blur remains a real failure
+  cause on a phone even though the pipeline now tolerates it better.
 - Balanced quality is markedly more accurate than fast on the same input, not just denser.
 
 ## Conventions

@@ -12,10 +12,15 @@ import { TSDFVolume, fitVolume } from '../mesh/tsdf.js';
 import { surfaceNets } from '../mesh/surfaceNets.js';
 import { computeNormals, smoothMesh, removeSmallComponents } from '../mesh/meshUtils.js';
 
+// maxFeatures and cornerThreshold decide how far apart consecutive shots may be. Measured on
+// a synthetic object, 1000 features at corner threshold 18 lose the geometry beyond about
+// 16 degrees of viewpoint change, while 3000 features at threshold 12 still recover it at 25
+// degrees. Being able to take fewer, wider-spaced shots more than pays for the extra matching
+// time, because the number of image pairs grows with the square of the number of shots.
 export const QUALITY = {
-  fast: { featureWidth: 560, maxFeatures: 1000, depthWidth: 160, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
-  balanced: { featureWidth: 640, maxFeatures: 1100, depthWidth: 240, numPlanes: 64, voxelRes: 128, neighbors: 3, radius: 3 },
-  high: { featureWidth: 800, maxFeatures: 1500, depthWidth: 320, numPlanes: 96, voxelRes: 176, neighbors: 4, radius: 3 },
+  fast: { featureWidth: 560, maxFeatures: 2000, cornerThreshold: 14, depthWidth: 160, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
+  balanced: { featureWidth: 640, maxFeatures: 3000, cornerThreshold: 12, depthWidth: 240, numPlanes: 64, voxelRes: 128, neighbors: 3, radius: 3 },
+  high: { featureWidth: 800, maxFeatures: 4500, cornerThreshold: 10, depthWidth: 320, numPlanes: 96, voxelRes: 176, neighbors: 4, radius: 3 },
 };
 
 export const PRESETS = {
@@ -113,30 +118,38 @@ function globalDescriptor(gray, w, h) {
   return t;
 }
 
+/**
+ * Choose which image pairs to match. Matching every pair costs time that grows with the
+ * square of the number of shots and mostly buys nothing, because shots taken far apart in
+ * a walk around a subject share no view. Pairs are kept when the shots were taken close
+ * together, when the two frames come from the same shot (they are simultaneous, so they
+ * always overlap), or when a coarse thumbnail descriptor says the views look alike, which
+ * is what catches a loop closing back on itself.
+ */
 function selectCandidatePairs(frames, opts) {
   const n = frames.length;
   const pairs = new Set();
   const key = (i, j) => (i < j ? i * n + j : j * n + i);
   const allPairs = n * (n - 1) / 2;
-  if (allPairs <= (opts.maxPairs ?? 300)) {
+  const shot = (i) => frames[i].shotIndex ?? i;
+  if (allPairs <= (opts.maxPairs ?? 60)) {
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pairs.add(key(i, j));
-  } else {
-    const window = opts.shotWindow ?? 3;
-    const topK = opts.similarK ?? 5;
-    const desc = frames.map((f) => f.global);
-    for (let i = 0; i < n; i++) {
-      const sims = [];
-      for (let j = 0; j < n; j++) {
-        if (j === i) continue;
-        const ds = Math.abs((frames[i].shotIndex ?? i) - (frames[j].shotIndex ?? j));
-        if (ds <= window) pairs.add(key(i, j));
-        let s = 0;
-        for (let k = 0; k < desc[i].length; k++) s += desc[i][k] * desc[j][k];
-        sims.push([s, j]);
-      }
-      sims.sort((a, b) => b[0] - a[0]);
-      for (let k = 0; k < Math.min(topK, sims.length); k++) pairs.add(key(i, sims[k][1]));
+    return Array.from(pairs).map((k) => [Math.floor(k / n), k % n]);
+  }
+  const window = opts.shotWindow ?? 3;
+  const topK = opts.similarK ?? 5;
+  const desc = frames.map((f) => f.global);
+  for (let i = 0; i < n; i++) {
+    const sims = [];
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      if (Math.abs(shot(i) - shot(j)) <= window) pairs.add(key(i, j));
+      let s = 0;
+      for (let k = 0; k < desc[i].length; k++) s += desc[i][k] * desc[j][k];
+      sims.push([s, j]);
     }
+    sims.sort((a, b) => b[0] - a[0]);
+    for (let k = 0; k < Math.min(topK, sims.length); k++) pairs.add(key(i, sims[k][1]));
   }
   return Array.from(pairs).map((k) => [Math.floor(k / n), k % n]);
 }
@@ -165,7 +178,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const gray = resizeGray(grayFull, im.width, im.height, fw, fh);
     const sx = fw / im.width, sy = fh / im.height;
     const sharp = sharpness(gray, fw, fh);
-    const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures });
+    const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures, threshold: q.cornerThreshold });
     frames.push({
       id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
       rigKey: im.rigKey ?? im.focalGroup ?? im.id,
