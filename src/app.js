@@ -3,7 +3,7 @@ import { CameraManager } from './camera/cameraManager.js';
 import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
 import { readExifFov } from './camera/exif.js';
 import { QUALITY } from './pipeline/reconstruct.js';
-import { toGLB, toPLY, toOBJ } from './mesh/exporters.js';
+import { toGLB, toPLY, toOBJ, toPointCloudPLY } from './mesh/exporters.js';
 import { ShotStore } from './storage.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -41,7 +41,7 @@ function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length,
 function updateCounts() {
   $('#shot-count').textContent = state.shots.length;
   const n = frameCount();
-  $('#frame-count').textContent = n ? `· ${n} frames` : '';
+  $('#frame-count').textContent = n ? `· ${n} frames${n > 60 ? ' · many frames: Fast quality recommended' : ''}` : '';
   $('#btn-reconstruct').disabled = n < 2;
   // Rough on-phone processing time per frame at each quality level
   const perFrame = { fast: 1.5, balanced: 4, high: 12 }[$('#quality').value] || 4;
@@ -328,8 +328,18 @@ async function showResult(result, seconds) {
     state.viewer.setLayer('grid', $('#chk-grid').checked);
   }
   const s = result.stats;
-  $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span><span><b>${s.triangles.toLocaleString()}</b> triangles</span><span><b>${s.vertices.toLocaleString()}</b> vertices</span><span><b>${s.sparsePoints}</b> sparse points</span><span><b>${seconds.toFixed(0)}s</b></span>`;
+  $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span><span><b>${s.triangles.toLocaleString()}</b> triangles</span><span><b>${s.vertices.toLocaleString()}</b> vertices</span><span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span><span><b>${seconds.toFixed(0)}s</b></span>`;
+  if (s.intrinsics?.length) {
+    const byLabel = new Map();
+    for (const it of s.intrinsics) if (!byLabel.has(it.label)) byLabel.set(it.label, it);
+    setProgressLog(`Calibrated intrinsics: ` + Array.from(byLabel.values()).map((it) => `${it.label}: f=${it.focalPx.toFixed(0)}px, k1=${it.k1.toFixed(3)}`).join('; '));
+  }
   $('#btn-share').hidden = !(navigator.canShare);
+}
+
+function setProgressLog(line) {
+  const log = $('#progress-log');
+  log.textContent += line + '\n';
 }
 
 function download(name, data, mime) {
@@ -373,6 +383,7 @@ function init() {
   $('#btn-export-glb').addEventListener('click', () => state.result && download(exportName('glb'), toGLB(state.result.mesh), 'model/gltf-binary'));
   $('#btn-export-ply').addEventListener('click', () => state.result && download(exportName('ply'), toPLY(state.result.mesh), 'application/octet-stream'));
   $('#btn-export-obj').addEventListener('click', () => state.result && download(exportName('obj'), toOBJ(state.result.mesh), 'text/plain'));
+  $('#btn-export-points').addEventListener('click', () => state.result?.dense && download(exportName('points.ply'), toPointCloudPLY(state.result.dense), 'application/octet-stream'));
   $('#btn-share').addEventListener('click', async () => {
     if (!state.result) return;
     const file = new File([toGLB(state.result.mesh)], exportName('glb'), { type: 'model/gltf-binary' });

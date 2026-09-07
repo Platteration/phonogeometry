@@ -10,6 +10,23 @@ export function normalizePoint(x, y, f, cx, cy) {
   return [(x - cx) / f, (y - cy) / f];
 }
 
+/** Radial distortion x_d = x (1 + k1 |x|^2) applied to normalized coordinates. */
+export function distortNormalized(x, y, k1) {
+  const D = 1 + k1 * (x * x + y * y);
+  return [x * D, y * D];
+}
+
+/** Inverse of distortNormalized (fixed-point iteration). */
+export function undistortNormalized(xd, yd, k1) {
+  if (k1 === 0) return [xd, yd];
+  let x = xd, y = yd;
+  for (let i = 0; i < 8; i++) {
+    const D = 1 + k1 * (x * x + y * y);
+    x = xd / D; y = yd / D;
+  }
+  return [x, y];
+}
+
 /** Hartley normalization of 2D points (flat [x,y,...] Float64Array). Returns {T, pts}. */
 export function hartleyNormalize(pts, n) {
   let mx = 0, my = 0;

@@ -1,6 +1,6 @@
 // End-to-end reconstruction pipeline: images -> features -> matches -> SfM ->
 // plane-sweep depth -> TSDF fusion -> mesh. Platform agnostic (runs in a Worker or Node).
-import { rgbaToGray, resizeGray, resizeRGBA } from '../vision/image.js';
+import { rgbaToGray, resizeGray, resizeRGBA, undistortGray, undistortRGBA } from '../vision/image.js';
 import { extractORB } from '../vision/orb.js';
 import { matchDescriptors } from '../vision/match.js';
 import { runSfM } from '../vision/sfm.js';
@@ -164,7 +164,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   // Frames sharing a physical camera share one focal-length parameter in bundle adjustment
   const groupIds = new Map();
   for (const fr of frames) { if (!groupIds.has(fr.focalGroup)) groupIds.set(fr.focalGroup, groupIds.size); fr.focalGroup = groupIds.get(fr.focalGroup); }
-  const sfm = runSfM(frames, pairs, { pixelThreshold: 2.0, refineFocal: options.refineFocal !== false, log });
+  const sfm = runSfM(frames, pairs, { pixelThreshold: 2.0, refineFocal: options.refineFocal !== false, refineDistortion: options.refineDistortion !== false, log });
   if (sfm.registeredCount < 2) throw new Error(sfm.error || 'Could not register the cameras');
   const registered = [];
   sfm.cameras.forEach((c, i) => { if (c) registered.push(i); });
@@ -241,10 +241,11 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
       if (!f.depthGray) {
         const s = Math.min(1, q.depthWidth / Math.max(f.width, f.height));
         const dw = Math.max(16, Math.round(f.width * s)), dh = Math.max(16, Math.round(f.height * s));
-        f.depthGray = resizeGray(f.gray, f.width, f.height, dw, dh);
-        f.depthRGBA = resizeRGBA(f.rgba, f.fullW, f.fullH, dw, dh);
         f.dw = dw; f.dh = dh;
         f.df = f.f * (dw / f.width); f.dcx = (f.cx + 0.5) * (dw / f.width) - 0.5; f.dcy = (f.cy + 0.5) * (dh / f.height) - 0.5;
+        // The plane sweep assumes pinhole cameras: resample distorted images onto the pinhole grid
+        f.depthGray = undistortGray(resizeGray(f.gray, f.width, f.height, dw, dh), dw, dh, f.df, f.dcx, f.dcy, f.k1 || 0);
+        f.depthRGBA = undistortRGBA(resizeRGBA(f.rgba, f.fullW, f.fullH, dw, dh), dw, dh, f.df, f.dcx, f.dcy, f.k1 || 0);
       }
       const cam = sfm.cameras[idx];
       return { gray: f.depthGray, w: f.dw, h: f.dh, f: f.df, cx: f.dcx, cy: f.dcy, R: cam.R, t: cam.t, rgb: f.depthRGBA };
@@ -264,11 +265,11 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   const filtered = filterDepthConsistency(depthViews, neighborIdx.map((nbs) => nbs), { relTol: 0.04, minAgree: 1 });
   depthViews.forEach((v, i) => { if (v) v.depth = filtered[i]; });
 
-  // 5. Volume + fusion
-  const dense = [];
+  // 5. Volume + fusion (the subsampled dense cloud is also exported for the user)
+  const dense = [], denseColors = [];
   for (const v of depthViews) {
     if (!v) continue;
-    const step = Math.max(1, Math.floor(Math.sqrt((v.w * v.h) / 4000)));
+    const step = Math.max(1, Math.floor(Math.sqrt((v.w * v.h) / 6000)));
     for (let y = 0; y < v.h; y += step) for (let x = 0; x < v.w; x += step) {
       const d = v.depth[y * v.w + x];
       if (!(d > 0)) continue;
@@ -279,6 +280,8 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
         R[1] * (Xc[0] - t[0]) + R[4] * (Xc[1] - t[1]) + R[7] * (Xc[2] - t[2]),
         R[2] * (Xc[0] - t[0]) + R[5] * (Xc[1] - t[1]) + R[8] * (Xc[2] - t[2]),
       );
+      const o = (y * v.w + x) * 4;
+      denseColors.push(v.rgb ? v.rgb[o] / 255 : 0.6, v.rgb ? v.rgb[o + 1] / 255 : 0.6, v.rgb ? v.rgb[o + 2] / 255 : 0.6);
     }
   }
   if (dense.length < 300) throw new Error('Too few consistent depth samples to build a surface.');
@@ -350,12 +353,17 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     };
   });
 
+  const nDense = dense.length / 3;
+  const densePositions = new Float32Array(nDense * 3);
+  for (let i = 0; i < nDense; i++) { densePositions[i * 3] = dense[i * 3]; densePositions[i * 3 + 1] = -dense[i * 3 + 1]; densePositions[i * 3 + 2] = -dense[i * 3 + 2]; }
   const result = {
     mesh: { positions, normals, colors, indices: mesh.indices },
     sparse: { positions: sparse, colors: sparseColors },
+    dense: { positions: densePositions, colors: Float32Array.from(denseColors) },
     cameras,
     stats: {
-      images: images.length, registered: sfm.registeredCount, sparsePoints: nSparse,
+      images: images.length, registered: sfm.registeredCount, sparsePoints: nSparse, densePoints: nDense,
+      intrinsics: frames.map((fr, i) => (sfm.cameras[i] ? { label: fr.label, focalPx: fr.f * (fr.fullW / fr.width), k1: fr.k1 || 0 } : null)).filter(Boolean),
       depthMaps: haveDepth.length, vertices: nv, triangles: mesh.indices.length / 3,
       seconds: (Date.now() - t0) / 1000, voxelSize: vol.voxelSize, volumeDims: Array.from(vol.dims),
     },

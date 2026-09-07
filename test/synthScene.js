@@ -1,5 +1,6 @@
 // Synthetic textured scenes rendered analytically (ray casting) for end-to-end tests.
 import { rng } from './helpers.js';
+import { undistortNormalized } from '../src/vision/geometry.js';
 
 function hash(x, y) {
   let h = (x * 374761393 + y * 668265263) | 0;
@@ -27,7 +28,7 @@ export function texture(u, v) {
  * Ray-cast the inside of a textured axis-aligned box (a "room") of half-size `half`
  * centred at the origin. Returns {gray, depth, rgba} at the given resolution.
  */
-export function renderRoom(cam, w, h, f, cx, cy, half = 2) {
+export function renderRoom(cam, w, h, f, cx, cy, half = 2, k1 = 0) {
   const gray = new Float32Array(w * h), depth = new Float32Array(w * h);
   const rgba = new Uint8ClampedArray(w * h * 4);
   const R = cam.R, t = cam.t;
@@ -35,7 +36,8 @@ export function renderRoom(cam, w, h, f, cx, cy, half = 2) {
   const C = [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const dc = [(x - cx) / f, (y - cy) / f, 1];
+      const [ux, uy] = k1 ? undistortNormalized((x - cx) / f, (y - cy) / f, k1) : [(x - cx) / f, (y - cy) / f];
+      const dc = [ux, uy, 1];
       const dw = [R[0] * dc[0] + R[3] * dc[1] + R[6] * dc[2], R[1] * dc[0] + R[4] * dc[1] + R[7] * dc[2], R[2] * dc[0] + R[5] * dc[1] + R[8] * dc[2]];
       let best = Infinity, uv = null, face = -1;
       for (let a = 0; a < 3; a++) {
@@ -60,14 +62,15 @@ export function renderRoom(cam, w, h, f, cx, cy, half = 2) {
 }
 
 /** Ray-cast a textured sphere in front of a textured back wall (an "object" scene). */
-export function renderObject(cam, w, h, f, cx, cy, radius = 1, wallZ = 3) {
+export function renderObject(cam, w, h, f, cx, cy, radius = 1, wallZ = 3, k1 = 0) {
   const gray = new Float32Array(w * h), depth = new Float32Array(w * h);
   const rgba = new Uint8ClampedArray(w * h * 4);
   const R = cam.R, t = cam.t;
   const C = [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const dc = [(x - cx) / f, (y - cy) / f, 1];
+      const [ux, uy] = k1 ? undistortNormalized((x - cx) / f, (y - cy) / f, k1) : [(x - cx) / f, (y - cy) / f];
+      const dc = [ux, uy, 1];
       const dw = [R[0] * dc[0] + R[3] * dc[1] + R[6] * dc[2], R[1] * dc[0] + R[4] * dc[1] + R[7] * dc[2], R[2] * dc[0] + R[5] * dc[1] + R[8] * dc[2]];
       // sphere at origin
       const b = C[0] * dw[0] + C[1] * dw[1] + C[2] * dw[2];

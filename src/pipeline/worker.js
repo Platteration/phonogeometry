@@ -11,8 +11,9 @@ self.onmessage = async (ev) => {
     const transfer = [
       result.mesh.positions.buffer, result.mesh.normals.buffer, result.mesh.colors.buffer, result.mesh.indices.buffer,
       result.sparse.positions.buffer, result.sparse.colors.buffer,
+      result.dense.positions.buffer, result.dense.colors.buffer,
     ];
-    self.postMessage({ type: 'done', result: { mesh: result.mesh, sparse: result.sparse, cameras: result.cameras, stats: result.stats } }, transfer);
+    self.postMessage({ type: 'done', result: { mesh: result.mesh, sparse: result.sparse, dense: result.dense, cameras: result.cameras, stats: result.stats } }, transfer);
   } catch (err) {
     self.postMessage({ type: 'error', message: err && err.message ? err.message : String(err), stack: err && err.stack });
   }

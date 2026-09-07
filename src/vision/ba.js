@@ -3,13 +3,14 @@
 import { rotvecToMat, matMul, matVec, solveSPD, inv3 } from './linalg.js';
 
 /**
- * @param cameras [{R: Float64Array(9), t: Float64Array(3), f: number, fixed?: boolean, focalGroup?: number}]
- *   Cameras sharing a focalGroup index share one focal-length scale parameter when
- *   opts.refineFocal is set; the scale is written back as cameras[c].focalScale.
+ * @param cameras [{R: Float64Array(9), t: Float64Array(3), f: number, k1?: number, fixed?: boolean, focalGroup?: number}]
+ *   Cameras sharing a focalGroup share one focal-length scale (opts.refineFocal) and one
+ *   radial distortion coefficient k1 (opts.refineDistortion). Results are written back as
+ *   cameras[c].focalScale and cameras[c].k1. Distortion model: x_d = x (1 + k1 |x|^2).
  * @param points Float64Array(3 * np) world points (modified in place)
- * @param obs {cam: Int32Array, pt: Int32Array, x: Float64Array(2*nobs)} observations normalised
- *   with the cameras' initial focal lengths
- * @param opts {iterations, huber (pixels), refineFocal}
+ * @param obs {cam: Int32Array, pt: Int32Array, x: Float64Array(2*nobs)} raw (distorted) observations
+ *   normalised with the cameras' initial focal lengths: (pixel - centre) / f
+ * @param opts {iterations, huber (pixels), refineFocal, refineDistortion}
  * @returns {{initialRms:number, finalRms:number, iterations:number, focalScales: Float64Array}}
  */
 export function bundleAdjust(cameras, points, obs, opts = {}) {
@@ -23,23 +24,31 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
   const camIndex = new Int32Array(nc);
   let nfree = 0;
   for (let c = 0; c < nc; c++) camIndex[c] = cameras[c].fixed ? -1 : nfree++;
+  // Intrinsic groups: one focal-length scale and one radial distortion coefficient (k1) per
+  // physical camera. Group parameters live after the pose parameters in the camera block.
   let nGroups = 0;
-  const groupIndex = new Int32Array(nc).fill(-1);
-  if (opts.refineFocal) {
+  const grp = new Int32Array(nc).fill(-1);
+  const useFocal = !!opts.refineFocal, useDist = !!opts.refineDistortion;
+  if (useFocal || useDist) {
     const map = new Map();
     for (let c = 0; c < nc; c++) {
       const g = cameras[c].focalGroup ?? c;
       if (!map.has(g)) map.set(g, nGroups++);
-      groupIndex[c] = nfree * 6 + map.get(g);
+      grp[c] = map.get(g);
     }
   }
-  const NC = nfree * 6 + nGroups;
+  const NC = nfree * 6 + nGroups * 2;
   const scale = new Float64Array(nGroups).fill(1); // focal multipliers
+  const k1p = new Float64Array(nGroups); // radial distortion per group (absolute)
+  for (let c = 0; c < nc; c++) if (grp[c] >= 0) k1p[grp[c]] = cameras[c].k1 || 0;
+  const scaleIdx = (c) => (useFocal && grp[c] >= 0 ? nfree * 6 + grp[c] * 2 : -1);
+  const k1Idx = (c) => (useDist && grp[c] >= 0 ? nfree * 6 + grp[c] * 2 + 1 : -1);
 
   const R = cameras.map((c) => Float64Array.from(c.R));
   const t = cameras.map((c) => Float64Array.from(c.t));
   const F = cameras.map((c) => c.f || 1);
-  const NP = 7; // camera-block parameters touched by one observation: 6 pose + 1 focal
+  const K1 = cameras.map((c) => c.k1 || 0);
+  const NP = 8; // camera-block parameters touched by one observation: 6 pose + focal + k1
 
   // Observations grouped by point (for the Schur complement)
   const ptObsStart = new Int32Array(np + 1);
@@ -54,12 +63,12 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
   const residuals = new Float64Array(nobs * 2);
   const weights = new Float64Array(nobs);
 
-  function computeResiduals(Rs, ts, pts, sc) {
+  function computeResiduals(Rs, ts, pts, sc, kk) {
     let total = 0, count = 0;
     for (let o = 0; o < nobs; o++) {
       const c = obs.cam[o], p = obs.pt[o];
       const Rc = Rs[c], tc = ts[c];
-      const gi = groupIndex[c], sgc = gi >= 0 ? sc[gi - nfree * 6] : 1;
+      const g = grp[c], sgc = g >= 0 ? sc[g] : 1, k1 = g >= 0 ? kk[g] : K1[c];
       const X0 = pts[p * 3], X1 = pts[p * 3 + 1], X2 = pts[p * 3 + 2];
       const z = Rc[6] * X0 + Rc[7] * X1 + Rc[8] * X2 + tc[2];
       if (z <= 1e-9) {
@@ -69,8 +78,9 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
       }
       const x = (Rc[0] * X0 + Rc[1] * X1 + Rc[2] * X2 + tc[0]) / z;
       const y = (Rc[3] * X0 + Rc[4] * X1 + Rc[5] * X2 + tc[1]) / z;
-      // pixel residual with the current focal scale: f*s*proj - f*obs
-      const ru = (sgc * x - obs.x[o * 2]) * F[c], rv = (sgc * y - obs.x[o * 2 + 1]) * F[c];
+      const D = 1 + k1 * (x * x + y * y);
+      // pixel residual with the current intrinsics: f*s*distort(proj) - f*obs
+      const ru = (sgc * x * D - obs.x[o * 2]) * F[c], rv = (sgc * y * D - obs.x[o * 2 + 1]) * F[c];
       residuals[o * 2] = ru; residuals[o * 2 + 1] = rv;
       const e = Math.hypot(ru, rv);
       const w = e <= huber ? 1 : huber / e;
@@ -81,7 +91,7 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
     return { cost: total, rms: Math.sqrt(total / Math.max(1, count)) };
   }
 
-  let { cost, rms: initialRms } = computeResiduals(R, t, points, scale);
+  let { cost, rms: initialRms } = computeResiduals(R, t, points, scale, k1p);
   let lambda = 1e-4;
   let iterDone = 0;
 
@@ -102,29 +112,31 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
       if (w === 0) continue;
       const c = obs.cam[o], p = obs.pt[o];
       const Rc = R[c], tc = t[c];
-      const gi = groupIndex[c], sgc = gi >= 0 ? scale[gi - nfree * 6] : 1;
+      const g = grp[c], sgc = g >= 0 ? scale[g] : 1, k1 = g >= 0 ? k1p[g] : K1[c];
       const f = F[c] * sgc;
       const X0 = points[p * 3], X1 = points[p * 3 + 1], X2 = points[p * 3 + 2];
       const xc = Rc[0] * X0 + Rc[1] * X1 + Rc[2] * X2 + tc[0];
       const yc = Rc[3] * X0 + Rc[4] * X1 + Rc[5] * X2 + tc[1];
       const zc = Rc[6] * X0 + Rc[7] * X1 + Rc[8] * X2 + tc[2];
       const iz = 1 / zc, u = xc * iz, v = yc * iz;
-      // d(f*s*u, f*s*v)/dXc
-      const Ju0 = f * iz, Ju2 = -f * u * iz;
-      const Jv1 = f * iz, Jv2 = -f * v * iz;
-      // dXc/dθ = -[Xc]x ; dXc/dt = I
-      // -[Xc]x = [[0, zc, -yc], [-zc, 0, xc], [yc, -xc, 0]]
-      // Jc rows: u then v; columns θ(3), t(3)
-      Jc[0] = Ju2 * yc;            Jc[1] = Ju0 * zc - Ju2 * xc;   Jc[2] = -Ju0 * yc;
-      Jc[3] = Ju0; Jc[4] = 0; Jc[5] = Ju2;
-      Jc[6] = 0; // focal scale: d(f*s*u)/ds = f*u
-      Jc[NP + 0] = -Jv1 * zc + Jv2 * yc; Jc[NP + 1] = -Jv2 * xc;    Jc[NP + 2] = Jv1 * xc;
-      Jc[NP + 3] = 0; Jc[NP + 4] = Jv1; Jc[NP + 5] = Jv2;
-      Jc[NP + 6] = 0;
-      if (gi >= 0) { Jc[6] = F[c] * u; Jc[NP + 6] = F[c] * v; }
-      // dXc/dX = R  => Jp = J_proj * R
-      Jp[0] = Ju0 * Rc[0] + Ju2 * Rc[6]; Jp[1] = Ju0 * Rc[1] + Ju2 * Rc[7]; Jp[2] = Ju0 * Rc[2] + Ju2 * Rc[8];
-      Jp[3] = Jv1 * Rc[3] + Jv2 * Rc[6]; Jp[4] = Jv1 * Rc[4] + Jv2 * Rc[7]; Jp[5] = Jv1 * Rc[5] + Jv2 * Rc[8];
+      const r2 = u * u + v * v, D = 1 + k1 * r2;
+      // Distorted normalised coordinates d = (u D, v D); dd/d(u,v) = D I + 2 k1 [u v]^T [u v]
+      const m00 = D + 2 * k1 * u * u, m01 = 2 * k1 * u * v, m11 = D + 2 * k1 * v * v;
+      // Pinhole d(u,v)/dXc rows: (iz, 0, -u iz) and (0, iz, -v iz); chain through the distortion and f
+      const Au0 = f * m00 * iz, Au1 = f * m01 * iz, Au2 = -f * (m00 * u + m01 * v) * iz;
+      const Av0 = f * m01 * iz, Av1 = f * m11 * iz, Av2 = -f * (m01 * u + m11 * v) * iz;
+      // dXc/dθ = -[Xc]x = [[0, zc, -yc], [-zc, 0, xc], [yc, -xc, 0]] ; dXc/dt = I
+      Jc[0] = -Au1 * zc + Au2 * yc; Jc[1] = Au0 * zc - Au2 * xc; Jc[2] = -Au0 * yc + Au1 * xc;
+      Jc[3] = Au0; Jc[4] = Au1; Jc[5] = Au2;
+      Jc[6] = F[c] * u * D;      // d/d(scale)
+      Jc[7] = f * u * r2;        // d/d(k1)
+      Jc[NP + 0] = -Av1 * zc + Av2 * yc; Jc[NP + 1] = Av0 * zc - Av2 * xc; Jc[NP + 2] = -Av0 * yc + Av1 * xc;
+      Jc[NP + 3] = Av0; Jc[NP + 4] = Av1; Jc[NP + 5] = Av2;
+      Jc[NP + 6] = F[c] * v * D;
+      Jc[NP + 7] = f * v * r2;
+      // dXc/dX = R  => Jp = A * R
+      Jp[0] = Au0 * Rc[0] + Au1 * Rc[3] + Au2 * Rc[6]; Jp[1] = Au0 * Rc[1] + Au1 * Rc[4] + Au2 * Rc[7]; Jp[2] = Au0 * Rc[2] + Au1 * Rc[5] + Au2 * Rc[8];
+      Jp[3] = Av0 * Rc[0] + Av1 * Rc[3] + Av2 * Rc[6]; Jp[4] = Av0 * Rc[1] + Av1 * Rc[4] + Av2 * Rc[7]; Jp[5] = Av0 * Rc[2] + Av1 * Rc[5] + Av2 * Rc[8];
       const ru = residuals[o * 2], rv = residuals[o * 2 + 1];
       const ci = camIndex[c];
       // Point block
@@ -136,7 +148,8 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
       const op = o * NP;
       for (let a = 0; a < NP; a++) obsParams[op + a] = -1;
       if (ci >= 0) for (let a = 0; a < 6; a++) obsParams[op + a] = ci * 6 + a;
-      if (gi >= 0) obsParams[op + 6] = gi;
+      obsParams[op + 6] = scaleIdx(c);
+      obsParams[op + 7] = k1Idx(c);
       for (let a = 0; a < NP; a++) {
         const ia = obsParams[op + a];
         if (ia < 0) continue;
@@ -235,15 +248,18 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
         const Rt = matVec(dR, t[c], 3, 3);
         newT[c] = new Float64Array([Rt[0] + d[3], Rt[1] + d[4], Rt[2] + d[5]]);
       }
-      const newScale = Float64Array.from(scale);
-      for (let g = 0; g < nGroups; g++) newScale[g] = Math.min(2.5, Math.max(0.4, scale[g] + dc[nfree * 6 + g]));
+      const newScale = Float64Array.from(scale), newK1 = Float64Array.from(k1p);
+      for (let g = 0; g < nGroups; g++) {
+        if (useFocal) newScale[g] = Math.min(2.5, Math.max(0.4, scale[g] + dc[nfree * 6 + g * 2]));
+        if (useDist) newK1[g] = Math.min(0.6, Math.max(-0.6, k1p[g] + dc[nfree * 6 + g * 2 + 1]));
+      }
       const savedRes = Float64Array.from(residuals), savedW = Float64Array.from(weights);
-      const trial = computeResiduals(newR, newT, newPts, newScale);
+      const trial = computeResiduals(newR, newT, newPts, newScale, newK1);
       if (trial.cost < cost) {
         const rel = (cost - trial.cost) / cost;
         cost = trial.cost;
         for (let c = 0; c < nc; c++) { R[c] = newR[c]; t[c] = newT[c]; }
-        scale.set(newScale);
+        scale.set(newScale); k1p.set(newK1);
         points.set(newPts);
         lambda = Math.max(1e-9, lambda / 3);
         accepted = true;
@@ -257,8 +273,9 @@ export function bundleAdjust(cameras, points, obs, opts = {}) {
   }
   for (let c = 0; c < nc; c++) {
     cameras[c].R = R[c]; cameras[c].t = t[c];
-    cameras[c].focalScale = groupIndex[c] >= 0 ? scale[groupIndex[c] - nfree * 6] : 1;
+    cameras[c].focalScale = useFocal && grp[c] >= 0 ? scale[grp[c]] : 1;
+    cameras[c].k1 = grp[c] >= 0 ? k1p[grp[c]] : K1[c];
   }
-  const final = computeResiduals(R, t, points, scale);
-  return { initialRms, finalRms: final.rms, iterations: iterDone, focalScales: scale };
+  const final = computeResiduals(R, t, points, scale, k1p);
+  return { initialRms, finalRms: final.rms, iterations: iterDone, focalScales: scale, k1s: k1p };
 }

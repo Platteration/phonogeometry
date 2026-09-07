@@ -78,3 +78,23 @@ test('end-to-end: a wrong assumed focal length is corrected by refinement', asyn
   const refined = res.debug.frames[0].f; // processing resolution equals the input here
   assert.ok(Math.abs(refined / fTrue - 1) < 0.03, `refined focal ${refined.toFixed(1)} vs true ${fTrue}\n${logs.filter((l) => /Focal|Bundle/.test(l)).join('\n')}`);
 });
+
+test('end-to-end: a distorted (ultra-wide style) lens is calibrated and reconstructed', async () => {
+  const w = 320, h = 240, f = 200, cx = 159.5, cy = 119.5, k1 = -0.15;
+  const images = [];
+  for (let i = 0; i < 8; i++) {
+    const ang = -0.55 + i * (1.1 / 7);
+    const dist = 2.2 + 0.3 * (i % 3);
+    const cam = lookAt([Math.sin(ang) * dist, 0.3 * Math.sin(i), -Math.cos(ang) * dist], [0, 0, 0]);
+    const r = renderObject(cam, w, h, f, cx, cy, 1, 3, k1);
+    images.push({ id: `cam${i}`, label: `ultra ${i}`, width: w, height: h, rgba: r.rgba, f, cx, cy, shotIndex: i, focalGroup: 'ultrawide' });
+  }
+  const logs = [];
+  const res = await reconstruct(images, { quality: 'fast', preset: 'object', debug: true, overrides: { featureWidth: 320, depthWidth: 160 } }, (s, fr, m) => { if (m) logs.push(m); });
+  assert.ok(res.stats.registered >= 7, `registered ${res.stats.registered}\n${logs.join('\n')}`);
+  const k1Est = res.debug.frames[0].k1;
+  assert.ok(Math.abs(k1Est - k1) < 0.05, `estimated k1 ${k1Est.toFixed(3)} vs ${k1}\n${logs.filter((l) => /Intrinsics/.test(l)).join('\n')}`);
+  assert.ok(res.stats.triangles > 1000);
+  assert.equal(res.dense.positions.length, res.dense.colors.length);
+  assert.ok(res.stats.densePoints > 1000);
+});

@@ -1,6 +1,6 @@
 // Incremental structure-from-motion: pairwise geometry, feature tracks, two-view
 // initialisation, PnP registration, triangulation and bundle adjustment.
-import { ransacEssential, recoverPose, triangulate, poseMatrix, ransacPnP, projectPoint, triangulationAngle } from './geometry.js';
+import { ransacEssential, recoverPose, triangulate, poseMatrix, ransacPnP, projectPoint, triangulationAngle, undistortNormalized } from './geometry.js';
 import { cameraCenter, transpose, matMul, matVec, cross, dot } from './linalg.js';
 import { bundleAdjust } from './ba.js';
 
@@ -22,21 +22,22 @@ export function runSfM(frames, pairs, opts = {}) {
   const minAngle = (opts.minAngleDeg ?? 1.5) * Math.PI / 180;
   const nf = frames.length;
 
-  // Normalized keypoints
-  const nk = frames.map((fr) => {
+  // Normalized, undistorted keypoints (pinhole-equivalent) for the current intrinsics
+  for (const fr of frames) fr.k1 = fr.k1 || 0;
+  const computeNk = (fr) => {
     const out = new Float64Array(fr.count * 2);
     for (let k = 0; k < fr.count; k++) {
-      out[k * 2] = (fr.keypoints[k * 2] - fr.cx) / fr.f;
-      out[k * 2 + 1] = (fr.keypoints[k * 2 + 1] - fr.cy) / fr.f;
+      const [x, y] = undistortNormalized((fr.keypoints[k * 2] - fr.cx) / fr.f, (fr.keypoints[k * 2 + 1] - fr.cy) / fr.f, fr.k1);
+      out[k * 2] = x; out[k * 2 + 1] = y;
     }
     return out;
-  });
+  };
+  const nk = frames.map(computeNk);
 
   // Pairwise two-view geometry
-  const goodPairs = [];
-  for (const pr of pairs) {
+  function verifyPair(pr) {
     const n = pr.matches.length / 2;
-    if (n < 8) continue;
+    if (n < 8) return null;
     const fi = frames[pr.i], fj = frames[pr.j];
     const p1 = new Float64Array(n * 2), p2 = new Float64Array(n * 2);
     for (let m = 0; m < n; m++) {
@@ -46,12 +47,12 @@ export function runSfM(frames, pairs, opts = {}) {
     }
     const fmin = Math.min(fi.f, fj.f);
     const res = ransacEssential(p1, p2, n, pxThr / fmin, { maxIters: 600, seed: 1000 + pr.i * 131 + pr.j });
-    if (!res || res.inliers.length < minInliers) continue;
+    if (!res || res.inliers.length < minInliers) return null;
     const ni = res.inliers.length;
     const a = new Float64Array(ni * 2), b = new Float64Array(ni * 2);
     res.inliers.forEach((m, k) => { a[k * 2] = p1[m * 2]; a[k * 2 + 1] = p1[m * 2 + 1]; b[k * 2] = p2[m * 2]; b[k * 2 + 1] = p2[m * 2 + 1]; });
     const pose = recoverPose(res.E, a, b, ni, 4 * pxThr / fmin);
-    if (!pose || pose.good < minInliers) continue;
+    if (!pose || pose.good < minInliers) return null;
     const C2 = cameraCenter(pose.R, pose.t);
     const angles = [];
     const inlierPairs = [];
@@ -63,8 +64,10 @@ export function runSfM(frames, pairs, opts = {}) {
     });
     angles.sort((x, y) => x - y);
     const medianAngle = angles[Math.floor(angles.length / 2)] || 0;
-    goodPairs.push({ i: pr.i, j: pr.j, R: pose.R, t: pose.t, inliers: Int32Array.from(inlierPairs), count: pose.good, medianAngle });
+    return { i: pr.i, j: pr.j, R: pose.R, t: pose.t, inliers: Int32Array.from(inlierPairs), count: pose.good, medianAngle };
   }
+  const goodPairs = [];
+  for (const pr of pairs) { const gp = verifyPair(pr); if (gp) goodPairs.push(gp); }
   log(`Verified ${goodPairs.length}/${pairs.length} image pairs`);
   if (goodPairs.length === 0) return { cameras: frames.map(() => null), points: new Float64Array(0), tracks: [], registeredCount: 0, error: 'No image pair with enough geometrically consistent matches' };
 
@@ -96,6 +99,34 @@ export function runSfM(frames, pairs, opts = {}) {
   }
   for (const tr of tracks) if (tr.obs.length < 2) tr.bad = true;
   log(`Built ${tracks.filter((t) => !t.bad).length} feature tracks`);
+
+  /** Merge the inlier matches of a newly verified pair into the existing tracks. */
+  function addPairToTracks(gp) {
+    for (let m = 0; m < gp.inliers.length; m += 2) {
+      const na = offsets[gp.i] + gp.inliers[m], nb = offsets[gp.j] + gp.inliers[m + 1];
+      const ta = nodeTrack[na], tb = nodeTrack[nb];
+      if (ta >= 0 && ta === tb) continue;
+      if (ta < 0 && tb < 0) {
+        const tid = tracks.length;
+        tracks.push({ obs: [{ frame: gp.i, kp: gp.inliers[m], ok: false }, { frame: gp.j, kp: gp.inliers[m + 1], ok: false }], point: null, bad: false, frames: new Set([gp.i, gp.j]) });
+        nodeTrack[na] = tid; nodeTrack[nb] = tid;
+        continue;
+      }
+      if (ta >= 0 && tb >= 0) {
+        // merge tb into ta (a track may not contain two keypoints of one frame)
+        const A = tracks[ta], B = tracks[tb];
+        for (const fr of B.frames) if (A.frames.has(fr)) A.bad = true;
+        for (const o of B.obs) { A.obs.push(o); A.frames.add(o.frame); nodeTrack[offsets[o.frame] + o.kp] = ta; }
+        B.bad = true; B.obs = []; B.point = null;
+        if (A.bad) A.point = null;
+        continue;
+      }
+      const [tid, node, fr, kp] = ta >= 0 ? [ta, nb, gp.j, gp.inliers[m + 1]] : [tb, na, gp.i, gp.inliers[m]];
+      const T = tracks[tid];
+      if (T.frames.has(fr)) { T.bad = true; T.point = null; continue; }
+      T.frames.add(fr); T.obs.push({ frame: fr, kp, ok: false }); nodeTrack[node] = tid;
+    }
+  }
 
   // Initial pair
   const sorted = goodPairs.slice().sort((a, b) => b.count - a.count);
@@ -156,8 +187,9 @@ export function runSfM(frames, pairs, opts = {}) {
   log(`Initial triangulation: ${tracks.filter((t) => t.point).length} points`);
 
   const refineFocal = opts.refineFocal !== false;
+  const refineDistortion = opts.refineDistortion !== false;
   function runBA(iterations, withFocal = false) {
-    const camList = registered.map((fr, idx) => ({ R: camR[fr], t: camT[fr], f: frames[fr].f, fixed: idx === 0, focalGroup: frames[fr].focalGroup ?? fr }));
+    const camList = registered.map((fr, idx) => ({ R: camR[fr], t: camT[fr], f: frames[fr].f, k1: frames[fr].k1, fixed: idx === 0, focalGroup: frames[fr].focalGroup ?? fr }));
     const camPos = new Int32Array(nf).fill(-1);
     registered.forEach((fr, idx) => { camPos[fr] = idx; });
     const ptTracks = [];
@@ -168,29 +200,33 @@ export function runSfM(frames, pairs, opts = {}) {
       const good = tr.obs.filter((o) => o.ok && camPos[o.frame] >= 0);
       if (good.length < 2) { tr.point = null; continue; }
       const p = ptTracks.length; ptTracks.push(tid);
-      for (const o of good) { camIdx.push(camPos[o.frame]); ptIdx.push(p); xs.push(nk[o.frame][o.kp * 2], nk[o.frame][o.kp * 2 + 1]); }
+      for (const o of good) {
+        const fr = frames[o.frame];
+        camIdx.push(camPos[o.frame]); ptIdx.push(p);
+        // raw (distorted) normalised observations, as the BA camera model expects
+        xs.push((fr.keypoints[o.kp * 2] - fr.cx) / fr.f, (fr.keypoints[o.kp * 2 + 1] - fr.cy) / fr.f);
+      }
     }
     if (ptTracks.length < 8) return;
     const pts = new Float64Array(ptTracks.length * 3);
     ptTracks.forEach((tid, p) => pts.set(tracks[tid].point, p * 3));
     const useFocal = withFocal && refineFocal && registered.length >= 3;
-    const res = bundleAdjust(camList, pts, { cam: Int32Array.from(camIdx), pt: Int32Array.from(ptIdx), x: Float64Array.from(xs) }, { iterations, huber: pxThr * 1.5, refineFocal: useFocal });
+    const useDist = withFocal && refineDistortion && registered.length >= 4 && ptTracks.length >= 100;
+    const res = bundleAdjust(camList, pts, { cam: Int32Array.from(camIdx), pt: Int32Array.from(ptIdx), x: Float64Array.from(xs) }, { iterations, huber: pxThr * 1.5, refineFocal: useFocal, refineDistortion: useDist });
     registered.forEach((fr, idx) => { camR[fr] = camList[idx].R; camT[fr] = camList[idx].t; });
-    if (useFocal) {
-      // Apply the estimated focal scales: frames' focal lengths and their normalised keypoints
-      const changed = new Set();
-      registered.forEach((fr, idx) => {
-        const sc = camList[idx].focalScale || 1;
-        if (Math.abs(sc - 1) < 1e-6) return;
-        frames[fr].f *= sc;
-        for (let k = 0; k < nk[fr].length; k++) nk[fr][k] /= sc;
-        changed.add(fr);
+    if (useFocal || useDist) {
+      // Apply the refined intrinsics to every frame of each camera group (registered or not)
+      // and re-normalise their keypoints
+      const groups = new Map();
+      registered.forEach((fr, idx) => { groups.set(frames[fr].focalGroup ?? fr, { sc: camList[idx].focalScale || 1, k1: camList[idx].k1 || 0 }); });
+      frames.forEach((frm, fr) => {
+        const g = groups.get(frm.focalGroup ?? fr);
+        if (!g) return;
+        const changed = Math.abs(g.sc - 1) > 1e-6 || Math.abs(g.k1 - frm.k1) > 1e-6;
+        frm.f *= g.sc; frm.k1 = g.k1;
+        if (changed) nk[fr] = computeNk(frm);
       });
-      if (changed.size) {
-        const groups = new Map();
-        registered.forEach((fr, idx) => { groups.set(frames[fr].focalGroup ?? fr, camList[idx].focalScale || 1); });
-        log(`Focal length refinement: ${Array.from(groups.values()).map((v) => (v * 100).toFixed(1) + '%').join(', ')} of the assumed value`);
-      }
+      log(`Intrinsics refinement: ` + Array.from(groups.values()).map((g) => `focal ${(g.sc * 100).toFixed(1)}%` + (useDist ? `, k1 ${g.k1.toFixed(3)}` : '')).join(' | '));
     }
     ptTracks.forEach((tid, p) => { tracks[tid].point = pts.subarray(p * 3, p * 3 + 3).slice(); });
     // Re-validate observations, drop weak points
@@ -273,6 +309,7 @@ export function runSfM(frames, pairs, opts = {}) {
   let sinceBA = 0;
   const failed = new Set();
   let retryPass = false;
+  function registerLoop() {
   let guard = 0;
   while (registered.length < nf && guard++ < nf * 4) {
     let best = -1, bestCount = 0;
@@ -306,11 +343,33 @@ export function runSfM(frames, pairs, opts = {}) {
     camR[best] = res.R; camT[best] = res.t; registered.push(best);
     const newPts = triangulateNewTracks(best);
     log(`Registered frame ${best} with ${res.inliers.length}/${n} PnP inliers, +${newPts} points`);
-    if (++sinceBA >= 3) { runBA(6); sinceBA = 0; }
+    if (++sinceBA >= 3) { runBA(6, registered.length >= 4); sinceBA = 0; }
   }
-  // Final refinement: second triangulation pass for tracks that became triangulable
+  }
+  registerLoop();
+
+  // Refine intrinsics, then give the remaining frames a second chance with corrected geometry
   for (const tr of tracks) if (!tr.bad && !tr.point) tryTriangulate(tr);
   runBA(25, true);
+  for (const tr of tracks) if (!tr.bad && !tr.point) tryTriangulate(tr);
+  if (registered.length < nf) {
+    const unreg = new Set(); for (let fr = 0; fr < nf; fr++) if (!camR[fr]) unreg.add(fr);
+    let reverified = 0;
+    for (const pr of pairs) {
+      if (!unreg.has(pr.i) && !unreg.has(pr.j)) continue;
+      const gp = verifyPair(pr);
+      if (!gp) continue;
+      const idx = goodPairs.findIndex((g) => g.i === gp.i && g.j === gp.j);
+      if (idx >= 0) goodPairs[idx] = gp; else goodPairs.push(gp);
+      addPairToTracks(gp);
+      reverified++;
+    }
+    for (const fr of registered) triangulateNewTracks(fr);
+    log(`Second pass: re-verified ${reverified} pairs involving the ${unreg.size} unregistered frame(s)`);
+    failed.clear(); chainFailed.clear(); retryPass = false;
+    registerLoop();
+    for (const tr of tracks) if (!tr.bad && !tr.point) tryTriangulate(tr);
+  }
   runBA(10, true);
 
   // Output
@@ -325,5 +384,5 @@ export function runSfM(frames, pairs, opts = {}) {
   }
   const cameras = frames.map((_, i) => (camR[i] ? { R: camR[i], t: camT[i] } : null));
   log(`SfM done: ${registered.length}/${nf} frames registered, ${pointTracks.length} points`);
-  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length, focals: frames.map((fr) => fr.f) };
+  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length, focals: frames.map((fr) => fr.f), k1s: frames.map((fr) => fr.k1) };
 }

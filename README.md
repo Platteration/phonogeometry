@@ -23,13 +23,13 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 | --- | --- | --- |
 | Features | Multi-scale FAST corners with oriented BRIEF descriptors (ORB-style, 256 bit) | `src/vision/fast.js`, `src/vision/orb.js` |
 | Matching | Brute-force Hamming with ratio test and mutual check; candidate pairs from shot order plus a global thumbnail descriptor | `src/vision/match.js` |
-| Two-view geometry | Normalised eight-point essential matrix inside RANSAC, cheirality-based pose recovery | `src/vision/geometry.js` |
+| Two-view geometry | Normalised eight-point essential matrix inside RANSAC, cheirality-based pose recovery; radial distortion model for keypoints and images | `src/vision/geometry.js` |
 | Structure from motion | Incremental: feature tracks, best-pair initialisation, PnP registration (DLT + RANSAC + Levenberg–Marquardt), pairwise pose chaining fallback | `src/vision/sfm.js` |
 | Bundle adjustment | Sparse Levenberg–Marquardt with the Schur complement and Huber loss; refines one focal length per physical camera | `src/vision/ba.js` |
 | Dense depth | Multi-view plane sweep with zero-mean normalised cross-correlation (robust to exposure differences between physical cameras), sub-plane refinement, cross-view consistency check; runs on the GPU through WebGL2 with an identical CPU fallback | `src/vision/planeSweepGPU.js`, `src/vision/planeSweep.js` |
 | Fusion | Truncated signed distance volume with per-voxel colour; object and person scans focus the volume on the point the cameras converge on | `src/mesh/tsdf.js`, `src/pipeline/reconstruct.js` |
 | Meshing | Naive surface nets, component filtering, Taubin smoothing, vertex colours | `src/mesh/surfaceNets.js`, `src/mesh/meshUtils.js` |
-| Export | GLB (glTF 2.0 binary), binary PLY, OBJ | `src/mesh/exporters.js` |
+| Export | GLB (glTF 2.0 binary), binary PLY, OBJ, dense point cloud PLY | `src/mesh/exporters.js` |
 
 The viewer uses three.js (vendored in `vendor/three`, MIT licensed).
 
@@ -60,7 +60,7 @@ Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phone
 
 ### Camera lenses
 
-Browsers do not report focal lengths. Each camera is mapped to a lens type (wide, ultra-wide, telephoto, front) from its label, which sets its initial field of view; bundle adjustment then refines one focal length per physical camera, which corrects errors of 10–20% when the shots vary in distance. If a phone reports generic names ("camera2 0, facing back") check the mapping under **Settings**: a closer starting guess still helps. Imported photos use the 35 mm-equivalent focal length from EXIF when present.
+Browsers do not report focal lengths. Each camera is mapped to a lens type (wide, ultra-wide, telephoto, front) from its label, which sets its initial field of view; bundle adjustment then refines one focal length and one radial distortion coefficient per physical camera. This corrects focal errors of 10–20% and the barrel distortion of ultra-wide lenses when the shots vary in distance. The calibrated values are printed under Details on the processing screen. If a phone reports generic names ("camera2 0, facing back") check the mapping under **Settings**: a closer starting guess still helps. Imported photos use the 35 mm-equivalent focal length from EXIF when present.
 
 Some phones refuse to stream several rear cameras at the same time. Cameras that cannot be opened concurrently are captured sequentially right after the simultaneous ones (this is on by default and can be disabled in Settings); hold still for that half second.
 

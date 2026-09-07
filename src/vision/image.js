@@ -173,3 +173,39 @@ export function medianFilterDepth(depth, w, h) {
   }
   return out;
 }
+
+/**
+ * Resample a radially distorted image onto the ideal pinhole grid with the same
+ * intrinsics (inverse mapping, bilinear). Pixels without a source are set to 0.
+ */
+export function undistortGray(gray, w, h, f, cx, cy, k1) {
+  if (!k1) return gray;
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const ny = (y - cy) / f;
+    for (let x = 0; x < w; x++) {
+      const nx = (x - cx) / f;
+      const D = 1 + k1 * (nx * nx + ny * ny);
+      const v = sampleBilinear(gray, w, h, cx + f * nx * D, cy + f * ny * D);
+      out[y * w + x] = Number.isNaN(v) ? 0 : v;
+    }
+  }
+  return out;
+}
+
+export function undistortRGBA(rgba, w, h, f, cx, cy, k1) {
+  if (!k1) return rgba;
+  const out = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    const ny = (y - cy) / f;
+    for (let x = 0; x < w; x++) {
+      const nx = (x - cx) / f;
+      const D = 1 + k1 * (nx * nx + ny * ny);
+      const sx = Math.round(cx + f * nx * D), sy = Math.round(cy + f * ny * D);
+      if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+      const si = (sy * w + sx) * 4, di = (y * w + x) * 4;
+      out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2]; out[di + 3] = 255;
+    }
+  }
+  return out;
+}
