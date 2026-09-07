@@ -142,6 +142,7 @@
       <label class="check"><input type="checkbox" id="chk-sequential" checked /> If a camera cannot stream at the same time as the others, switch to it and capture sequentially</label>
       <h3>Processing</h3>
       <label class="check"><input type="checkbox" id="chk-gpu" checked /> Compute depth maps on the GPU (WebGL2). Turn off if reconstruction fails or the browser crashes.</label>
+      <label class="check"><input type="checkbox" id="chk-rig" checked /> Use the camera rig: cameras fired in the same shot are rigidly attached, so a pose found for one places the others. This is what lets the front camera join a scan of the room behind you.</label>
       <div class="row gap end">
         <button value="close" class="primary">Done</button>
       </div>
@@ -152,7 +153,7 @@
     <form method="dialog">
       <h2>How to scan</h2>
       <ol class="help-list">
-        <li><strong>Enable all cameras.</strong> Every lens the browser exposes (wide, ultra-wide, telephoto, front) shows up as a tile. Each shot captures from all of them at once, so one press covers more of the scene and gives both wide context and sharp detail.</li>
+        <li><strong>Enable all cameras.</strong> Every lens the browser exposes (wide, ultra-wide, telephoto, front) shows up as a tile. Each shot captures from all of them at once, so one press covers more of the scene and gives both wide context and sharp detail. The cameras are bolted to the same phone, so a position worked out for one places the others, and the front camera joins the scan even though it never sees what the back cameras see.</li>
         <li><strong>Move, then shoot.</strong> Change your position between shots by roughly 20–30° around an object or person, or step sideways about a metre in a room. Parallax from movement is what makes the 3D.</li>
         <li><strong>Overlap and texture.</strong> Each shot should share at least half of its view with the previous one. Plain white walls and glossy surfaces reconstruct poorly; patterned and matte surfaces reconstruct well.</li>
         <li><strong>Vary your distance.</strong> Take a few shots closer and a few further away. Phones do not tell the browser their focal lengths, and varying distance is what lets the app calibrate each lens.</li>

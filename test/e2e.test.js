@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { reconstruct } from '../src/pipeline/reconstruct.js';
-import { renderRoom, renderObject } from './synthScene.js';
-import { lookAt } from './helpers.js';
+import { renderRoom, renderObject, renderFurnishedRoom } from './synthScene.js';
+import { lookAt, fitSimilarity } from './helpers.js';
+import { rotvecToMat, matMul, matVec } from '../src/vision/linalg.js';
 import { eulerCharacteristic } from '../src/mesh/meshUtils.js';
 
 function depthAccuracy(view, truthDepth, w, h) {
@@ -97,4 +98,91 @@ test('end-to-end: a distorted (ultra-wide style) lens is calibrated and reconstr
   assert.ok(res.stats.triangles > 1000);
   assert.equal(res.dense.positions.length, res.dense.colors.length);
   assert.ok(res.stats.densePoints > 1000);
+});
+
+test('end-to-end: the reconstructed surface matches the true sphere', async () => {
+  const w = 320, h = 240, f = 260, cx = 159.5, cy = 119.5, radius = 1;
+  const images = [], truthCenters = [];
+  for (let i = 0; i < 8; i++) {
+    const ang = -0.55 + i * (1.1 / 7);
+    const dist = 2.6 + 0.25 * (i % 3);
+    const C = [Math.sin(ang) * dist, 0.3 * Math.sin(i), -Math.cos(ang) * dist];
+    const cam = lookAt(C, [0, 0, 0]);
+    const r = renderObject(cam, w, h, f, cx, cy, radius, 3);
+    images.push({ id: `c${i}`, label: `c${i}`, width: w, height: h, rgba: r.rgba, f, cx, cy, shotIndex: i, focalGroup: 'back' });
+    truthCenters.push([C[0], -C[1], -C[2]]); // pipeline output is y-up
+  }
+  const res = await reconstruct(images, { quality: 'balanced', preset: 'object' });
+  assert.equal(res.stats.registered, 8);
+  const from = [], to = [];
+  res.cameras.forEach((c, i) => { if (c) { from.push(c.center); to.push(truthCenters[i]); } });
+  const sim = fitSimilarity(from, to);
+  // Camera centres must line up with the truth (scene is ~3 units across)
+  assert.ok(sim.residual < 0.08, `camera fit residual ${sim.residual.toFixed(4)}`);
+  // Every mesh vertex should lie on the true sphere (radius 1) or the back wall (z = -3)
+  const P = res.mesh.positions;
+  const errs = [];
+  for (let i = 0; i < P.length; i += 3) {
+    const p = sim.apply([P[i], P[i + 1], P[i + 2]]);
+    errs.push(Math.min(Math.abs(Math.hypot(p[0], p[1], p[2]) - radius), Math.abs(p[2] + 3)));
+  }
+  errs.sort((a, b) => a - b);
+  const median = errs[errs.length >> 1], p95 = errs[Math.floor(errs.length * 0.95)];
+  assert.ok(errs.length > 5000, `only ${errs.length} vertices`);
+  assert.ok(median < 0.06, `median surface error ${median.toFixed(4)} of a unit radius`);
+  assert.ok(p95 < 0.15, `p95 surface error ${p95.toFixed(4)} of a unit radius`);
+});
+
+test('end-to-end: front and back cameras fired together cover a whole room', async () => {
+  // A phone carried around the middle of a box-shaped room. The back camera looks one way,
+  // the front camera the other, so they never share a feature: only the rig joins them.
+  const w = 240, h = 180, fBack = 110, fFront = 100, cx = 119.5, cy = 89.5, half = 3;
+  const furniture = [
+    { c: [1.6, 0.4, 2.2], r: 0.6 }, { c: [-1.7, -0.5, 2.0], r: 0.55 },
+    { c: [1.5, -0.6, -2.1], r: 0.6 }, { c: [-1.6, 0.6, -2.2], r: 0.55 },
+    { c: [0.1, 1.4, 2.4], r: 0.5 }, { c: [0.0, -1.5, -2.3], r: 0.5 },
+    { c: [2.3, 0.2, 0.2], r: 0.5 }, { c: [-2.4, -0.2, -0.3], r: 0.5 },
+  ];
+  const images = [];
+  const shots = 8;
+  for (let s = 0; s < shots; s++) {
+    const a = -0.85 + s * (1.7 / (shots - 1));
+    const C = [Math.sin(a) * 1.5, 0.18 * Math.sin(s * 1.7), Math.cos(a) * 1.5 - 1.25];
+    const back = lookAt(C, [C[0] + 0.5 * Math.sin(a * 1.4), C[1] + 0.35 * Math.sin(s * 0.9), C[2] + 3], [0, -1, 0.12 * Math.cos(s * 1.3)]);
+    // The front camera is bolted to the same body: a fixed rotation of about 180 degrees
+    // and a few millimetres of offset, identical at every shot.
+    const flip = rotvecToMat([0, Math.PI * 0.97, 0]);
+    const fR = matMul(flip, back.R, 3, 3, 3);
+    const fRt = matVec(flip, back.t, 3, 3);
+    const front = { R: fR, t: new Float64Array([fRt[0] + 0.004, fRt[1], fRt[2] + 0.006]) };
+    const rb = renderFurnishedRoom(back, w, h, fBack, cx, cy, half, furniture);
+    const rf = renderFurnishedRoom(front, w, h, fFront, cx, cy, half, furniture);
+    images.push({ id: `b${s}`, label: 'Back', width: w, height: h, rgba: rb.rgba, f: fBack, cx, cy, shotIndex: s, rigKey: 'back', focalGroup: 'back' });
+    images.push({ id: `f${s}`, label: 'Front', width: w, height: h, rgba: rf.rgba, f: fFront, cx, cy, shotIndex: s, rigKey: 'front', focalGroup: 'front' });
+  }
+  const logs = [];
+  const onLog = (st, fr, m) => { if (m) logs.push(m); };
+
+  const withoutRig = await reconstruct(images, { quality: 'fast', preset: 'room', useRig: false, overrides: { featureWidth: 240, depthWidth: 120 } }, onLog);
+  const withRig = await reconstruct(images, { quality: 'fast', preset: 'room', useRig: true, overrides: { featureWidth: 240, depthWidth: 120 } }, onLog);
+
+  assert.ok(withRig.stats.registered > withoutRig.stats.registered,
+    `rig registered ${withRig.stats.registered}, without it ${withoutRig.stats.registered}\n${logs.filter((l) => /component|rig|Rig/i.test(l)).join('\n')}`);
+  assert.ok(withRig.stats.registered >= 12, `registered ${withRig.stats.registered}/${images.length}`);
+  // Covering both directions must widen the reconstructed volume along the viewing axis
+  const spanOf = (r2) => {
+    const p = r2.mesh.positions;
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 2; i < p.length; i += 3) { if (p[i] < lo) lo = p[i]; if (p[i] > hi) hi = p[i]; }
+    return hi - lo;
+  };
+  const scaleOf = (r2) => {
+    const cs = r2.cameras.filter(Boolean).map((c) => c.center);
+    let m = 0;
+    for (let i = 0; i < cs.length; i++) for (let j = i + 1; j < cs.length; j++) m = Math.max(m, Math.hypot(cs[i][0] - cs[j][0], cs[i][1] - cs[j][1], cs[i][2] - cs[j][2]));
+    return m;
+  };
+  const relSpan = spanOf(withRig) / scaleOf(withRig);
+  const relSpanNo = spanOf(withoutRig) / scaleOf(withoutRig);
+  assert.ok(relSpan > relSpanNo * 1.3, `depth coverage ${relSpan.toFixed(2)} vs ${relSpanNo.toFixed(2)} camera-path units`);
 });

@@ -248,7 +248,7 @@ async function decodeForWorker(frame, targetWidth, id, shotIndex) {
   bmp.close?.();
   const data = ctx.getImageData(0, 0, w, h).data;
   const sx = w / frame.width, sy = h / frame.height;
-  return { id, label: frame.label, width: w, height: h, rgba: data, f: frame.f * sx, cx: (frame.cx + 0.5) * sx - 0.5, cy: (frame.cy + 0.5) * sy - 0.5, shotIndex, focalGroup: `${frame.key}|${Math.round(frame.hfov || 0)}` };
+  return { id, label: frame.label, width: w, height: h, rgba: data, f: frame.f * sx, cx: (frame.cx + 0.5) * sx - 0.5, cy: (frame.cy + 0.5) * sy - 0.5, shotIndex, focalGroup: `${frame.key}|${Math.round(frame.hfov || 0)}`, rigKey: frame.key };
 }
 
 let wakeLock = null;
@@ -308,7 +308,7 @@ async function reconstruct() {
     }
   };
   worker.onerror = (e) => { releaseWakeLock(); toast('Worker error: ' + e.message, 6000); $('#progress-stage').textContent = 'Reconstruction failed'; $('#btn-cancel').textContent = 'Back'; };
-  worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked } }, images.map((im) => im.rgba.buffer));
+  worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked, useRig: $('#chk-rig').checked } }, images.map((im) => im.rgba.buffer));
 }
 
 async function showResult(result, seconds) {
@@ -329,6 +329,9 @@ async function showResult(result, seconds) {
   }
   const s = result.stats;
   $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span><span><b>${s.triangles.toLocaleString()}</b> triangles</span><span><b>${s.vertices.toLocaleString()}</b> vertices</span><span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span><span><b>${seconds.toFixed(0)}s</b></span>`;
+  if (s.rig?.length) {
+    setProgressLog(`Camera rig: ` + s.rig.map((r2) => `${r2.camera} tied to the reference camera from ${r2.shots} shots (${r2.spreadDeg.toFixed(1)}° spread)`).join('; '));
+  }
   if (s.intrinsics?.length) {
     const byLabel = new Map();
     for (const it of s.intrinsics) if (!byLabel.has(it.label)) byLabel.set(it.label, it);

@@ -300,3 +300,48 @@ export function relativePose(Ra, ta, Rb, tb) {
   const trel = new Float64Array([tb[0] - Rt[0], tb[1] - Rt[1], tb[2] - Rt[2]]);
   return { R: Rrel, t: trel };
 }
+
+/**
+ * Best similarity (scale, rotation, translation) mapping the points `from` onto `to`
+ * (Umeyama). Both are arrays of 3-element arrays of the same length.
+ * @returns {{R, scale, t, apply, residual, planarity}} where planarity is the ratio of the
+ *   smallest to the largest spread of `from`: near zero means the points are collinear and
+ *   the rotation about that line is not determined.
+ */
+export function similarityTransform(from, to) {
+  const n = from.length;
+  if (n < 3) return null;
+  const cf = [0, 0, 0], ct = [0, 0, 0];
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { cf[k] += from[i][k] / n; ct[k] += to[i][k] / n; }
+  const H = new Float64Array(9);
+  const C = new Float64Array(9); // covariance of `from`, for the degeneracy check
+  let sf = 0, st = 0;
+  for (let i = 0; i < n; i++) {
+    const a = [0, 1, 2].map((k) => from[i][k] - cf[k]);
+    const b = [0, 1, 2].map((k) => to[i][k] - ct[k]);
+    sf += a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+    st += Math.hypot(b[0], b[1], b[2]);
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) { H[r * 3 + c] += b[r] * a[c]; C[r * 3 + c] += a[r] * a[c]; }
+  }
+  if (!(sf > 1e-18)) return null;
+  const R = closestRotation(H);
+  let sumFrom = 0;
+  for (let i = 0; i < n; i++) {
+    const a = [0, 1, 2].map((k) => from[i][k] - cf[k]);
+    sumFrom += Math.hypot(a[0], a[1], a[2]);
+  }
+  const scale = sumFrom > 1e-12 ? st / sumFrom : 1;
+  const Rcf = matVec(R, cf, 3, 3);
+  const t = [0, 1, 2].map((k) => ct[k] - scale * Rcf[k]);
+  const apply = (p) => {
+    const r = matVec(R, p, 3, 3);
+    return new Float64Array([scale * r[0] + t[0], scale * r[1] + t[1], scale * r[2] + t[2]]);
+  };
+  let residual = 0;
+  for (let i = 0; i < n; i++) {
+    const p = apply(from[i]);
+    residual += Math.hypot(p[0] - to[i][0], p[1] - to[i][1], p[2] - to[i][2]);
+  }
+  const { S } = svd(C, 3, 3);
+  return { R, scale, t, apply, residual: residual / n, planarity: S[0] > 0 ? Math.sqrt(S[2] / S[0]) : 0 };
+}

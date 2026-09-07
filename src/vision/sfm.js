@@ -1,7 +1,7 @@
 // Incremental structure-from-motion: pairwise geometry, feature tracks, two-view
 // initialisation, PnP registration, triangulation and bundle adjustment.
-import { ransacEssential, recoverPose, triangulate, poseMatrix, ransacPnP, projectPoint, triangulationAngle, undistortNormalized } from './geometry.js';
-import { cameraCenter, transpose, matMul, matVec, cross, dot } from './linalg.js';
+import { ransacEssential, recoverPose, triangulate, poseMatrix, ransacPnP, refinePose, projectPoint, triangulationAngle, undistortNormalized } from './geometry.js';
+import { cameraCenter, transpose, matMul, matVec, cross, dot, relativePose, closestRotation, matToRotvec, similarityTransform } from './linalg.js';
 import { bundleAdjust } from './ba.js';
 
 class UnionFind {
@@ -188,6 +188,7 @@ export function runSfM(frames, pairs, opts = {}) {
 
   const refineFocal = opts.refineFocal !== false;
   const refineDistortion = opts.refineDistortion !== false;
+  const useRig = opts.useRig !== false;
   function runBA(iterations, withFocal = false) {
     const camList = registered.map((fr, idx) => ({ R: camR[fr], t: camT[fr], f: frames[fr].f, k1: frames[fr].k1, fixed: idx === 0, focalGroup: frames[fr].focalGroup ?? fr }));
     const camPos = new Int32Array(nf).fill(-1);
@@ -304,6 +305,129 @@ export function runSfM(frames, pairs, opts = {}) {
     return true;
   }
 
+  /**
+   * Rig constraint. Frames captured in one shot come from cameras that are rigidly
+   * attached to each other, so the pose of one gives the poses of all the others. The
+   * fixed transform of each camera relative to a reference camera is estimated from the
+   * shots where both are already registered, then used to place frames that structure
+   * from motion could not register on their own.
+   */
+  const rigKey = frames.map((fr, i) => fr.rigKey ?? fr.focalGroup ?? i);
+  const shotOf = frames.map((fr, i) => fr.shotIndex ?? i);
+  const rigTransforms = new Map(); // rigKey -> {R, t, shots, spreadDeg}
+  let rigRef = null;
+
+  function averageRotations(Rs) {
+    const M = new Float64Array(9);
+    for (const R of Rs) for (let k = 0; k < 9; k++) M[k] += R[k] / Rs.length;
+    return closestRotation(M);
+  }
+  function angleTo(Ra, Rb) {
+    const D = matMul(Ra, transpose(Rb, 3, 3), 3, 3, 3);
+    const v = matToRotvec(D);
+    return Math.hypot(v[0], v[1], v[2]) * 180 / Math.PI;
+  }
+
+  function estimateRig() {
+    // Reference camera: the one with the most registered frames
+    const perKey = new Map();
+    for (let fr = 0; fr < nf; fr++) {
+      if (!camR[fr]) continue;
+      if (!perKey.has(rigKey[fr])) perKey.set(rigKey[fr], []);
+      perKey.get(rigKey[fr]).push(fr);
+    }
+    if (perKey.size < 2) return 0;
+    rigRef = null;
+    let bestN = 0;
+    for (const [key, list] of perKey) if (list.length > bestN) { bestN = list.length; rigRef = key; }
+    const refByShot = new Map();
+    for (const fr of perKey.get(rigRef)) refByShot.set(shotOf[fr], fr);
+    let learned = 0;
+    for (const [key, list] of perKey) {
+      if (key === rigRef) continue;
+      const samples = [];
+      for (const fr of list) {
+        const refFr = refByShot.get(shotOf[fr]);
+        if (refFr === undefined) continue;
+        samples.push(relativePose(camR[refFr], camT[refFr], camR[fr], camT[fr]));
+      }
+      if (samples.length < 2) continue;
+      // Robust average: chordal mean, drop rotations far from it, recompute
+      let R = averageRotations(samples.map((s2) => s2.R));
+      const keptIdx = samples.map((s2, i) => [angleTo(s2.R, R), i]).filter(([a]) => a < 6).map(([, i]) => i);
+      if (keptIdx.length < 2) continue;
+      R = averageRotations(keptIdx.map((i) => samples[i].R));
+      const spread = Math.max(...keptIdx.map((i) => angleTo(samples[i].R, R)));
+      const t = new Float64Array(3);
+      for (let k = 0; k < 3; k++) {
+        const vals = keptIdx.map((i) => samples[i].t[k]).sort((a, b) => a - b);
+        t[k] = vals[vals.length >> 1];
+      }
+      const prev = rigTransforms.get(key);
+      if (!prev || keptIdx.length > prev.shots) { rigTransforms.set(key, { R, t, shots: keptIdx.length, spreadDeg: spread }); learned++; }
+    }
+    if (learned) {
+      log(`Rig calibration: ${rigTransforms.size} camera(s) tied to the reference camera ` +
+        Array.from(rigTransforms.entries()).map(([k, v]) => `[${k}: ${v.shots} shots, ${v.spreadDeg.toFixed(1)}° spread]`).join(' '));
+    }
+    return learned;
+  }
+
+  /** Place an unregistered frame using the rig transform of its camera. */
+  function tryRigRegistration() {
+    if (rigTransforms.size === 0 && rigRef === null) return false;
+    const refFrames = new Map(); // shot -> registered frame of the reference camera
+    for (let fr = 0; fr < nf; fr++) if (camR[fr] && rigKey[fr] === rigRef) refFrames.set(shotOf[fr], fr);
+    let placed = false;
+    for (let fr = 0; fr < nf; fr++) {
+      if (camR[fr]) continue;
+      const rig = rigTransforms.get(rigKey[fr]);
+      const refFr = refFrames.get(shotOf[fr]);
+      if (refFr === undefined) continue;
+      // The reference camera itself needs no transform
+      const rel = rigKey[fr] === rigRef ? null : rig;
+      if (rigKey[fr] !== rigRef && (!rel || rel.spreadDeg > 4)) continue;
+      const Rn = rel ? matMul(rel.R, camR[refFr], 3, 3, 3) : Float64Array.from(camR[refFr]);
+      const Rt = rel ? matVec(rel.R, camT[refFr], 3, 3) : camT[refFr];
+      const tn = rel ? new Float64Array([Rt[0] + rel.t[0], Rt[1] + rel.t[1], Rt[2] + rel.t[2]]) : Float64Array.from(camT[refFr]);
+      // Verify the predicted pose against this frame's own observations
+      const X = [], x = [];
+      for (let k = 0; k < frames[fr].count; k++) {
+        const tid = nodeTrack[offsets[fr] + k];
+        if (tid < 0 || tracks[tid].bad || !tracks[tid].point) continue;
+        X.push(...tracks[tid].point); x.push(nk[fr][k * 2], nk[fr][k * 2 + 1]);
+      }
+      const nObs = x.length / 2;
+      let R = Rn, t = tn, inliers = 0;
+      if (nObs >= 6) {
+        const Xa = Float64Array.from(X), xa = Float64Array.from(x);
+        const ref = refinePose(Rn, tn, Xa, xa, nObs, { iters: 15 });
+        const thr = pxThr * 2 / frames[fr].f;
+        const count = (Rr, tt) => {
+          let c = 0;
+          for (let i = 0; i < nObs; i++) {
+            const pr = projectPoint(Rr, tt, Xa.subarray(i * 3, i * 3 + 3));
+            if (pr[2] > 0 && Math.hypot(pr[0] - xa[i * 2], pr[1] - xa[i * 2 + 1]) < thr) c++;
+          }
+          return c;
+        };
+        const cRaw = count(Rn, tn), cRef = count(ref.R, ref.t);
+        if (cRef >= cRaw) { R = ref.R; t = ref.t; inliers = cRef; } else inliers = cRaw;
+        // Too few of its own points agree: the rig prediction is not trustworthy here
+        if (inliers < Math.max(5, 0.25 * nObs)) continue;
+      } else if (nObs > 0 && rigKey[fr] === rigRef) {
+        continue; // same camera, same shot as itself should not happen
+      }
+      camR[fr] = R; camT[fr] = t;
+      registered.push(fr);
+      const newPts = triangulateNewTracks(fr);
+      log(`Registered frame ${fr} from the camera rig (shot ${shotOf[fr]}, ${nObs ? `${inliers}/${nObs} points agree` : 'no shared points'}), +${newPts} points`);
+      placed = true;
+    }
+    if (placed) runBA(8, registered.length >= 4);
+    return placed;
+  }
+
   // Incremental registration (frames that fail PnP get one more attempt at the end,
   // when more points have been triangulated)
   let sinceBA = 0;
@@ -324,6 +448,7 @@ export function runSfM(frames, pairs, opts = {}) {
     }
     if (best < 0 || bestCount < 12) {
       if (tryChainRegistration()) { sinceBA = 0; continue; }
+      if (useRig && estimateRig() >= 0 && tryRigRegistration()) { sinceBA = 0; continue; }
       if (!retryPass && (failed.size || chainFailed.size)) { retryPass = true; failed.clear(); chainFailed.clear(); continue; }
       break;
     }
@@ -370,10 +495,126 @@ export function runSfM(frames, pairs, opts = {}) {
     registerLoop();
     for (const tr of tracks) if (!tr.bad && !tr.point) tryTriangulate(tr);
   }
+  if (useRig && registered.length < nf) { estimateRig(); if (tryRigRegistration()) registerLoop(); }
   runBA(10, true);
+
+  // Frames that share no features with the main reconstruction (the front camera looks the
+  // other way) form their own component. Reconstruct it separately and bring it into the
+  // main coordinate frame through the rig, which is the only thing connecting them.
+  const merged = [];
+  if (useRig && opts.allowSubComponents !== false && registered.length < nf) {
+    const sub = mergeDisconnectedComponent();
+    if (sub) merged.push(...sub);
+  }
+
+  function mergeDisconnectedComponent() {
+    const unregIdx = [];
+    for (let fr = 0; fr < nf; fr++) if (!camR[fr]) unregIdx.push(fr);
+    if (unregIdx.length < 3) return null;
+    const local = new Map(unregIdx.map((fr, i) => [fr, i]));
+    const subFrames = unregIdx.map((fr) => frames[fr]);
+    const subPairs = pairs.filter((pr) => local.has(pr.i) && local.has(pr.j))
+      .map((pr) => ({ i: local.get(pr.i), j: local.get(pr.j), matches: pr.matches }));
+    if (subPairs.length < 2) return null;
+    log(`Reconstructing ${unregIdx.length} frames that share no features with the main model`);
+    const subRes = runSfM(subFrames, subPairs, {
+      ...opts, log: (m) => log('  [separate component] ' + m),
+      useRig: false, allowSubComponents: false, refineFocal: false, refineDistortion: false,
+    });
+    if (subRes.registeredCount < 3) return null;
+
+    // Hand-eye alignment: the rotation X with R_main = R_sub X, found from the relative
+    // rotations of the reference camera in the main model and of this component's frames
+    // between the same pairs of shots (B = X A X^T, so axis(B) = X axis(A)).
+    const refPose = new Map(); // shot -> {R, t} of the reference camera in the main model
+    for (let fr = 0; fr < nf; fr++) if (camR[fr] && rigKey[fr] === (rigRef ?? rigKey[fr])) refPose.set(shotOf[fr], { R: camR[fr], t: camT[fr] });
+    const subByShot = new Map();
+    unregIdx.forEach((fr, i) => { if (subRes.cameras[i]) subByShot.set(shotOf[fr], { R: subRes.cameras[i].R, t: subRes.cameras[i].t, frame: fr }); });
+    const shots = Array.from(subByShot.keys()).filter((sh) => refPose.has(sh));
+    if (shots.length < 3) { log(`  cannot align: only ${shots.length} shots seen by both`); return null; }
+    // Both cameras are bolted to the same phone, so they travel the same path: aligning the
+    // two camera trajectories gives the similarity between the reconstructions directly.
+    // The few millimetres between the lenses are far below the scale of any scan.
+    const Cmain = shots.map((sh) => Array.from(cameraCenter(refPose.get(sh).R, refPose.get(sh).t)));
+    const Csub = shots.map((sh) => Array.from(cameraCenter(subByShot.get(sh).R, subByShot.get(sh).t)));
+    // Robust fit: align, drop the worst quarter of the shots, align again. One badly placed
+    // frame in either reconstruction should not drag the whole alignment with it.
+    let sim = similarityTransform(Csub, Cmain);
+    if (!sim) { log('  cannot align: the component has no camera motion'); return null; }
+    if (shots.length >= 5) {
+      const errs = Csub.map((c, i) => {
+        const p = sim.apply(c);
+        return [Math.hypot(p[0] - Cmain[i][0], p[1] - Cmain[i][1], p[2] - Cmain[i][2]), i];
+      }).sort((a, b) => a[0] - b[0]);
+      const keep = errs.slice(0, Math.max(4, Math.ceil(errs.length * 0.75))).map(([, i]) => i);
+      const trimmed = similarityTransform(keep.map((i) => Csub[i]), keep.map((i) => Cmain[i]));
+      if (trimmed && trimmed.residual < sim.residual) sim = trimmed;
+    }
+    if (sim.planarity < 0.02) { log('  cannot align: the camera path is a straight line, so the alignment is ambiguous'); return null; }
+    // Judge the fit against the size of the scene, not the size of the camera path: what
+    // matters is that the merged views land in the right place in the room.
+    let sceneScale = 0;
+    {
+      const cc = [0, 1, 2].map((k) => Cmain.reduce((a, c) => a + c[k], 0) / shots.length);
+      const d = [];
+      for (const tr of tracks) {
+        if (tr.bad || !tr.point) continue;
+        d.push(Math.hypot(tr.point[0] - cc[0], tr.point[1] - cc[1], tr.point[2] - cc[2]));
+      }
+      d.sort((a, b) => a - b);
+      sceneScale = d.length ? d[d.length >> 1] : 0;
+    }
+    if (!(sceneScale > 0)) { log('  cannot align: the main model has no points'); return null; }
+    if (sim.residual > 0.08 * sceneScale) {
+      log(`  cannot align: the two camera paths disagree by ${(100 * sim.residual / sceneScale).toFixed(1)}% of the scene size`);
+      return null;
+    }
+    // World mapping: Xmain = scale * Q * Xsub + q, which makes R_main = R_sub * Q^T
+    const X = transpose(sim.R, 3, 3);
+    const toMain = sim.apply;
+    const scale = sim.scale;
+
+    // Independent check: the rig rotation implied by each shot must be the same one
+    let rigSpread = 0;
+    const rigRots = shots.map((sh) => matMul(matMul(subByShot.get(sh).R, X, 3, 3, 3), transpose(refPose.get(sh).R, 3, 3), 3, 3, 3));
+    const meanRig = averageRotations(rigRots);
+    for (const R2 of rigRots) rigSpread = Math.max(rigSpread, angleTo(R2, meanRig));
+    if (rigSpread > 8) { log(`  cannot align: the implied rig rotation varies by ${rigSpread.toFixed(1)}° between shots`); return null; }
+    const fitErr = sim.residual;
+
+    // Apply the alignment and adopt the component's frames and points
+    const placed = [];
+    unregIdx.forEach((fr, i) => {
+      const c = subRes.cameras[i];
+      if (!c) return;
+      const Rm = matMul(c.R, X, 3, 3, 3);
+      const Cm = toMain(cameraCenter(c.R, c.t));
+      camR[fr] = Rm;
+      camT[fr] = new Float64Array([
+        -(Rm[0] * Cm[0] + Rm[1] * Cm[1] + Rm[2] * Cm[2]),
+        -(Rm[3] * Cm[0] + Rm[4] * Cm[1] + Rm[5] * Cm[2]),
+        -(Rm[6] * Cm[0] + Rm[7] * Cm[1] + Rm[8] * Cm[2]),
+      ]);
+      registered.push(fr);
+      placed.push(fr);
+    });
+    // Bring the component's 3D points across as tracks of the merged frames
+    const extra = [];
+    for (let p = 0; p < subRes.tracks.length; p++) {
+      const obs = subRes.tracks[p].map(([li, kp]) => [unregIdx[li], kp]);
+      extra.push({ point: toMain(subRes.points.subarray(p * 3, p * 3 + 3)), obs });
+    }
+    log(`Merged the separate component through the rig: ${placed.length} frames, ${extra.length} points, ` +
+      `camera paths agree to ${(100 * fitErr / sceneScale).toFixed(1)}% of the scene size, rig rotation steady within ${rigSpread.toFixed(1)}°`);
+    return extra;
+  }
 
   // Output
   const pointList = [], pointTracks = [];
+  for (const m of merged) {
+    pointList.push(m.point[0], m.point[1], m.point[2]);
+    pointTracks.push(m.obs);
+  }
   for (let tid = 0; tid < tracks.length; tid++) {
     const tr = tracks[tid];
     if (tr.bad || !tr.point) continue;
@@ -384,5 +625,6 @@ export function runSfM(frames, pairs, opts = {}) {
   }
   const cameras = frames.map((_, i) => (camR[i] ? { R: camR[i], t: camT[i] } : null));
   log(`SfM done: ${registered.length}/${nf} frames registered, ${pointTracks.length} points`);
-  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length, focals: frames.map((fr) => fr.f), k1s: frames.map((fr) => fr.k1) };
+  const rig = Array.from(rigTransforms.entries()).map(([key, v]) => ({ key, R: v.R, t: v.t, shots: v.shots, spreadDeg: v.spreadDeg }));
+  return { cameras, points: Float64Array.from(pointList), tracks: pointTracks, registeredCount: registered.length, focals: frames.map((fr) => fr.f), k1s: frames.map((fr) => fr.k1), rig, rigRef };
 }

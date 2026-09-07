@@ -107,3 +107,71 @@ export function renderObject(cam, w, h, f, cx, cy, radius = 1, wallZ = 3, k1 = 0
 }
 
 export { rng };
+
+/**
+ * A textured box room ("walls") containing a few spheres ("furniture"). Every view sees a
+ * wall plus some curved geometry, so the scene is far from the planar degeneracy that a
+ * bare wall causes, which is what a real room looks like to a camera.
+ */
+export function renderFurnishedRoom(cam, w, h, f, cx, cy, half = 2, spheres = null) {
+  const balls = spheres || [
+    { c: [1.2, 0.5, 1.3], r: 0.55 }, { c: [-1.3, -0.3, 1.1], r: 0.45 },
+    { c: [1.1, -0.6, -1.2], r: 0.5 }, { c: [-1.0, 0.6, -1.4], r: 0.6 },
+    { c: [0.0, 1.1, 1.5], r: 0.4 }, { c: [0.2, -1.2, -0.4], r: 0.42 },
+  ];
+  const gray = new Float32Array(w * h), depth = new Float32Array(w * h);
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  const R = cam.R, t = cam.t;
+  const C = [
+    -(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]),
+    -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]),
+    -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2]),
+  ];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dc = [(x - cx) / f, (y - cy) / f, 1];
+      const dw = [
+        R[0] * dc[0] + R[3] * dc[1] + R[6] * dc[2],
+        R[1] * dc[0] + R[4] * dc[1] + R[7] * dc[2],
+        R[2] * dc[0] + R[5] * dc[1] + R[8] * dc[2],
+      ];
+      let best = Infinity, g = 0, col = [0, 0, 0];
+      // Box interior
+      for (let a = 0; a < 3; a++) {
+        for (const s of [-1, 1]) {
+          if (Math.abs(dw[a]) < 1e-9) continue;
+          const tt = (s * half - C[a]) / dw[a];
+          if (tt <= 0 || tt >= best) continue;
+          const p = [C[0] + dw[0] * tt, C[1] + dw[1] * tt, C[2] + dw[2] * tt];
+          const b = (a + 1) % 3, c2 = (a + 2) % 3;
+          if (Math.abs(p[b]) <= half && Math.abs(p[c2]) <= half) {
+            best = tt;
+            g = texture((p[b] + 10 * a) * 2.5, (p[c2] + 10 * s) * 2.5);
+            col = [g * (a === 0 ? 1 : 0.85), g * (a === 1 ? 1 : 0.9), g * (a === 2 ? 1 : 0.8)];
+          }
+        }
+      }
+      // Furniture
+      for (const ball of balls) {
+        const oc = [C[0] - ball.c[0], C[1] - ball.c[1], C[2] - ball.c[2]];
+        const bq = oc[0] * dw[0] + oc[1] * dw[1] + oc[2] * dw[2];
+        const cq = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - ball.r * ball.r;
+        const aq = dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2];
+        const disc = bq * bq - aq * cq;
+        if (disc <= 0) continue;
+        const tt = (-bq - Math.sqrt(disc)) / aq;
+        if (tt <= 0 || tt >= best) continue;
+        best = tt;
+        const p = [C[0] + dw[0] * tt - ball.c[0], C[1] + dw[1] * tt - ball.c[1], C[2] + dw[2] * tt - ball.c[2]];
+        const u = Math.atan2(p[0], p[2]), v = Math.asin(Math.max(-1, Math.min(1, p[1] / ball.r)));
+        g = texture(u * 5 + ball.c[0] * 7, v * 5 + ball.c[1] * 7);
+        col = [g, g * 0.75, g * 0.55];
+      }
+      if (best === Infinity) continue;
+      const i = y * w + x;
+      gray[i] = g; depth[i] = best;
+      rgba[i * 4] = col[0]; rgba[i * 4 + 1] = col[1]; rgba[i * 4 + 2] = col[2]; rgba[i * 4 + 3] = 255;
+    }
+  }
+  return { gray, depth, rgba };
+}

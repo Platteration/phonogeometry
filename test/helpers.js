@@ -1,4 +1,4 @@
-import { rotvecToMat, matMul, matVec } from '../src/vision/linalg.js';
+import { rotvecToMat, matMul, matVec, svd, transpose, det3 } from '../src/vision/linalg.js';
 
 export function rng(seed = 1) {
   let s = seed >>> 0 || 1;
@@ -44,3 +44,44 @@ export function angleBetween(a, b) {
 }
 
 export { rotvecToMat, matMul, matVec };
+
+/**
+ * Best similarity transform (scale, rotation, translation) mapping points `from` onto
+ * `to` (Umeyama). Used to compare a reconstruction, which is only defined up to a
+ * similarity, against ground truth.
+ */
+export function fitSimilarity(from, to) {
+  const n = from.length;
+  const cf = [0, 0, 0], ct = [0, 0, 0];
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { cf[k] += from[i][k] / n; ct[k] += to[i][k] / n; }
+  let num = 0, den = 0;
+  const H = new Float64Array(9);
+  for (let i = 0; i < n; i++) {
+    const a = [0, 1, 2].map((k) => from[i][k] - cf[k]);
+    const b = [0, 1, 2].map((k) => to[i][k] - ct[k]);
+    num += Math.hypot(...b); den += Math.hypot(...a);
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) H[r * 3 + c] += a[r] * b[c];
+  }
+  const scale = den > 0 ? num / den : 1;
+  const { U, V } = svd(H, 3, 3);
+  let R = matMul(V, transpose(U, 3, 3), 3, 3, 3);
+  if (det3(R) < 0) {
+    const V2 = Float64Array.from(V);
+    V2[2] = -V2[2]; V2[5] = -V2[5]; V2[8] = -V2[8];
+    R = matMul(V2, transpose(U, 3, 3), 3, 3, 3);
+  }
+  const apply = (p) => {
+    const a = [0, 1, 2].map((k) => (p[k] - cf[k]) * scale);
+    return [
+      R[0] * a[0] + R[1] * a[1] + R[2] * a[2] + ct[0],
+      R[3] * a[0] + R[4] * a[1] + R[5] * a[2] + ct[1],
+      R[6] * a[0] + R[7] * a[1] + R[8] * a[2] + ct[2],
+    ];
+  };
+  let residual = 0;
+  for (let i = 0; i < n; i++) {
+    const p = apply(from[i]);
+    residual += Math.hypot(p[0] - to[i][0], p[1] - to[i][1], p[2] - to[i][2]);
+  }
+  return { apply, scale, rotation: R, residual: residual / n };
+}

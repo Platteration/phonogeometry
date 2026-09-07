@@ -19,6 +19,10 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - `src/app.js` UI and flow; `src/camera/` device discovery, capture, intrinsics, EXIF;
   `src/storage.js` IndexedDB shot persistence.
 - `src/pipeline/reconstruct.js` orchestrates the pipeline; `worker.js` is the Web Worker entry.
+- The camera rig (`sfm.js`) ties frames captured in the same shot together: `rigKey` names the
+  physical camera, `shotIndex` the moment. It fills gaps and merges a camera that shares no
+  features with the rest by aligning camera paths. Both merge checks (rig-rotation spread,
+  path agreement against scene scale) must keep failing closed: never merge on a weak fit.
 - `src/vision/` numerics: `linalg` (SVD, Cholesky, Rodrigues), `fast`/`orb`/`match`
   features, `geometry` (essential matrix, PnP, triangulation, distortion), `sfm`, `ba`
   (sparse LM with Schur complement, per-camera focal and k1), `planeSweep` (CPU) and

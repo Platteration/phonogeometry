@@ -138,6 +138,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures });
     frames.push({
       id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
+      rigKey: im.rigKey ?? im.focalGroup ?? im.id,
       width: fw, height: fh, gray, fullW: im.width, fullH: im.height, rgba: im.rgba,
       f: im.f * sx, cx: (im.cx + 0.5) * sx - 0.5, cy: (im.cy + 0.5) * sy - 0.5,
       keypoints: feat.keypoints, count: feat.count, descriptors: feat.descriptors,
@@ -164,7 +165,13 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   // Frames sharing a physical camera share one focal-length parameter in bundle adjustment
   const groupIds = new Map();
   for (const fr of frames) { if (!groupIds.has(fr.focalGroup)) groupIds.set(fr.focalGroup, groupIds.size); fr.focalGroup = groupIds.get(fr.focalGroup); }
-  const sfm = runSfM(frames, pairs, { pixelThreshold: 2.0, refineFocal: options.refineFocal !== false, refineDistortion: options.refineDistortion !== false, log });
+  const sfm = runSfM(frames, pairs, {
+    pixelThreshold: 2.0,
+    refineFocal: options.refineFocal !== false,
+    refineDistortion: options.refineDistortion !== false,
+    useRig: options.useRig !== false,
+    log,
+  });
   if (sfm.registeredCount < 2) throw new Error(sfm.error || 'Could not register the cameras');
   const registered = [];
   sfm.cameras.forEach((c, i) => { if (c) registered.push(i); });
@@ -363,6 +370,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     cameras,
     stats: {
       images: images.length, registered: sfm.registeredCount, sparsePoints: nSparse, densePoints: nDense,
+      rig: (sfm.rig || []).map((r2) => ({ camera: String(r2.key), shots: r2.shots, spreadDeg: r2.spreadDeg })),
       intrinsics: frames.map((fr, i) => (sfm.cameras[i] ? { label: fr.label, focalPx: fr.f * (fr.fullW / fr.width), k1: fr.k1 || 0 } : null)).filter(Boolean),
       depthMaps: haveDepth.length, vertices: nv, triangles: mesh.indices.length / 3,
       seconds: (Date.now() - t0) / 1000, voxelSize: vol.voxelSize, volumeDims: Array.from(vol.dims),

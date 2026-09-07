@@ -25,6 +25,7 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 | Matching | Brute-force Hamming with ratio test and mutual check; candidate pairs from shot order plus a global thumbnail descriptor | `src/vision/match.js` |
 | Two-view geometry | Normalised eight-point essential matrix inside RANSAC, cheirality-based pose recovery; radial distortion model for keypoints and images | `src/vision/geometry.js` |
 | Structure from motion | Incremental: feature tracks, best-pair initialisation, PnP registration (DLT + RANSAC + Levenberg–Marquardt), pairwise pose chaining fallback | `src/vision/sfm.js` |
+| Camera rig | Calibrates the fixed transform between the phone's cameras from the shots where both are placed, then uses it to register frames structure from motion cannot, and to merge a camera that shares no features at all (the front one) by aligning the two camera paths | `src/vision/sfm.js` |
 | Bundle adjustment | Sparse Levenberg–Marquardt with the Schur complement and Huber loss; refines one focal length per physical camera | `src/vision/ba.js` |
 | Dense depth | Multi-view plane sweep with zero-mean normalised cross-correlation (robust to exposure differences between physical cameras), sub-plane refinement, cross-view consistency check; runs on the GPU through WebGL2 with an identical CPU fallback | `src/vision/planeSweepGPU.js`, `src/vision/planeSweep.js` |
 | Fusion | Truncated signed distance volume with per-voxel colour; object and person scans focus the volume on the point the cameras converge on | `src/mesh/tsdf.js`, `src/pipeline/reconstruct.js` |
@@ -64,10 +65,32 @@ Browsers do not report focal lengths. Each camera is mapped to a lens type (wide
 
 Some phones refuse to stream several rear cameras at the same time. Cameras that cannot be opened concurrently are captured sequentially right after the simultaneous ones (this is on by default and can be disabled in Settings); hold still for that half second.
 
+## The camera rig
+
+The cameras fired in one shot are bolted to the same phone, so the transform between them is
+the same in every shot. Phonogeometry estimates that transform and puts it to work twice.
+
+**Filling gaps.** A frame that cannot be placed on its own, because it is blurred or aimed at
+a blank wall, is placed from its shot-mate's pose and then checked against whatever points it
+does see.
+
+**Joining the front camera.** The front camera looks the other way, so it shares no features
+at all with the back cameras: no amount of feature matching can connect them. Phonogeometry
+reconstructs the front camera's frames as their own model, then brings that model into the
+main one by aligning the two camera paths, which are the same path walked by the same phone.
+The result is checked twice before it is accepted: the implied rig rotation must come out the
+same at every shot, and the two paths must agree to within a few percent of the size of the
+scene. If either check fails the component is left out rather than merged wrongly.
+
+That is what lets a single sweep of a room capture the wall in front of you and the wall
+behind you at the same time. The few millimetres between the lenses are treated as zero,
+which is far below the voxel size of any scan, so the cameras of one shot end up at the same
+point.
+
 ## Limits
 
 - The scale of the model is arbitrary. A single phone cannot measure absolute size from images alone; export and scale in your 3D tool if you need real units.
-- Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere.
+- Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere. A camera aimed at one flat wall and nothing else is also a hard case: the geometry is ambiguous until something with depth comes into view.
 - Feature matching, structure from motion and fusion run on the CPU in JavaScript; the dense depth stage runs on the GPU when the browser offers WebGL2 with float render targets (most phones since 2018). Resolutions and voxel counts are modest by design.
 
 ## Development
