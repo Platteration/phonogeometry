@@ -126,13 +126,24 @@ in order of how often they bite:
 
 ```bash
 npm test          # unit and end-to-end tests on synthetic scenes (Node >= 18)
+npm run test:browser  # the whole app in a real browser (needs Playwright; skips if absent)
 npm start         # plain HTTP on :8080 for desktop development (imports only)
 npm run icons     # regenerate the PWA icons
 ```
 
 The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence and focal-length recovery, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as full reconstructions.
 
-The GPU plane sweep cannot run under Node. Start the dev server and open `test/browser/index.html` in a browser: it compares the GPU and CPU depth maps of a synthetic scene against the ground truth and prints coverage, accuracy, agreement and timings.
+`npm run test:browser` drives the real application in Chromium: it captures from the
+browser's fake camera, imports rendered photographs, checks that a blurred one is flagged and
+sharp ones are not, reconstructs a scan and confirms every photo was used, times the camera
+preview against the finished mesh, downloads all three exports, reloads to confirm shots
+survive, feeds it a scan that cannot work and checks the reason reaches whichever screen the
+user is on, and finally cuts the network and runs a whole scan offline. It skips itself with
+a message if Playwright is not installed.
+
+The GPU plane sweep needs a browser too. Start the dev server and open
+`test/browser/index.html`: it compares the GPU and CPU depth maps of a synthetic scene against
+the ground truth and prints coverage, accuracy, agreement and timings.
 
 ## Project layout
 

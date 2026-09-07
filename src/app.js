@@ -314,6 +314,9 @@ async function reconstruct() {
     if (msg) { $('#progress-message').textContent = msg; log.textContent += `[${stage}] ${msg}\n`; log.scrollTop = log.scrollHeight; }
     setBuilding(names[stage] || stage, pct, msg);
   };
+  state.failed = false;
+  state.result = null;
+  setResultControlsEnabled(false);
   const quality = $('#quality').value;
   const targetWidth = QUALITY[quality].featureWidth;
   setProgress('features', 0, 'Decoding photos…');
@@ -333,6 +336,7 @@ async function reconstruct() {
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
     else if (m.type === 'preview') await showPreview(m);
     else if (m.type === 'error') { reportFailure(m.message); } else if (m.type === 'done') {
+      if (state.failed) return;
       releaseWakeLock();
       $('#building').hidden = true;
       state.result = m.result;
@@ -348,6 +352,7 @@ async function reconstruct() {
  * screen, so writing only to the processing screen would leave a build bar running forever.
  */
 function reportFailure(message) {
+  state.failed = true;
   releaseWakeLock();
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   setProgressLog('ERROR: ' + message);
@@ -378,7 +383,10 @@ function setResultControlsEnabled(on) {
 
 /** Show the camera path and sparse points while the surface is still being built. */
 async function showPreview(m) {
-  if (!(await ensureViewer())) return;
+  // Loading the viewer is asynchronous, so a failure can arrive while this is still waiting.
+  // Whoever loses that race must not paint over the other's screen.
+  if (state.failed) return;
+  if (!(await ensureViewer()) || state.failed) return;
   showScreen('view');
   $('#building').hidden = false;
   $('#building-stage').textContent = 'Building the surface…';

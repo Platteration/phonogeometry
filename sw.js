@@ -1,5 +1,5 @@
 // Service worker: offline-capable app shell (all code, including three.js, is served from this origin).
-const VERSION = 'phonogeometry-v10';
+const VERSION = 'phonogeometry-v11';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'src/app.js', 'src/storage.js', 'src/camera/cameraManager.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
