@@ -44,6 +44,15 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   cause on a phone even though the pipeline now tolerates it better.
 - Balanced quality is markedly more accurate than fast on the same input, not just denser.
 
+## Memory
+
+The worker holds the whole scan at once, so per-frame buffers are released as soon as their
+smaller derivatives exist: the depth-resolution copies are made during feature extraction and
+the full-size image and greyscale are dropped there, and `releaseInputs` lets the worker free
+the transferred pixel buffers as it goes (tests reuse their images and so must not set it).
+Dense samples go straight into typed arrays. Forty frames at Balanced peak near 250 MB; keep
+new per-frame state small or free it explicitly.
+
 ## Conventions
 
 - Camera model: `Xc = R Xw + t`, pixel = `c + f * distort(Xc.xy / Xc.z)` with

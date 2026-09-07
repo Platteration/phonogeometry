@@ -5,7 +5,8 @@ self.onmessage = async (ev) => {
   const { type, images, options } = ev.data;
   if (type !== 'run') return;
   try {
-    const result = await reconstruct(images, options, (stage, fraction, message) => {
+    // The pixel buffers were transferred to this worker, so they can be freed as they are used
+    const result = await reconstruct(images, { ...options, releaseInputs: true }, (stage, fraction, message) => {
       self.postMessage({ type: 'progress', stage, fraction, message });
     });
     const transfer = [

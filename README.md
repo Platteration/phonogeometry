@@ -106,6 +106,7 @@ in order of how often they bite:
 - Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere.
 - A camera aimed at one flat wall and nothing else is a degenerate case, not merely a hard one: every distance explains the photographs equally well. Phonogeometry places the cameras correctly and returns a flat surface at the wrong distance rather than refusing. Keep something with depth in view.
 - Feature matching, structure from motion and fusion run on the CPU in JavaScript; the dense depth stage runs on the GPU when the browser offers WebGL2 with float render targets (most phones since 2018). Resolutions and voxel counts are modest by design.
+- Long scans are bounded by memory rather than patience. Forty frames at Balanced quality peak at about 250 MB in the worker, which fits comfortably on a modern phone; High quality costs roughly twice that, so keep High for scans of thirty frames or fewer unless the phone is a recent flagship.
 
 ## Development
 

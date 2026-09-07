@@ -156,7 +156,9 @@ function selectCandidatePairs(frames, opts) {
 
 /**
  * @param images [{id, width, height, rgba: Uint8ClampedArray, f, cx, cy, shotIndex, label}]
- * @param options {quality: 'fast'|'balanced'|'high', preset: 'object'|'person'|'room', debug}
+ * @param options {quality: 'fast'|'balanced'|'high', preset: 'object'|'person'|'room', debug,
+ *   releaseInputs: drop each image's pixels once its smaller copies exist (the caller must
+ *   not need them again)}
  * @param progress (stage, fraction, message) => void
  */
 export async function reconstruct(images, options = {}, progress = () => {}) {
@@ -179,10 +181,21 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const sx = fw / im.width, sy = fh / im.height;
     const sharp = sharpness(gray, fw, fh);
     const feat = extractORB(gray, fw, fh, { maxFeatures: q.maxFeatures, threshold: q.cornerThreshold });
+    // Make the small copies the dense stage will need now, so the full-size image and its
+    // greyscale version can be released immediately. On a long scan those are the largest
+    // thing held in memory, and a phone has little to spare.
+    const ds = Math.min(1, q.depthWidth / Math.max(fw, fh));
+    const dw = Math.max(16, Math.round(fw * ds)), dh = Math.max(16, Math.round(fh * ds));
+    const depthGrayRaw = resizeGray(gray, fw, fh, dw, dh);
+    const depthRGBARaw = resizeRGBA(im.rgba, im.width, im.height, dw, dh);
+    // The worker owns the pixel buffers it was handed and nothing else will read them, so it
+    // asks for them to be released here; callers that keep their images simply omit this.
+    if (options.releaseInputs) im.rgba = null;
     frames.push({
       id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
       rigKey: im.rigKey ?? im.focalGroup ?? im.id,
-      width: fw, height: fh, gray, fullW: im.width, fullH: im.height, rgba: im.rgba,
+      width: fw, height: fh, fullW: im.width, fullH: im.height,
+      depthGrayRaw, depthRGBARaw, dw, dh,
       f: im.f * sx, cx: (im.cx + 0.5) * sx - 0.5, cy: (im.cy + 0.5) * sy - 0.5,
       keypoints: feat.keypoints, count: feat.count, descriptors: feat.descriptors,
       sharpness: sharp,
@@ -251,6 +264,21 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   }
   const centers = sfm.cameras.map((c) => (c ? cameraCenter(c.R, c.t) : null));
 
+  // Colour the sparse points now, while the source images are still in memory: they are
+  // released as soon as the depth stage has made its own smaller copies.
+  const nSparse = sfm.points.length / 3;
+  const sparse = new Float32Array(nSparse * 3), sparseColors = new Float32Array(nSparse * 3);
+  for (let p = 0; p < nSparse; p++) {
+    sparse[p * 3] = sfm.points[p * 3]; sparse[p * 3 + 1] = -sfm.points[p * 3 + 1]; sparse[p * 3 + 2] = -sfm.points[p * 3 + 2];
+    const [fr, kp] = sfm.tracks[p][0];
+    const f = frames[fr];
+    const src = f.depthRGBARaw || f.depthRGBA;
+    const px = Math.min(f.dw - 1, Math.max(0, Math.round(f.keypoints[kp * 2] * (f.dw / f.width))));
+    const py = Math.min(f.dh - 1, Math.max(0, Math.round(f.keypoints[kp * 2 + 1] * (f.dh / f.height))));
+    const o = (py * f.dw + px) * 4;
+    sparseColors[p * 3] = src[o] / 255; sparseColors[p * 3 + 1] = src[o + 1] / 255; sparseColors[p * 3 + 2] = src[o + 2] / 255;
+  }
+
   // 4. Dense depth (GPU plane sweep when WebGL2 is available, CPU otherwise)
   let gpu = null;
   if (options.gpu !== false) {
@@ -303,13 +331,13 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const view = (idx) => {
       const f = frames[idx];
       if (!f.depthGray) {
-        const s = Math.min(1, q.depthWidth / Math.max(f.width, f.height));
-        const dw = Math.max(16, Math.round(f.width * s)), dh = Math.max(16, Math.round(f.height * s));
-        f.dw = dw; f.dh = dh;
-        f.df = f.f * (dw / f.width); f.dcx = (f.cx + 0.5) * (dw / f.width) - 0.5; f.dcy = (f.cy + 0.5) * (dh / f.height) - 0.5;
-        // The plane sweep assumes pinhole cameras: resample distorted images onto the pinhole grid
-        f.depthGray = undistortGray(resizeGray(f.gray, f.width, f.height, dw, dh), dw, dh, f.df, f.dcx, f.dcy, f.k1 || 0);
-        f.depthRGBA = undistortRGBA(resizeRGBA(f.rgba, f.fullW, f.fullH, dw, dh), dw, dh, f.df, f.dcx, f.dcy, f.k1 || 0);
+        const scaleX = f.dw / f.width, scaleY = f.dh / f.height;
+        f.df = f.f * scaleX; f.dcx = (f.cx + 0.5) * scaleX - 0.5; f.dcy = (f.cy + 0.5) * scaleY - 0.5;
+        // The plane sweep assumes pinhole cameras, so resample onto the pinhole grid using
+        // the distortion that bundle adjustment settled on.
+        f.depthGray = undistortGray(f.depthGrayRaw, f.dw, f.dh, f.df, f.dcx, f.dcy, f.k1 || 0);
+        f.depthRGBA = undistortRGBA(f.depthRGBARaw, f.dw, f.dh, f.df, f.dcx, f.dcy, f.k1 || 0);
+        f.depthGrayRaw = null; f.depthRGBARaw = null;
       }
       const cam = sfm.cameras[idx];
       return { gray: f.depthGray, w: f.dw, h: f.dh, f: f.df, cx: f.dcx, cy: f.dcy, R: cam.R, t: cam.t, rgb: f.depthRGBA };
@@ -322,6 +350,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     depthViews[fr] = { ...ref, depth: res.depth, confidence: res.confidence };
   }
   if (gpu) { gpu.dispose(); gpu = null; }
+  for (const f of frames) { f.depthGray = null; f.depthGrayRaw = null; f.depthRGBARaw = null; f.global = null; }
   const haveDepth = depthViews.filter((v) => v);
   if (haveDepth.length === 0) throw new Error('No depth maps could be computed. Add more overlapping photos.');
 
@@ -329,37 +358,60 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   const filtered = filterDepthConsistency(depthViews, neighborIdx.map((nbs) => nbs), { relTol: 0.04, minAgree: 1 });
   depthViews.forEach((v, i) => { if (v) v.depth = filtered[i]; });
 
-  // 5. Volume + fusion (the subsampled dense cloud is also exported for the user)
-  const dense = [], denseColors = [];
+  // 5. Volume + fusion (the subsampled dense cloud is also exported for the user).
+  // Counted first so the samples go straight into typed arrays: a plain array of a million
+  // boxed numbers costs many times more memory than the Float32Array it ends up as.
+  const denseStep = (v) => Math.max(1, Math.floor(Math.sqrt((v.w * v.h) / 6000)));
+  let denseCount = 0;
   for (const v of depthViews) {
     if (!v) continue;
-    const step = Math.max(1, Math.floor(Math.sqrt((v.w * v.h) / 6000)));
-    for (let y = 0; y < v.h; y += step) for (let x = 0; x < v.w; x += step) {
-      const d = v.depth[y * v.w + x];
-      if (!(d > 0)) continue;
-      const Xc = [((x - v.cx) / v.f) * d, ((y - v.cy) / v.f) * d, d];
-      const R = v.R, t = v.t;
-      dense.push(
-        R[0] * (Xc[0] - t[0]) + R[3] * (Xc[1] - t[1]) + R[6] * (Xc[2] - t[2]),
-        R[1] * (Xc[0] - t[0]) + R[4] * (Xc[1] - t[1]) + R[7] * (Xc[2] - t[2]),
-        R[2] * (Xc[0] - t[0]) + R[5] * (Xc[1] - t[1]) + R[8] * (Xc[2] - t[2]),
-      );
-      const o = (y * v.w + x) * 4;
-      denseColors.push(v.rgb ? v.rgb[o] / 255 : 0.6, v.rgb ? v.rgb[o + 1] / 255 : 0.6, v.rgb ? v.rgb[o + 2] / 255 : 0.6);
+    const step = denseStep(v);
+    for (let y = 0; y < v.h; y += step) for (let x = 0; x < v.w; x += step) if (v.depth[y * v.w + x] > 0) denseCount++;
+  }
+  const dense = new Float64Array(denseCount * 3);
+  const denseColors = new Float32Array(denseCount * 3);
+  {
+    let k = 0;
+    for (const v of depthViews) {
+      if (!v) continue;
+      const step = denseStep(v), R = v.R, t = v.t;
+      for (let y = 0; y < v.h; y += step) for (let x = 0; x < v.w; x += step) {
+        const d = v.depth[y * v.w + x];
+        if (!(d > 0)) continue;
+        const a = ((x - v.cx) / v.f) * d - t[0], b = ((y - v.cy) / v.f) * d - t[1], c = d - t[2];
+        dense[k] = R[0] * a + R[3] * b + R[6] * c;
+        dense[k + 1] = R[1] * a + R[4] * b + R[7] * c;
+        dense[k + 2] = R[2] * a + R[5] * b + R[8] * c;
+        const o = (y * v.w + x) * 4;
+        denseColors[k] = v.rgb ? v.rgb[o] / 255 : 0.6;
+        denseColors[k + 1] = v.rgb ? v.rgb[o + 1] / 255 : 0.6;
+        denseColors[k + 2] = v.rgb ? v.rgb[o + 2] / 255 : 0.6;
+        k += 3;
+      }
     }
   }
   if (dense.length < 300) throw new Error('Too few consistent depth samples to build a surface.');
-  let densePts = Float64Array.from(dense);
+  let densePts = dense;
   if (preset.focus) {
     // Object/person scans orbit their subject: crop the volume to where the optical axes converge
     const focus = opticalAxesFocus(sfm.cameras, centers);
     if (focus) {
       const radius = focus.meanDistance * preset.focus;
-      const kept = [];
+      let keep = 0;
       for (let i = 0; i < densePts.length; i += 3) {
-        if (Math.hypot(densePts[i] - focus.point[0], densePts[i + 1] - focus.point[1], densePts[i + 2] - focus.point[2]) <= radius) kept.push(densePts[i], densePts[i + 1], densePts[i + 2]);
+        if (Math.hypot(densePts[i] - focus.point[0], densePts[i + 1] - focus.point[1], densePts[i + 2] - focus.point[2]) <= radius) keep += 3;
       }
-      if (kept.length >= 300) { densePts = Float64Array.from(kept); log(`Focused on the subject: kept ${(100 * kept.length / dense.length).toFixed(0)}% of depth samples within the scan radius`); }
+      if (keep >= 300) {
+        const kept = new Float64Array(keep);
+        let k = 0;
+        for (let i = 0; i < densePts.length; i += 3) {
+          if (Math.hypot(densePts[i] - focus.point[0], densePts[i + 1] - focus.point[1], densePts[i + 2] - focus.point[2]) <= radius) {
+            kept[k] = densePts[i]; kept[k + 1] = densePts[i + 1]; kept[k + 2] = densePts[i + 2]; k += 3;
+          }
+        }
+        log(`Focused on the subject: kept ${(100 * keep / dense.length).toFixed(0)}% of depth samples within the scan radius`);
+        densePts = kept;
+      }
     }
   }
   const vol = fitVolume(densePts, q.voxelRes, { percentile: preset.percentile, margin: 0.06 });
@@ -393,18 +445,6 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   // Flipping two axes preserves handedness, so the winding stays valid.
   const normals = computeNormals(positions, mesh.indices);
 
-  // Sparse cloud and cameras for display (same y-up flip)
-  const nSparse = sfm.points.length / 3;
-  const sparse = new Float32Array(nSparse * 3), sparseColors = new Float32Array(nSparse * 3);
-  for (let p = 0; p < nSparse; p++) {
-    sparse[p * 3] = sfm.points[p * 3]; sparse[p * 3 + 1] = -sfm.points[p * 3 + 1]; sparse[p * 3 + 2] = -sfm.points[p * 3 + 2];
-    const [fr, kp] = sfm.tracks[p][0];
-    const f = frames[fr];
-    const px = Math.min(f.fullW - 1, Math.max(0, Math.round(f.keypoints[kp * 2] * (f.fullW / f.width))));
-    const py = Math.min(f.fullH - 1, Math.max(0, Math.round(f.keypoints[kp * 2 + 1] * (f.fullH / f.height))));
-    const o = (py * f.fullW + px) * 4;
-    sparseColors[p * 3] = f.rgba[o] / 255; sparseColors[p * 3 + 1] = f.rgba[o + 1] / 255; sparseColors[p * 3 + 2] = f.rgba[o + 2] / 255;
-  }
   const cameras = sfm.cameras.map((c, i) => {
     if (!c) return null;
     const C = cameraCenter(c.R, c.t);
