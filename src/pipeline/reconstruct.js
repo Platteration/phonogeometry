@@ -143,7 +143,10 @@ function selectCandidatePairs(frames, opts) {
     const sims = [];
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
-      if (Math.abs(shot(i) - shot(j)) <= window) pairs.add(key(i, j));
+      if (Math.abs(shot(i) - shot(j)) <= window) { pairs.add(key(i, j)); continue; }
+      // Only frames outside the window compete for the similarity slots. Ranking the
+      // neighbours here as well would fill every slot with pairs already chosen, and a walk
+      // that comes back on itself would never be recognised.
       let s = 0;
       for (let k = 0; k < desc[i].length; k++) s += desc[i][k] * desc[j][k];
       sims.push([s, j]);

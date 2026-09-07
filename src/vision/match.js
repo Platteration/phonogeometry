@@ -32,6 +32,9 @@ export function matchDescriptors(descA, na, descB, nb, opts = {}) {
   const secondBd = new Int32Array(na).fill(1e9);
   const bestA = new Int32Array(nb).fill(-1);
   const bestAd = new Int32Array(nb).fill(1e9);
+  // Abandoning a candidate part way through, once its partial distance already rules it out,
+  // was tried and made no measurable difference: the extra branch costs about what the
+  // skipped words save. Left as the plain full comparison.
   for (let i = 0; i < na; i++) {
     const a0 = A[i * 8], a1 = A[i * 8 + 1], a2 = A[i * 8 + 2], a3 = A[i * 8 + 3];
     const a4 = A[i * 8 + 4], a5 = A[i * 8 + 5], a6 = A[i * 8 + 6], a7 = A[i * 8 + 7];

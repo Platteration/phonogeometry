@@ -332,22 +332,39 @@ async function reconstruct() {
     const m = ev.data;
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
     else if (m.type === 'preview') await showPreview(m);
-    else if (m.type === 'error') {
-      releaseWakeLock();
-      setProgress('log', null, 'ERROR: ' + m.message);
-      $('#progress-stage').textContent = 'Reconstruction failed';
-      $('#progress-message').textContent = m.message;
-      toast(m.message, 6000);
-      $('#btn-cancel').textContent = 'Back';
-    } else if (m.type === 'done') {
+    else if (m.type === 'error') { reportFailure(m.message); } else if (m.type === 'done') {
       releaseWakeLock();
       $('#building').hidden = true;
       state.result = m.result;
       await showResult(m.result, (performance.now() - t0) / 1000);
     }
   };
-  worker.onerror = (e) => { releaseWakeLock(); toast('Worker error: ' + e.message, 6000); $('#progress-stage').textContent = 'Reconstruction failed'; $('#btn-cancel').textContent = 'Back'; };
+  worker.onerror = (e) => reportFailure(e.message || 'The reconstruction stopped unexpectedly');
   worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked, useRig: $('#chk-rig').checked } }, images.map((im) => im.rgba.buffer));
+}
+
+/**
+ * Show a failure wherever the user is looking. Once the preview is up they are on the viewer
+ * screen, so writing only to the processing screen would leave a build bar running forever.
+ */
+function reportFailure(message) {
+  releaseWakeLock();
+  if (state.worker) { state.worker.terminate(); state.worker = null; }
+  setProgressLog('ERROR: ' + message);
+  $('#progress-stage').textContent = 'Reconstruction failed';
+  $('#progress-message').textContent = message;
+  $('#btn-cancel').textContent = 'Back';
+  if ($('#screen-view').hidden) {
+    showScreen('process');
+  } else {
+    // The preview is on screen: say so there, and leave it up so the camera path stays visible
+    $('#building').hidden = false;
+    $('#building-stage').textContent = 'Could not build the surface';
+    $('#building-detail').textContent = message;
+    $('#building-bar').style.width = '100%';
+    $('#btn-cancel-build').textContent = 'Back';
+  }
+  toast(message, 6000);
 }
 
 /** Controls that need a finished surface are off while only a preview is on screen. */
@@ -374,16 +391,24 @@ async function showPreview(m) {
   setProgressLog(`Preview: ${m.message}`);
 }
 
+let viewerPromise = null;
 async function ensureViewer() {
   if (state.viewer) return true;
-  try {
-    const { Viewer } = await import('./viewer/viewer.js');
-    state.viewer = new Viewer($('#viewer'));
-    return true;
-  } catch {
-    toast('3D viewer could not load (offline?). You can still download the mesh.', 6000);
-    return false;
+  // Guard against two callers racing: the preview and the finished result can arrive close
+  // together, and building two viewers would leak a WebGL context and stack two canvases.
+  if (!viewerPromise) {
+    viewerPromise = (async () => {
+      try {
+        const { Viewer } = await import('./viewer/viewer.js');
+        state.viewer = new Viewer($('#viewer'));
+        return true;
+      } catch {
+        toast('3D viewer could not load. You can still download the mesh.', 6000);
+        return false;
+      }
+    })();
   }
+  return viewerPromise;
 }
 
 async function showResult(result, seconds) {
@@ -456,6 +481,7 @@ function init() {
     releaseWakeLock();
     $('#building').hidden = true;
     $('#btn-cancel').textContent = 'Cancel';
+    $('#btn-cancel-build').textContent = 'Stop';
     showScreen('capture');
   };
   $('#btn-cancel').addEventListener('click', stopBuild);

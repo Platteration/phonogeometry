@@ -86,6 +86,7 @@ export class Viewer {
     const radius = Math.max(1e-3, box.getSize(new THREE.Vector3()).length() / 2);
     this.grid.position.set(centre.x, centre.y - radius, centre.z);
     this.grid.scale.setScalar(radius);
+    this._framing = { centre, radius };
     this._frame(centre, radius);
   }
 
@@ -146,13 +147,18 @@ export class Viewer {
     const bs = geo.boundingSphere;
     this.grid.position.set(bs.center.x, bs.center.y - bs.radius, bs.center.z);
     this.grid.scale.setScalar(bs.radius);
+    this._framing = { centre: bs.center.clone(), radius: bs.radius };
     this.fit();
   }
 
+  /** Return the camera to the framing chosen when the current content was loaded. */
   fit() {
-    if (!this.mesh) return;
-    const bs = this.mesh.geometry.boundingSphere;
-    this._frame(bs.center, bs.radius);
+    if (this.mesh) {
+      const bs = this.mesh.geometry.boundingSphere;
+      this._frame(bs.center, bs.radius);
+    } else if (this._framing) {
+      this._frame(this._framing.centre, this._framing.radius);
+    }
   }
 
   setMode(mode) {

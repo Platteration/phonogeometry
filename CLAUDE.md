@@ -36,6 +36,12 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - Relaxing the descriptor ratio test doubles the image pairs that pass geometric verification
   but wrecks the reconstruction, because the extra wrong matches chain unrelated features into
   one track. Pairwise metrics mislead here: judge matching changes end to end.
+- Matching is the dominant cost on a long scan and it grew, not shrank, when the feature
+  settings were raised: a forty-frame Balanced scan spends about a minute there on a laptop.
+  Cutting features back to 2000 halves that but loses the hardest inputs (the worst degraded
+  case goes from 0.025 to 0.170 surface error), and 1500 fails to register them at all, so
+  the cost is being paid deliberately. Fewer candidate pairs, not cheaper comparisons, is the
+  lever that works: an early-exit inner loop was tried and measured no faster.
 - How far apart consecutive shots may be is set by how many corners are detected, and the
   corner threshold matters more than the feature cap. At 1000 features and threshold 18 the
   geometry gives out past about 16 degrees of viewpoint change; at 3000 features and
