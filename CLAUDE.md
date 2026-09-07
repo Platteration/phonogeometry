@@ -11,7 +11,9 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
 - Browser-only checks (GPU plane sweep) live in `test/browser/`; open them through the dev
-  server. Headless Chromium via Playwright works with fake camera devices
+  server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
+  a secure context: a self-signed certificate blocks service worker registration outright, so
+  the HTTPS dev server cannot exercise it. Headless Chromium via Playwright works with fake camera devices
   (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`).
 
 ## Layout

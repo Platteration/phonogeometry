@@ -4,7 +4,9 @@ Turn every camera on your phone into a 3D scanner.
 
 Phonogeometry is a progressive web app that opens **all the cameras your phone exposes** (wide, ultra-wide, telephoto, front) and captures from them simultaneously. From a handful of shots taken while you move around, it reconstructs a **textured 3D mesh** of a room, a person or an object, entirely on the device, and exports it as GLB, PLY or OBJ.
 
-No app store, no server, no account: it runs in the phone's browser and works offline once installed.
+No app store, no server, no account: it runs in the phone's browser and works offline once
+loaded. That is tested, not assumed: with the network cut after the first visit, the app
+still opens, imports photos, reconstructs and exports.
 
 <p align="center">
   <img src="docs/capture.png" width="30%" alt="Capture screen with live camera tiles" />

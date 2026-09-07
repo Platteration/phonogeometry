@@ -492,7 +492,11 @@ function init() {
   restoreShots();
 
   if (!cams.supported) $('#camera-status').textContent = 'Camera access is not available in this browser or over an insecure (http) connection. You can still import photos.';
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  // A secure context, not specifically https: browsers count http://localhost as secure, which
+  // is how the app is developed and tested.
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Offline support unavailable:', err.message));
+  }
 }
 
 init();
