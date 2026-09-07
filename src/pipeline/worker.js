@@ -6,7 +6,13 @@ self.onmessage = async (ev) => {
   if (type !== 'run') return;
   try {
     // The pixel buffers were transferred to this worker, so they can be freed as they are used
-    const result = await reconstruct(images, { ...options, releaseInputs: true }, (stage, fraction, message) => {
+    const result = await reconstruct(images, { ...options, releaseInputs: true }, (stage, fraction, message, data) => {
+      if (stage === 'preview' && data) {
+        // Copies, because the reconstruction goes on using these arrays
+        const sparse = { positions: Float32Array.from(data.sparse.positions), colors: Float32Array.from(data.sparse.colors) };
+        self.postMessage({ type: 'preview', message, sparse, cameras: data.cameras }, [sparse.positions.buffer, sparse.colors.buffer]);
+        return;
+      }
       self.postMessage({ type: 'progress', stage, fraction, message });
     });
     const transfer = [

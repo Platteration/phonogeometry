@@ -66,6 +66,61 @@ export class Viewer {
     }
   }
 
+  /** Show only the camera path and sparse points, before a surface exists. */
+  setPreview({ sparse, cameras }) {
+    this.clear();
+    this.mesh = null;
+    const box = new THREE.Box3();
+    if (sparse && sparse.positions.length) {
+      const pg = new THREE.BufferGeometry();
+      pg.setAttribute('position', new THREE.BufferAttribute(sparse.positions, 3));
+      pg.setAttribute('color', new THREE.BufferAttribute(sparse.colors, 3));
+      pg.computeBoundingBox();
+      box.union(pg.boundingBox);
+      const r = Math.max(1e-3, pg.boundingBox.getSize(new THREE.Vector3()).length() / 2);
+      this.pointsGroup.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: r * 0.01, vertexColors: true, sizeAttenuation: true })));
+      this.pointsGroup.visible = true;
+    }
+    this._addCameras(cameras, Math.max(1e-3, box.getSize(new THREE.Vector3()).length() / 2));
+    const centre = box.getCenter(new THREE.Vector3());
+    const radius = Math.max(1e-3, box.getSize(new THREE.Vector3()).length() / 2);
+    this.grid.position.set(centre.x, centre.y - radius, centre.z);
+    this.grid.scale.setScalar(radius);
+    this._frame(centre, radius);
+  }
+
+  _addCameras(cameras, size0) {
+    if (!cameras) return;
+    const size = size0 * 0.08;
+    const verts = [];
+    for (const c of cameras) {
+      if (!c) continue;
+      const C = new THREE.Vector3(...c.center);
+      const right = new THREE.Vector3(...c.right), down = new THREE.Vector3(...c.down), fwd = new THREE.Vector3(...c.forward);
+      const hw = c.fovTan * size, hh = hw / c.aspect;
+      const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) =>
+        C.clone().add(fwd.clone().multiplyScalar(size)).add(right.clone().multiplyScalar(sx * hw)).add(down.clone().multiplyScalar(sy * hh)));
+      for (let i = 0; i < 4; i++) {
+        verts.push(C.x, C.y, C.z, corners[i].x, corners[i].y, corners[i].z);
+        const n = corners[(i + 1) % 4];
+        verts.push(corners[i].x, corners[i].y, corners[i].z, n.x, n.y, n.z);
+      }
+    }
+    if (!verts.length) return;
+    const cg = new THREE.BufferGeometry();
+    cg.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    this.camerasGroup.add(new THREE.LineSegments(cg, new THREE.LineBasicMaterial({ color: 0xffb454 })));
+  }
+
+  _frame(centre, radius) {
+    const dist = radius / Math.sin((this.camera.fov * Math.PI) / 360) * 1.1;
+    this.controls.target.copy(centre);
+    this.camera.position.copy(centre).add(new THREE.Vector3(0.4, 0.5, 1).normalize().multiplyScalar(dist));
+    this.camera.near = Math.max(0.001, dist / 1000); this.camera.far = dist * 50;
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
+  }
+
   setResult(result) {
     this.clear();
     const { mesh, sparse, cameras } = result;
@@ -86,27 +141,7 @@ export class Viewer {
       this.pointsGroup.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: r * 0.012, vertexColors: true, sizeAttenuation: true })));
     }
 
-    if (cameras) {
-      const r = geo.boundingSphere.radius;
-      const size = r * 0.08;
-      const verts = [];
-      for (const c of cameras) {
-        if (!c) continue;
-        const C = new THREE.Vector3(...c.center);
-        const right = new THREE.Vector3(...c.right), down = new THREE.Vector3(...c.down), fwd = new THREE.Vector3(...c.forward);
-        const hw = c.fovTan * size, hh = hw / c.aspect;
-        const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) =>
-          C.clone().add(fwd.clone().multiplyScalar(size)).add(right.clone().multiplyScalar(sx * hw)).add(down.clone().multiplyScalar(sy * hh)));
-        for (let i = 0; i < 4; i++) {
-          verts.push(C.x, C.y, C.z, corners[i].x, corners[i].y, corners[i].z);
-          const n = corners[(i + 1) % 4];
-          verts.push(corners[i].x, corners[i].y, corners[i].z, n.x, n.y, n.z);
-        }
-      }
-      const cg = new THREE.BufferGeometry();
-      cg.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-      this.camerasGroup.add(new THREE.LineSegments(cg, new THREE.LineBasicMaterial({ color: 0xffb454 })));
-    }
+    this._addCameras(cameras, geo.boundingSphere.radius);
     // Grid under the model
     const bs = geo.boundingSphere;
     this.grid.position.set(bs.center.x, bs.center.y - bs.radius, bs.center.z);
@@ -117,12 +152,7 @@ export class Viewer {
   fit() {
     if (!this.mesh) return;
     const bs = this.mesh.geometry.boundingSphere;
-    const dist = bs.radius / Math.sin((this.camera.fov * Math.PI) / 360) * 1.1;
-    this.controls.target.copy(bs.center);
-    this.camera.position.copy(bs.center).add(new THREE.Vector3(0.4, 0.5, 1).normalize().multiplyScalar(dist));
-    this.camera.near = Math.max(0.001, dist / 1000); this.camera.far = dist * 50;
-    this.camera.updateProjectionMatrix();
-    this.controls.update();
+    this._frame(bs.center, bs.radius);
   }
 
   setMode(mode) {

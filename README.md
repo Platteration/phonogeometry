@@ -89,6 +89,14 @@ behind you at the same time. The few millimetres between the lenses are treated 
 which is far below the voxel size of any scan, so the cameras of one shot end up at the same
 point.
 
+## Watching a scan come together
+
+Working out where each photo was taken is the slow and uncertain part of the job; turning
+those positions into a surface takes a predictable amount of time. So as soon as the camera
+positions are solved, the app shows them: the camera path and the sparse points appear in the
+viewer with a bar reporting what is still being computed, and the finished surface replaces
+them when it is ready. If the path looks wrong, stop there rather than waiting out the rest.
+
 ## When a scan comes out wrong
 
 After processing, any photo that could not be placed in the model is greyed out and labelled

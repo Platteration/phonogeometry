@@ -279,6 +279,27 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     sparseColors[p * 3] = src[o] / 255; sparseColors[p * 3 + 1] = src[o + 1] / 255; sparseColors[p * 3 + 2] = src[o + 2] / 255;
   }
 
+  // Camera frusta for display, in the y-up convention used for output
+  const cameras = sfm.cameras.map((c, i) => {
+    if (!c) return null;
+    const C = cameraCenter(c.R, c.t);
+    return {
+      id: frames[i].id, label: frames[i].label,
+      center: [C[0], -C[1], -C[2]],
+      // Camera axes in world space (rows of R), flipped to y-up
+      right: [c.R[0], -c.R[1], -c.R[2]], down: [c.R[3], -c.R[4], -c.R[5]], forward: [c.R[6], -c.R[7], -c.R[8]],
+      aspect: frames[i].width / frames[i].height, fovTan: (frames[i].width / 2) / frames[i].f,
+    };
+  });
+
+  // Hand back what is known so far. Working out where every photo was taken is the slow,
+  // uncertain part; the surface that follows takes a predictable amount of time. Showing the
+  // camera path and the sparse points now lets someone see their scan taking shape, and see
+  // early if it has gone wrong, instead of watching a bar for several minutes.
+  progress('preview', 0, `Placed ${sfm.registeredCount} of ${images.length} photos`, {
+    sparse: { positions: sparse, colors: sparseColors }, cameras,
+  });
+
   // 4. Dense depth (GPU plane sweep when WebGL2 is available, CPU otherwise)
   let gpu = null;
   if (options.gpu !== false) {
@@ -445,17 +466,6 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   // Flipping two axes preserves handedness, so the winding stays valid.
   const normals = computeNormals(positions, mesh.indices);
 
-  const cameras = sfm.cameras.map((c, i) => {
-    if (!c) return null;
-    const C = cameraCenter(c.R, c.t);
-    return {
-      id: frames[i].id, label: frames[i].label,
-      center: [C[0], -C[1], -C[2]],
-      // Camera axes in world space (rows of R), flipped to y-up
-      right: [c.R[0], -c.R[1], -c.R[2]], down: [c.R[3], -c.R[4], -c.R[5]], forward: [c.R[6], -c.R[7], -c.R[8]],
-      aspect: frames[i].width / frames[i].height, fovTan: (frames[i].width / 2) / frames[i].f,
-    };
-  });
 
   const nDense = dense.length / 3;
   const densePositions = new Float32Array(nDense * 3);

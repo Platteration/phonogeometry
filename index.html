@@ -96,6 +96,11 @@
   <!-- ============ Viewer ============ -->
   <main id="screen-view" class="screen viewer-screen" hidden>
     <div id="viewer" class="viewer"></div>
+    <div id="building" class="building" hidden>
+      <div class="building-text"><strong id="building-stage">Building the surface…</strong><span id="building-detail"></span></div>
+      <div class="progress slim"><div id="building-bar"></div></div>
+      <button id="btn-cancel-build" class="ghost small danger">Stop</button>
+    </div>
     <div class="viewer-toolbar">
       <div class="segmented" id="view-mode">
         <button data-mode="solid" class="active">Color</button>
@@ -158,7 +163,7 @@
         <li><strong>Overlap and texture.</strong> Each shot should share well over half of its view with the previous one. Plain white walls and glossy surfaces reconstruct poorly; patterned and matte surfaces reconstruct well. Keep something with depth in view, such as furniture or a corner: a single flat wall filling the frame cannot be measured, whatever you do.</li>
         <li><strong>Vary your distance.</strong> Take a few shots closer and a few further away. Phones do not tell the browser their focal lengths, and varying distance is what lets the app calibrate each lens.</li>
         <li><strong>Hold still.</strong> People should stay still while you walk around them. Avoid moving objects. Frames that come out blurry are marked with a badge: retake those shots, because one soft frame in the middle of a sequence can strand everything after it.</li>
-        <li><strong>Build.</strong> Processing runs entirely on the phone. Fast quality takes under a minute for a dozen shots; High can take several minutes.</li>
+        <li><strong>Build.</strong> Processing runs entirely on the phone. The camera path and a cloud of points appear as soon as the positions are worked out, so you can see whether the scan is going to work before the surface is finished.</li>
         <li><strong>Export.</strong> Download GLB (opens in most 3D viewers and AR apps), PLY or OBJ. Scale is arbitrary because a single phone cannot measure absolute size.</li>
       </ol>
       <div class="row gap end"><button value="close" class="primary">Got it</button></div>

@@ -294,6 +294,13 @@ async function reconstruct() {
   showScreen('process');
   holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';
+  const setBuilding = (stage, pct, msg) => {
+    if ($('#screen-view').hidden) return;
+    $('#building').hidden = false;
+    $('#building-stage').textContent = stage;
+    $('#building-detail').textContent = msg || '';
+    $('#building-bar').style.width = pct + '%';
+  };
   const setProgress = (stage, frac, msg) => {
     const names = { features: 'Finding features', matching: 'Matching images', sfm: 'Solving camera positions', depth: 'Computing depth maps', fusion: 'Fusing into a volume', mesh: 'Extracting the mesh', done: 'Done' };
     const order = ['features', 'matching', 'sfm', 'depth', 'fusion', 'mesh', 'done'];
@@ -305,6 +312,7 @@ async function reconstruct() {
     $('#progress-bar').style.width = pct + '%';
     $('#progress-stage').textContent = names[stage] || stage;
     if (msg) { $('#progress-message').textContent = msg; log.textContent += `[${stage}] ${msg}\n`; log.scrollTop = log.scrollHeight; }
+    setBuilding(names[stage] || stage, pct, msg);
   };
   const quality = $('#quality').value;
   const targetWidth = QUALITY[quality].featureWidth;
@@ -323,6 +331,7 @@ async function reconstruct() {
   worker.onmessage = async (ev) => {
     const m = ev.data;
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
+    else if (m.type === 'preview') await showPreview(m);
     else if (m.type === 'error') {
       releaseWakeLock();
       setProgress('log', null, 'ERROR: ' + m.message);
@@ -332,6 +341,7 @@ async function reconstruct() {
       $('#btn-cancel').textContent = 'Back';
     } else if (m.type === 'done') {
       releaseWakeLock();
+      $('#building').hidden = true;
       state.result = m.result;
       await showResult(m.result, (performance.now() - t0) / 1000);
     }
@@ -340,16 +350,47 @@ async function reconstruct() {
   worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked, useRig: $('#chk-rig').checked } }, images.map((im) => im.rgba.buffer));
 }
 
-async function showResult(result, seconds) {
-  if (!state.viewer) {
-    try {
-      const { Viewer } = await import('./viewer/viewer.js');
-      state.viewer = new Viewer($('#viewer'));
-    } catch (err) {
-      toast('3D viewer could not load (offline?). You can still download the mesh.', 6000);
-    }
+/** Controls that need a finished surface are off while only a preview is on screen. */
+function setResultControlsEnabled(on) {
+  for (const sel of ['#btn-export-glb', '#btn-export-ply', '#btn-export-obj', '#btn-export-points', '#btn-share']) {
+    const el = $(sel);
+    if (el) el.disabled = !on;
   }
+  for (const b of $('#view-mode').querySelectorAll('button')) b.disabled = !on;
+}
+
+/** Show the camera path and sparse points while the surface is still being built. */
+async function showPreview(m) {
+  if (!(await ensureViewer())) return;
   showScreen('view');
+  $('#building').hidden = false;
+  $('#building-stage').textContent = 'Building the surface…';
+  $('#building-detail').textContent = m.message || '';
+  setResultControlsEnabled(false);
+  state.viewer.setPreview({ sparse: m.sparse, cameras: m.cameras });
+  state.viewer.setLayer('cameras', $('#chk-cameras').checked);
+  state.viewer.setLayer('grid', $('#chk-grid').checked);
+  $('#chk-points').checked = true;
+  setProgressLog(`Preview: ${m.message}`);
+}
+
+async function ensureViewer() {
+  if (state.viewer) return true;
+  try {
+    const { Viewer } = await import('./viewer/viewer.js');
+    state.viewer = new Viewer($('#viewer'));
+    return true;
+  } catch {
+    toast('3D viewer could not load (offline?). You can still download the mesh.', 6000);
+    return false;
+  }
+}
+
+async function showResult(result, seconds) {
+  await ensureViewer();
+  showScreen('view');
+  $('#building').hidden = true;
+  setResultControlsEnabled(true);
   if (state.viewer) {
     state.viewer.setResult(result);
     state.viewer.setLayer('points', $('#chk-points').checked);
@@ -410,7 +451,15 @@ function init() {
   $('#file-import').addEventListener('change', (e) => { importFiles(Array.from(e.target.files)); e.target.value = ''; });
   $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
-  $('#btn-cancel').addEventListener('click', () => { if (state.worker) { state.worker.terminate(); state.worker = null; } releaseWakeLock(); $('#btn-cancel').textContent = 'Cancel'; showScreen('capture'); });
+  const stopBuild = () => {
+    if (state.worker) { state.worker.terminate(); state.worker = null; }
+    releaseWakeLock();
+    $('#building').hidden = true;
+    $('#btn-cancel').textContent = 'Cancel';
+    showScreen('capture');
+  };
+  $('#btn-cancel').addEventListener('click', stopBuild);
+  $('#btn-cancel-build').addEventListener('click', stopBuild);
   $('#btn-settings').addEventListener('click', () => $('#settings').showModal());
   $('#btn-help').addEventListener('click', () => $('#help').showModal());
   $('#view-mode').addEventListener('click', (e) => {
