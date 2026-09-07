@@ -43,6 +43,10 @@ function updateCounts() {
   const n = frameCount();
   $('#frame-count').textContent = n ? `· ${n} frames` : '';
   $('#btn-reconstruct').disabled = n < 2;
+  // Rough on-phone processing time per frame at each quality level
+  const perFrame = { fast: 1.5, balanced: 4, high: 12 }[$('#quality').value] || 4;
+  const secs = n * perFrame;
+  $('#btn-reconstruct').textContent = n >= 2 ? `Build 3D mesh (~${secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + ' min'})` : 'Build 3D mesh';
 }
 
 // ---------- Cameras ----------
@@ -97,6 +101,22 @@ async function startCameras() {
   } finally {
     btn.disabled = false;
   }
+}
+
+let reopening = false;
+async function reopenCameras() {
+  if (reopening || !cams.cameras.length || $('#screen-capture').hidden) return;
+  const missing = cams.cameras.filter((c) => c.enabled && !cams.open.has(c.deviceId));
+  if (!missing.length) return;
+  reopening = true;
+  try {
+    const results = [];
+    for (const cam of missing) {
+      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, { width: 1280, height: 720 }) }); }
+      catch (err) { results.push({ cam, ok: false, error: err.message }); }
+    }
+    renderCameraTiles(results);
+  } finally { reopening = false; }
 }
 
 function renderLensSettings() {
@@ -231,9 +251,19 @@ async function decodeForWorker(frame, targetWidth, id, shotIndex) {
   return { id, label: frame.label, width: w, height: h, rgba: data, f: frame.f * sx, cx: (frame.cx + 0.5) * sx - 0.5, cy: (frame.cy + 0.5) * sy - 0.5, shotIndex, focalGroup: `${frame.key}|${Math.round(frame.hfov || 0)}` };
 }
 
+let wakeLock = null;
+async function holdWakeLock() {
+  try { if (navigator.wakeLock && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch { /* not allowed or unsupported */ }
+}
+function releaseWakeLock() {
+  try { wakeLock?.release(); } catch { /* ignore */ }
+  wakeLock = null;
+}
+
 async function reconstruct() {
   if (frameCount() < 2) return;
   showScreen('process');
+  holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';
   const setProgress = (stage, frac, msg) => {
     const names = { features: 'Finding features', matching: 'Matching images', sfm: 'Solving camera positions', depth: 'Computing depth maps', fusion: 'Fusing into a volume', mesh: 'Extracting the mesh', done: 'Done' };
@@ -265,18 +295,20 @@ async function reconstruct() {
     const m = ev.data;
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
     else if (m.type === 'error') {
+      releaseWakeLock();
       setProgress('log', null, 'ERROR: ' + m.message);
       $('#progress-stage').textContent = 'Reconstruction failed';
       $('#progress-message').textContent = m.message;
       toast(m.message, 6000);
       $('#btn-cancel').textContent = 'Back';
     } else if (m.type === 'done') {
+      releaseWakeLock();
       state.result = m.result;
       await showResult(m.result, (performance.now() - t0) / 1000);
     }
   };
-  worker.onerror = (e) => { toast('Worker error: ' + e.message, 6000); $('#progress-stage').textContent = 'Reconstruction failed'; $('#btn-cancel').textContent = 'Back'; };
-  worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset } }, images.map((im) => im.rgba.buffer));
+  worker.onerror = (e) => { releaseWakeLock(); toast('Worker error: ' + e.message, 6000); $('#progress-stage').textContent = 'Reconstruction failed'; $('#btn-cancel').textContent = 'Back'; };
+  worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked } }, images.map((im) => im.rgba.buffer));
 }
 
 async function showResult(result, seconds) {
@@ -319,12 +351,13 @@ function init() {
     $('#preset-tip').textContent = PRESET_TIPS[state.preset];
   });
   $('#btn-start-cameras').addEventListener('click', startCameras);
+  $('#quality').addEventListener('change', updateCounts);
   $('#btn-capture').addEventListener('click', captureShot);
   $('#btn-import').addEventListener('click', () => $('#file-import').click());
   $('#file-import').addEventListener('change', (e) => { importFiles(Array.from(e.target.files)); e.target.value = ''; });
   $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
-  $('#btn-cancel').addEventListener('click', () => { if (state.worker) { state.worker.terminate(); state.worker = null; } $('#btn-cancel').textContent = 'Cancel'; showScreen('capture'); });
+  $('#btn-cancel').addEventListener('click', () => { if (state.worker) { state.worker.terminate(); state.worker = null; } releaseWakeLock(); $('#btn-cancel').textContent = 'Cancel'; showScreen('capture'); });
   $('#btn-settings').addEventListener('click', () => $('#settings').showModal());
   $('#btn-help').addEventListener('click', () => $('#help').showModal());
   $('#view-mode').addEventListener('click', (e) => {
@@ -349,6 +382,9 @@ function init() {
   $('#btn-new-scan').addEventListener('click', () => { if (confirm('Start a new scan? Current shots and mesh will be discarded.')) { state.shots = []; state.result = null; store.clear(); renderShots(); updateCounts(); showScreen('capture'); } });
   document.addEventListener('keydown', (e) => { if (e.code === 'Space' && !$('#screen-capture').hidden && document.activeElement?.tagName !== 'BUTTON') { e.preventDefault(); captureShot(); } });
   window.addEventListener('pagehide', () => cams.closeAll());
+  // Phones stop camera streams when the tab is hidden; reopen them when it comes back.
+  cams.addEventListener('ended', () => { if (document.visibilityState === 'visible') reopenCameras(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reopenCameras(); });
   updateCounts();
   restoreShots();
 

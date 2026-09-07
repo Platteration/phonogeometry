@@ -6,6 +6,13 @@ Phonogeometry is a progressive web app that opens **all the cameras your phone e
 
 No app store, no server, no account: it runs in the phone's browser and works offline once installed.
 
+<p align="center">
+  <img src="docs/capture.png" width="30%" alt="Capture screen with live camera tiles" />
+  &nbsp;
+  <img src="docs/viewer.png" width="30%" alt="Reconstructed mesh in the viewer" />
+</p>
+<p align="center"><sub>Capture screen (with a browser test camera) and the viewer showing a reconstruction of a synthetic test scene with its eight camera frusta.</sub></p>
+
 ## How it works
 
 Every shutter press grabs a frame from each camera at the same instant. Wide and ultra-wide lenses give context and coverage, the telephoto gives detail, and the front camera looks the opposite way, which is what you want when you scan a room. Between shots you move; the parallax between viewpoints is what makes the 3D.
@@ -19,7 +26,7 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 | Two-view geometry | Normalised eight-point essential matrix inside RANSAC, cheirality-based pose recovery | `src/vision/geometry.js` |
 | Structure from motion | Incremental: feature tracks, best-pair initialisation, PnP registration (DLT + RANSAC + Levenberg–Marquardt), pairwise pose chaining fallback | `src/vision/sfm.js` |
 | Bundle adjustment | Sparse Levenberg–Marquardt with the Schur complement and Huber loss; refines one focal length per physical camera | `src/vision/ba.js` |
-| Dense depth | Multi-view plane sweep with zero-mean normalised cross-correlation (robust to exposure differences between physical cameras), sub-plane refinement, cross-view consistency check | `src/vision/planeSweep.js` |
+| Dense depth | Multi-view plane sweep with zero-mean normalised cross-correlation (robust to exposure differences between physical cameras), sub-plane refinement, cross-view consistency check; runs on the GPU through WebGL2 with an identical CPU fallback | `src/vision/planeSweepGPU.js`, `src/vision/planeSweep.js` |
 | Fusion | Truncated signed distance volume with per-voxel colour; object and person scans focus the volume on the point the cameras converge on | `src/mesh/tsdf.js`, `src/pipeline/reconstruct.js` |
 | Meshing | Naive surface nets, component filtering, Taubin smoothing, vertex colours | `src/mesh/surfaceNets.js`, `src/mesh/meshUtils.js` |
 | Export | GLB (glTF 2.0 binary), binary PLY, OBJ | `src/mesh/exporters.js` |
@@ -61,7 +68,7 @@ Some phones refuse to stream several rear cameras at the same time. Cameras that
 
 - The scale of the model is arbitrary. A single phone cannot measure absolute size from images alone; export and scale in your 3D tool if you need real units.
 - Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere.
-- Everything runs on the phone's CPU in JavaScript, so resolution and voxel counts are modest by design. The pipeline is structured so the plane sweep could move to WebGL and the TSDF to a coarser-to-finer scheme.
+- Feature matching, structure from motion and fusion run on the CPU in JavaScript; the dense depth stage runs on the GPU when the browser offers WebGL2 with float render targets (most phones since 2018). Resolutions and voxel counts are modest by design.
 
 ## Development
 
@@ -71,7 +78,9 @@ npm start         # plain HTTP on :8080 for desktop development (imports only)
 npm run icons     # regenerate the PWA icons
 ```
 
-The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as two full reconstructions.
+The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence and focal-length recovery, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as full reconstructions.
+
+The GPU plane sweep cannot run under Node. Start the dev server and open `test/browser/index.html` in a browser: it compares the GPU and CPU depth maps of a synthetic scene against the ground truth and prints coverage, accuracy, agreement and timings.
 
 ## Project layout
 

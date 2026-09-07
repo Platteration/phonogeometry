@@ -5,6 +5,7 @@ import { extractORB } from '../vision/orb.js';
 import { matchDescriptors } from '../vision/match.js';
 import { runSfM } from '../vision/sfm.js';
 import { computeDepthMap, filterDepthConsistency } from '../vision/planeSweep.js';
+import { createGpuSweeper } from '../vision/planeSweepGPU.js';
 import { cameraCenter, inv3 } from '../vision/linalg.js';
 import { triangulationAngle } from '../vision/geometry.js';
 import { TSDFVolume, fitVolume } from '../mesh/tsdf.js';
@@ -12,7 +13,7 @@ import { surfaceNets } from '../mesh/surfaceNets.js';
 import { computeNormals, smoothMesh, removeSmallComponents } from '../mesh/meshUtils.js';
 
 export const QUALITY = {
-  fast: { featureWidth: 480, maxFeatures: 800, depthWidth: 160, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
+  fast: { featureWidth: 560, maxFeatures: 1000, depthWidth: 160, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
   balanced: { featureWidth: 640, maxFeatures: 1100, depthWidth: 240, numPlanes: 64, voxelRes: 128, neighbors: 3, radius: 3 },
   high: { featureWidth: 800, maxFeatures: 1500, depthWidth: 320, numPlanes: 96, voxelRes: 176, neighbors: 4, radius: 3 },
 };
@@ -186,7 +187,19 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   }
   const centers = sfm.cameras.map((c) => (c ? cameraCenter(c.R, c.t) : null));
 
-  // 4. Dense depth
+  // 4. Dense depth (GPU plane sweep when WebGL2 is available, CPU otherwise)
+  let gpu = null;
+  if (options.gpu !== false) {
+    try { gpu = createGpuSweeper(); } catch { gpu = null; }
+    log(gpu ? `Depth maps on the GPU (${gpu.info})` : 'Depth maps on the CPU (WebGL2 float rendering unavailable)');
+  }
+  const sweep = (ref, nbs, sweepOpts) => {
+    if (gpu && !gpu.isLost()) {
+      try { return gpu.computeDepthMap(ref, nbs, sweepOpts); }
+      catch (err) { log(`GPU depth failed (${err.message}), falling back to the CPU`); gpu.dispose(); gpu = null; }
+    }
+    return computeDepthMap(ref, nbs, sweepOpts);
+  };
   const depthViews = frames.map(() => null);
   const neighborIdx = frames.map(() => []);
   let done = 0;
@@ -237,12 +250,13 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
       return { gray: f.depthGray, w: f.dw, h: f.dh, f: f.df, cx: f.dcx, cy: f.dcy, R: cam.R, t: cam.t, rgb: f.depthRGBA };
     };
     const ref = view(fr);
-    const res = computeDepthMap(ref, nbs.map(view), { dmin, dmax, numPlanes: q.numPlanes, radius: q.radius, minZncc: preset.minZncc });
+    const res = sweep(ref, nbs.map(view), { dmin, dmax, numPlanes: q.numPlanes, radius: q.radius, minZncc: preset.minZncc });
     let valid = 0;
     for (let i = 0; i < res.depth.length; i++) if (res.depth[i] > 0) valid++;
     log(`Frame ${fr}: depth from ${nbs.length} neighbours, ${(100 * valid / res.depth.length).toFixed(0)}% coverage, range ${dmin.toFixed(2)}-${dmax.toFixed(2)}`);
     depthViews[fr] = { ...ref, depth: res.depth, confidence: res.confidence };
   }
+  if (gpu) { gpu.dispose(); gpu = null; }
   const haveDepth = depthViews.filter((v) => v);
   if (haveDepth.length === 0) throw new Error('No depth maps could be computed. Add more overlapping photos.');
 
