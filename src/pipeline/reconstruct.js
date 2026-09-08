@@ -170,7 +170,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   const log = (msg) => progress('log', null, msg);
   const t0 = Date.now();
 
-  if (images.length < 2) throw new Error('At least two images are needed');
+  if (images.length < 2) throw new Error('At least two photos are needed, and in practice several more: a scan needs enough views that each part of the subject is seen from three or four positions.');
 
   // 1. Preprocess + features
   const frames = [];

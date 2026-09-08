@@ -50,13 +50,21 @@ function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length,
 function updateCounts() {
   $('#shot-count').textContent = state.shots.length;
   const n = frameCount();
-  $('#frame-count').textContent = n ? `· ${n} frames${n > 60 ? ' · many frames: Fast quality recommended' : ''}` : '';
-  $('#btn-reconstruct').disabled = n < 2;
+  // Three frames is the least that can give a depth map with a second view to check it
+  // against. Two, and often three, cannot produce a surface at all, so the button does not
+  // offer a build that is going to fail.
+  const MIN_FRAMES = 3;
+  let note = '';
+  if (n && n < MIN_FRAMES) note = ` · at least ${MIN_FRAMES} needed`;
+  else if (n && n < 8) note = ' · more shots will give a fuller model';
+  else if (n > 60) note = ' · many frames: Fast quality recommended';
+  $('#frame-count').textContent = n ? `· ${n} frames${note}` : '';
+  $('#btn-reconstruct').disabled = n < MIN_FRAMES;
   // Rough on-phone processing time per frame at each quality level
   // Rough seconds per frame on a phone, from timings on a laptop scaled for slower hardware
   const perFrame = { fast: 4, balanced: 8, high: 20 }[$('#quality').value] || 8;
   const secs = n * perFrame;
-  $('#btn-reconstruct').textContent = n >= 2 ? `Build 3D mesh (~${secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + ' min'})` : 'Build 3D mesh';
+  $('#btn-reconstruct').textContent = n >= MIN_FRAMES ? `Build 3D mesh (~${secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + ' min'})` : 'Build 3D mesh';
 }
 
 // ---------- Cameras ----------
@@ -328,7 +336,7 @@ function releaseWakeLock() {
 }
 
 async function reconstruct() {
-  if (frameCount() < 2) return;
+  if (frameCount() < 3) return;
   showScreen('process');
   holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';

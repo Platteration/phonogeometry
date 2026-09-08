@@ -54,6 +54,8 @@ Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phone
 
 ### Scanning tips
 
+- Four photographs is about the fewest that can produce any surface at all, and a good scan
+  needs many more. Fewer than that, and the app will not offer to build.
 - **Object**: circle it in small steps, roughly 10° apart, 20–40 shots. Matte, textured objects work best.
 - **Person**: they stand still; you circle them at chest height in small steps, then add a higher and a lower pass.
 - **Room**: stand near the centre, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
