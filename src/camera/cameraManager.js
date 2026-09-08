@@ -19,6 +19,10 @@ export class CameraManager extends EventTarget {
     super();
     this.cameras = []; // {deviceId, key, label, facing, lens, index, enabled}
     this.open = new Map(); // deviceId -> {stream, track, video, settings}
+    // One <video> per camera, kept across open and close. A phone that can only run one
+    // camera at a time is closed and reopened during a capture, and the preview tile holds
+    // whichever element it was given: handing it a new one each time would leave it blank.
+    this.videos = new Map(); // deviceId -> HTMLVideoElement
     this.supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   }
 
@@ -73,9 +77,13 @@ export class CameraManager extends EventTarget {
       }
     } catch { /* capabilities not supported */ }
     if (settings.facingMode) cam.facing = settings.facingMode;
-    const video = document.createElement('video');
-    video.playsInline = true; video.muted = true; video.autoplay = true;
-    video.setAttribute('playsinline', ''); video.setAttribute('muted', '');
+    let video = this.videos.get(cam.deviceId);
+    if (!video) {
+      video = document.createElement('video');
+      video.playsInline = true; video.muted = true; video.autoplay = true;
+      video.setAttribute('playsinline', ''); video.setAttribute('muted', '');
+      this.videos.set(cam.deviceId, video);
+    }
     video.srcObject = stream;
     try { await video.play(); } catch { /* autoplay policies: the frame check below still works */ }
     const ready = await waitForVideo(video);
@@ -114,6 +122,7 @@ export class CameraManager extends EventTarget {
     entry.stream.getTracks().forEach((t) => t.stop());
     entry.video.srcObject = null;
     this.open.delete(deviceId);
+    // The element itself is kept in this.videos so the tile showing it keeps working
   }
 
   closeAll() {

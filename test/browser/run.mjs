@@ -11,6 +11,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeObjectScan, writeStandingStillScan } from './fixtures.mjs';
+import { fakePhoneCameras } from './fakeCameras.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
@@ -97,6 +98,44 @@ async function main() {
       }
       const shotCount = Number(await page.textContent('#shot-count'));
       check('capture from the phone cameras', shotCount === 2 && errors.length === 0, `${shotCount} shots, ${errors.length} page errors`);
+      await page.close();
+    }
+
+    // ---- 1b. A phone with three cameras, one of which cannot stream alongside the others ----
+    for (const limit of [3, 1]) {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 }, permissions: ['camera'] });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      await page.addInitScript(fakePhoneCameras(), { limit });
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.click('#btn-start-cameras');
+      await page.waitForFunction(() => document.querySelectorAll('#camera-grid .cam-tile').length === 3, null, { timeout: 20000 });
+      const label = limit === 3 ? 'three cameras at once' : 'three cameras, only one at a time';
+
+      const tiles = await page.$$eval('#camera-grid .cam-tile', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ').trim()));
+      check(`${label}: every lens is listed and named`,
+        tiles.length === 3 && tiles.some((t) => /Back 1/.test(t)) && tiles.some((t) => /Back 2/.test(t)) && tiles.some((t) => /Front/.test(t)),
+        tiles.join(' / '));
+      check(`${label}: lens types are guessed from the labels`,
+        tiles.some((t) => /Ultra-wide/.test(t)) && tiles.some((t) => /Front \(selfie\)/.test(t)),
+        tiles.join(' / '));
+
+      await page.click('#btn-capture');
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 1, null, { timeout: 30000 });
+      await page.waitForTimeout(500);
+      const framesInShot = await page.$$eval('#thumbs .shot:first-child .thumb', (els) => els.map((e) => e.textContent.trim()));
+      check(`${label}: one press captures from all of them`, framesInShot.length === 3, `${framesInShot.length} frames: ${framesInShot.join(', ')}`);
+
+      // A second press must work as well as the first: the tiles have to survive the first one
+      await page.click('#btn-capture');
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 2, null, { timeout: 30000 });
+      await page.waitForTimeout(500);
+      const secondShot = await page.$$eval('#thumbs .shot:nth-child(2) .thumb', (els) => els.length);
+      check(`${label}: a second press captures from all of them too`, secondShot === 3, `${secondShot} frames`);
+
+      const liveTiles = await page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.videoWidth > 0 && !v.paused).length);
+      check(`${label}: the previews are still live afterwards`, liveTiles === Math.min(3, limit), `${liveTiles} live of ${Math.min(3, limit)} expected`);
+      check(`${label}: no page errors`, errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
 

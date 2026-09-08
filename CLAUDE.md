@@ -10,8 +10,11 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - `npm start` serves over HTTP on :8080 (desktop development, photo import only).
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
-- `npm run test:browser` runs the application end to end in Chromium (capture, a good scan, a
-  hopeless one, exports, reload, offline). It starts its own server and renders its own
+- `npm run test:browser` runs the application end to end in Chromium (multi-camera capture, a
+  good scan, a hopeless one, exports, reload, offline). `test/browser/fakeCameras.mjs` stands
+  in a phone with three lenses and an adjustable limit on how many can stream at once, which
+  is the only way to exercise the capture path: Chromium's own fake device provides one
+  camera. It starts its own server and renders its own
   photographs, and skips itself when Playwright is absent, so it is safe to run anywhere.
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
