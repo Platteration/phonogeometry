@@ -8,6 +8,13 @@ import { toGLB, toPLY, toOBJ, toPointCloudPLY } from './mesh/exporters.js';
 import { ShotStore } from './storage.js';
 
 const $ = (sel) => document.querySelector(sel);
+/** Build an element with a class and text. Text is set as text, never parsed as markup. */
+function el(tag, className = '', text = '') {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}
 const state = {
   preset: 'object',
   metresPerUnit: null, // set once the user tells us the real size of something they measured
@@ -29,10 +36,10 @@ const PRESET_TIPS = {
 // ---------- UI helpers ----------
 let toastTimer = null;
 function toast(msg, ms = 3000) {
-  const el = $('#toast');
-  el.textContent = msg; el.hidden = false;
+  const box = $('#toast');
+  box.textContent = msg; box.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, ms);
+  toastTimer = setTimeout(() => { box.hidden = true; }, ms);
 }
 function showScreen(name) {
   for (const s of ['capture', 'process', 'view']) $(`#screen-${s}`).hidden = s !== name;
@@ -70,7 +77,12 @@ function renderCameraTiles(results) {
       tile.insertAdjacentHTML('beforeend', `<div class="cam-error">${msg}</div>`);
       if (res && !res.ok) tile.classList.add('failed');
     }
-    tile.insertAdjacentHTML('beforeend', `<span class="cam-label">${cam.shortLabel || cam.label}</span><span class="cam-lens">${LENS_TYPES[cam.lens]?.label || cam.lens}</span>`);
+    // Labels come from the operating system, so they are set as text rather than pasted
+    // into markup
+    tile.append(
+      el('span', 'cam-label', cam.shortLabel || cam.label),
+      el('span', 'cam-lens', LENS_TYPES[cam.lens]?.label || cam.lens),
+    );
     tile.title = `${cam.label}\nTap to include/exclude`;
     tile.addEventListener('click', () => {
       cam.enabled = !cam.enabled;
@@ -129,9 +141,20 @@ function renderLensSettings() {
   for (const cam of cams.cameras) {
     const row = document.createElement('div');
     row.className = 'lens-row';
-    const opts = Object.entries(LENS_TYPES).map(([k, v]) => `<option value="${k}" ${cam.lens === k ? 'selected' : ''}>${v.label}</option>`).join('');
-    row.innerHTML = `<span title="${cam.label}">${cam.shortLabel || cam.label}<br><span class="muted">${cam.label}</span></span><select>${opts}</select><label class="muted">FOV° <input type="number" min="20" max="140" step="1" value="${Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)}"></label>`;
-    const sel = row.querySelector('select'), num = row.querySelector('input');
+    const name = el('span', '', cam.shortLabel || cam.label);
+    name.title = cam.label;
+    name.append(document.createElement('br'), el('span', 'muted', cam.label));
+    const sel = document.createElement('select');
+    for (const [k, v] of Object.entries(LENS_TYPES)) {
+      const opt = new Option(v.label, k);
+      opt.selected = cam.lens === k;
+      sel.append(opt);
+    }
+    const num = document.createElement('input');
+    Object.assign(num, { type: 'number', min: '20', max: '140', step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
+    const fov = el('label', 'muted', 'FOV° ');
+    fov.append(num);
+    row.append(name, sel, fov);
     sel.addEventListener('change', () => {
       cam.lens = sel.value; cam.hfovOverride = null; num.value = LENS_TYPES[cam.lens].hfov;
       saveLensOverride(cam.key, cam.lens, null);
@@ -238,13 +261,27 @@ function renderShots() {
   state.shots.forEach((shot, i) => {
     const row = document.createElement('div');
     row.className = 'shot';
-    row.innerHTML = `<span class="shot-index">${i + 1}</span><div class="shot-frames"></div><button class="shot-delete" title="Delete shot" aria-label="Delete shot">×</button>`;
+    const del = el('button', 'shot-delete', '×');
+    del.title = 'Delete shot'; del.setAttribute('aria-label', 'Delete shot');
+    row.append(el('span', 'shot-index', String(i + 1)), el('div', 'shot-frames'), del);
     const fr = row.querySelector('.shot-frames');
     for (const f of shot.frames) {
-      const flags = [];
-      if (f.soft) flags.push('<span class="thumb-flag warn" title="This frame is much blurrier than the others. Retaking it will help.">blurry</span>');
-      if (f.used === false) flags.push('<span class="thumb-flag bad" title="This frame could not be placed in the model.">unused</span>');
-      fr.insertAdjacentHTML('beforeend', `<div class="thumb${f.used === false ? ' unused' : ''}"><img src="${f.thumbUrl}" alt="${f.label}"><span class="thumb-label">${f.label}</span>${flags.join('')}</div>`);
+      // Labels come from file names, so nothing here is built by pasting into markup
+      const thumb = el('div', 'thumb' + (f.used === false ? ' unused' : ''));
+      const img = document.createElement('img');
+      img.src = f.thumbUrl; img.alt = f.label;
+      thumb.append(img, el('span', 'thumb-label', f.label));
+      if (f.soft) {
+        const flag = el('span', 'thumb-flag warn', 'blurry');
+        flag.title = 'This frame is much blurrier than the others. Retaking it will help.';
+        thumb.append(flag);
+      }
+      if (f.used === false) {
+        const flag = el('span', 'thumb-flag bad', 'unused');
+        flag.title = 'This frame could not be placed in the model.';
+        thumb.append(flag);
+      }
+      fr.append(thumb);
     }
     row.querySelector('.shot-delete').addEventListener('click', () => { store.deleteShot(shot.id); state.shots.splice(i, 1); renderShots(); updateCounts(); });
     box.appendChild(row);
@@ -376,8 +413,8 @@ function reportFailure(message) {
 /** Controls that need a finished surface are off while only a preview is on screen. */
 function setResultControlsEnabled(on) {
   for (const sel of ['#btn-export-glb', '#btn-export-ply', '#btn-export-obj', '#btn-export-points', '#btn-share', '#btn-measure']) {
-    const el = $(sel);
-    if (el) el.disabled = !on;
+    const button = $(sel);
+    if (button) button.disabled = !on;
   }
   if (!on) {
     state.metresPerUnit = null;
@@ -529,11 +566,16 @@ function updateStatsLine() {
 
 function updateScaleReadout() {
   const dims = modelDimensions();
-  const el = $('#measure-hint');
+  const hint = $('#measure-hint');
+  hint.textContent = '';
   if (state.metresPerUnit && dims) {
-    el.innerHTML = `<span class="scale-set">Scale set.</span> The model is ${dims.map(formatLength).join(' × ')} (width × height × depth). Downloads are now in metres. Tap two points to measure again.`;
+    hint.append(
+      el('span', 'scale-set', 'Scale set.'),
+      ` The model is ${dims.map(formatLength).join(' × ')} (width × height × depth). `
+      + 'Downloads are now in metres. Tap two points to measure again.',
+    );
   } else {
-    el.textContent = 'Tap two points on the model that span something you know the size of, such as a door or a table edge.';
+    hint.textContent = 'Tap two points on the model that span something you know the size of, such as a door or a table edge.';
   }
 }
 

@@ -227,6 +227,28 @@ async function main() {
       await page.close();
     }
 
+    // ---- 2b. Names that come from outside are shown, not executed ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      await page.goto(BASE, { waitUntil: 'load' });
+      // A photo whose file name is markup. It reaches the interface as a label.
+      const nasty = path.join(fixtures, 'x"><img src=x onerror="window.__injected=1">.png');
+      fs.copyFileSync(path.join(fixtures, 'object', 'photo-0.png'), nasty);
+      await page.setInputFiles('#file-import', [nasty]);
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 1, null, { timeout: 20000 });
+      await page.waitForTimeout(600);
+      const injected = await page.evaluate(() => window.__injected === 1);
+      const shown = await page.$eval('#thumbs .thumb-label', (e) => e.textContent);
+      const strayImages = await page.$$eval('#thumbs img', (els) => els.filter((i) => i.getAttribute('src') === 'x').length);
+      check('a file name that looks like markup is shown as text',
+        !injected && strayImages === 0 && shown.includes('<img'),
+        `injected: ${injected}, stray elements: ${strayImages}, label: ${JSON.stringify(shown)}`);
+      check('no page errors from an awkward file name', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
     // ---- 3. A scan that cannot work says so, where the user is looking ----
     {
       const page = await browser.newPage({ viewport: { width: 420, height: 860 } });

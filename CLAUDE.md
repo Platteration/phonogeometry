@@ -76,6 +76,11 @@ metres. The scale is cleared whenever a new build starts.
 
 ## Conventions
 
+- Never paste text that came from outside into markup. Camera labels come from the operating
+  system and photo labels from file names, so the interface builds those nodes with
+  `document.createElement` and `textContent` (there is an `el()` helper in `app.js`).
+  `innerHTML` is for fixed markup and computed numbers only.
+
 - Camera model: `Xc = R Xw + t`, pixel = `c + f * distort(Xc.xy / Xc.z)` with
   `distort(x) = x (1 + k1 |x|^2)`. World frame = first registered camera; results are
   flipped to y-up (`x, -y, -z`) only when building the final output.
