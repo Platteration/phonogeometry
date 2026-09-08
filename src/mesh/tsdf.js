@@ -23,7 +23,10 @@ export class TSDFVolume {
   }
 
   /**
-   * Integrate one depth map.
+   * Integrate one depth map. Every measurement counts the same: weighting by the matcher's
+   * confidence was tried and changed nothing, because the cross-view consistency check has
+   * already removed most of what confidence would have discounted, and averaging over views
+   * outvotes the rest. See the note in CLAUDE.md before trying it again.
    * @param view {depth: Float32Array, w, h, f, cx, cy, R, t, rgb?: Uint8ClampedArray (RGBA at depth resolution)}
    */
   integrate(view, opts = {}) {

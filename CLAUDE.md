@@ -57,6 +57,14 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - Frames are still scored for sharpness and flagged, because blur remains a real failure
   cause on a phone even though the pipeline now tolerates it better.
 - Balanced quality is markedly more accurate than fast on the same input, not just denser.
+- The plane sweep's confidence map really does predict errors: on a synthetic room the less
+  confident half of the accepted depths is wrong 11.7% of the time against 0.5% for the
+  confident half. Acting on it still buys nothing. The cross-view consistency check cuts that
+  11.7% to 4.7% on its own, and averaging over views outvotes what remains, so both weighting
+  fusion by confidence and rejecting low-confidence depths were measured and left surface
+  error unchanged (rejection merely cost three to six percent of the triangles). Tested down
+  to four views, where fusion has fewest votes to spare. Do not spend time here again without
+  a scenario that defeats the consistency check.
 
 ## Memory
 
