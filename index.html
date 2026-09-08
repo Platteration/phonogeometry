@@ -109,10 +109,28 @@
         <button data-mode="normals">Normals</button>
       </div>
       <div class="row gap wrap">
+        <button id="btn-measure" class="ghost small">Set scale</button>
         <label class="check"><input type="checkbox" id="chk-points" /> Sparse points</label>
         <label class="check"><input type="checkbox" id="chk-cameras" checked /> Cameras</label>
         <label class="check"><input type="checkbox" id="chk-grid" checked /> Grid</label>
         <button id="btn-fit" class="ghost small">Reset view</button>
+      </div>
+      <div id="measure" class="measure" hidden>
+        <p id="measure-hint" class="tip">Tap two points on the model that span something you know the size of, such as a door or a table edge.</p>
+        <div class="row gap wrap" id="measure-entry" hidden>
+          <label class="field-inline">Real distance
+            <input id="measure-value" type="number" min="0.001" step="0.01" inputmode="decimal" />
+          </label>
+          <select id="measure-unit">
+            <option value="1">m</option>
+            <option value="0.01">cm</option>
+            <option value="0.001">mm</option>
+            <option value="0.0254">in</option>
+            <option value="0.3048">ft</option>
+          </select>
+          <button id="btn-measure-apply" class="primary small">Set</button>
+          <button id="btn-measure-clear" class="ghost small">Clear</button>
+        </div>
       </div>
       <div id="stats" class="stats"></div>
       <div class="row gap wrap">
@@ -164,7 +182,7 @@
         <li><strong>Vary your distance.</strong> Take a few shots closer and a few further away. Phones do not tell the browser their focal lengths, and varying distance is what lets the app calibrate each lens.</li>
         <li><strong>Hold still.</strong> People should stay still while you walk around them. Avoid moving objects. Frames that come out blurry are marked with a badge: retake those shots, because one soft frame in the middle of a sequence can strand everything after it.</li>
         <li><strong>Build.</strong> Processing runs entirely on the phone. The camera path and a cloud of points appear as soon as the positions are worked out, so you can see whether the scan is going to work before the surface is finished.</li>
-        <li><strong>Export.</strong> Download GLB (opens in most 3D viewers and AR apps), PLY or OBJ. Scale is arbitrary because a single phone cannot measure absolute size.</li>
+        <li><strong>Set the scale, then export.</strong> Photographs alone cannot tell the app how big anything is. Tap <em>Set scale</em>, tap two points spanning something you know the size of, and type the real distance: the model's dimensions appear and downloads are written in metres. Then download GLB (opens in most 3D viewers and AR apps), PLY or OBJ.</li>
       </ol>
       <div class="row gap end"><button value="close" class="primary">Got it</button></div>
     </form>

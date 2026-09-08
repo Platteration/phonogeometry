@@ -67,6 +67,13 @@ the transferred pixel buffers as it goes (tests reuse their images and so must n
 Dense samples go straight into typed arrays. Forty frames at Balanced peak near 250 MB; keep
 new per-frame state small or free it explicitly.
 
+## Scale
+
+A reconstruction has no absolute scale. The viewer lets the user tap two points on the mesh
+and give the real distance between them, which sets `state.metresPerUnit`; exports multiply
+positions by it (`scaledGeometry`) so a GLB opens at its true size, glTF being defined in
+metres. The scale is cleared whenever a new build starts.
+
 ## Conventions
 
 - Camera model: `Xc = R Xw + t`, pixel = `c + f * distort(Xc.xy / Xc.z)` with

@@ -182,6 +182,43 @@ async function main() {
         check(`export ${button.replace('#btn-export-', '')}`, fs.statSync(file).size > 1000 && dl.suggestedFilename().endsWith(ext), `${fs.statSync(file).size} bytes`);
       }
 
+      // ---- Setting a real-world scale ----
+      const glbBefore = fs.statSync(path.join(shots, fs.readdirSync(shots).find((f) => f.endsWith('.glb')))).size;
+      await page.click('#btn-measure');
+      const box = await page.$eval('#viewer canvas', (el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
+      // Tap two points on the model, well above the toolbar that overlays the lower part
+      const toolbarTop = await page.$eval('.viewer-toolbar', (el) => el.getBoundingClientRect().top);
+      const usable = Math.max(box.y + 80, toolbarTop - 40);
+      const midY = (box.y + 60 + usable) / 2;
+      await page.mouse.click(box.x + box.w * 0.42, midY);
+      await page.waitForTimeout(300);
+      await page.mouse.click(box.x + box.w * 0.58, midY);
+      await page.waitForTimeout(400);
+      const entryShown = !(await page.$eval('#measure-entry', (e) => e.hidden));
+      check('two taps on the model give a measurement', entryShown, (await page.textContent('#measure-hint')).trim().slice(0, 70));
+      if (entryShown) {
+        await page.fill('#measure-value', '0.5');
+        await page.selectOption('#measure-unit', '1');
+        await page.click('#btn-measure-apply');
+        await page.waitForTimeout(400);
+        const statsText = (await page.textContent('#stats')).replace(/\s+/g, ' ');
+        const reported = (statsText.match(/([\d.]+) m × ([\d.]+) m × ([\d.]+) m/) || []).slice(1).map(Number);
+        check('the model size is reported once the scale is known', reported.length === 3, statsText.slice(-60));
+        const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#btn-export-glb')]);
+        const file = path.join(shots, 'scaled-' + dl.suggestedFilename());
+        await dl.saveAs(file);
+        const scaled = fs.readFileSync(file);
+        const json = JSON.parse(scaled.subarray(20, 20 + scaled.readUInt32LE(12)).toString());
+        const extent = json.accessors[0].max.map((v, i) => v - json.accessors[0].min[i]);
+        // glTF is defined in metres, so the exported bounds must be the size shown on screen
+        const matches = reported.length === 3 && extent.every((v, i) => Math.abs(v - reported[i]) < 0.02 * reported[i]);
+        check('the export carries the scale that was set',
+          matches && Math.abs(fs.statSync(file).size - glbBefore) < 4096,
+          `bounding box ${extent.map((v) => v.toFixed(2)).join(' × ')} m against ${reported.join(' × ')} m shown`);
+      }
+      if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'measure.png') });
+      await page.click('#btn-measure');
+
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 20000 }).catch(() => {});
       const restored = Number(await page.textContent('#shot-count'));

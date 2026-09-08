@@ -25,10 +25,11 @@ export class Viewer {
     this.grid = new THREE.GridHelper(4, 16, 0x334, 0x223);
     this.grid.material.transparent = true; this.grid.material.opacity = 0.35;
     this.scene.add(this.grid);
+    this.measureGroup = new THREE.Group();
     this.meshGroup = new THREE.Group();
     this.pointsGroup = new THREE.Group();
     this.camerasGroup = new THREE.Group();
-    this.scene.add(this.meshGroup, this.pointsGroup, this.camerasGroup);
+    this.scene.add(this.meshGroup, this.pointsGroup, this.camerasGroup, this.measureGroup);
     this.pointsGroup.visible = false;
     this.mode = 'solid';
     this._materials = {
@@ -36,7 +37,26 @@ export class Viewer {
       wire: new THREE.MeshBasicMaterial({ color: 0x9ecbff, wireframe: true }),
       shaded: new THREE.MeshStandardMaterial({ color: 0xbfc7d5, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide, flatShading: false }),
       normals: new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }),
+      marker: new THREE.MeshBasicMaterial({ color: 0xff5c8a, depthTest: false }),
+      markerLine: new THREE.LineBasicMaterial({ color: 0xff5c8a, depthTest: false }),
     };
+    // Measuring: tap two points on the surface. A tap is a press and release without a drag,
+    // so turning the model does not drop a marker.
+    this.measuring = false;
+    this.onMeasure = null;
+    this._picked = [];
+    this._raycaster = new THREE.Raycaster();
+    this._pressedAt = null;
+    const el = this.renderer.domElement;
+    el.addEventListener('pointerdown', (e) => { this._pressedAt = { x: e.clientX, y: e.clientY }; });
+    el.addEventListener('pointerup', (e) => {
+      const start = this._pressedAt;
+      this._pressedAt = null;
+      if (!this.measuring || !start) return;
+      if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 6) return; // a drag, not a tap
+      this._pick(e);
+    });
+
     this._resize = () => this.resize();
     window.addEventListener('resize', this._resize);
     this.resize();
@@ -50,6 +70,57 @@ export class Viewer {
     requestAnimationFrame(loop);
   }
 
+  _pick(event) {
+    if (!this.mesh) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this._raycaster.setFromCamera(ndc, this.camera);
+    const hit = this._raycaster.intersectObject(this.mesh, false)[0];
+    if (!hit) return;
+    if (this._picked.length >= 2) this.clearMeasurement();
+    this._picked.push(hit.point.clone());
+    this._drawMeasurement();
+    if (this.onMeasure) {
+      this.onMeasure(this._picked.length === 2
+        ? this._picked[0].distanceTo(this._picked[1])
+        : null, this._picked.length);
+    }
+  }
+
+  _drawMeasurement() {
+    while (this.measureGroup.children.length) {
+      const c = this.measureGroup.children.pop();
+      c.geometry?.dispose();
+    }
+    const radius = (this.mesh?.geometry.boundingSphere?.radius || 1) * 0.012;
+    for (const p of this._picked) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(radius, 12, 8), this._materials.marker);
+      dot.position.copy(p);
+      this.measureGroup.add(dot);
+    }
+    if (this._picked.length === 2) {
+      const g = new THREE.BufferGeometry().setFromPoints(this._picked);
+      this.measureGroup.add(new THREE.Line(g, this._materials.markerLine));
+    }
+  }
+
+  setMeasuring(on) {
+    this.measuring = on;
+    if (!on) this.clearMeasurement();
+  }
+
+  clearMeasurement() {
+    this._picked = [];
+    while (this.measureGroup.children.length) {
+      const c = this.measureGroup.children.pop();
+      c.geometry?.dispose();
+    }
+    if (this.onMeasure) this.onMeasure(null, 0);
+  }
+
   resize() {
     const w = this.container.clientWidth || 1, h = this.container.clientHeight || 1;
     this.renderer.setSize(w, h, false);
@@ -58,7 +129,8 @@ export class Viewer {
   }
 
   clear() {
-    for (const g of [this.meshGroup, this.pointsGroup, this.camerasGroup]) {
+    this._picked = [];
+    for (const g of [this.meshGroup, this.pointsGroup, this.camerasGroup, this.measureGroup]) {
       while (g.children.length) {
         const c = g.children.pop();
         if (c.geometry) c.geometry.dispose();

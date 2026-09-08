@@ -10,6 +10,7 @@ import { ShotStore } from './storage.js';
 const $ = (sel) => document.querySelector(sel);
 const state = {
   preset: 'object',
+  metresPerUnit: null, // set once the user tells us the real size of something they measured
   shots: [], // {id, frames: [{blob, thumbUrl, width, height, f, cx, cy, label, lens, key}]}
   worker: null,
   result: null,
@@ -374,9 +375,17 @@ function reportFailure(message) {
 
 /** Controls that need a finished surface are off while only a preview is on screen. */
 function setResultControlsEnabled(on) {
-  for (const sel of ['#btn-export-glb', '#btn-export-ply', '#btn-export-obj', '#btn-export-points', '#btn-share']) {
+  for (const sel of ['#btn-export-glb', '#btn-export-ply', '#btn-export-obj', '#btn-export-points', '#btn-share', '#btn-measure']) {
     const el = $(sel);
     if (el) el.disabled = !on;
+  }
+  if (!on) {
+    state.metresPerUnit = null;
+    state.measuredUnits = 0;
+    $('#measure').hidden = true;
+    $('#measure-entry').hidden = true;
+    $('#btn-measure').classList.remove('active');
+    state.viewer?.setMeasuring(false);
   }
   for (const b of $('#view-mode').querySelectorAll('button')) b.disabled = !on;
 }
@@ -409,6 +418,18 @@ async function ensureViewer() {
       try {
         const { Viewer } = await import('./viewer/viewer.js');
         state.viewer = new Viewer($('#viewer'));
+        state.viewer.onMeasure = (distance, count) => {
+          state.measuredUnits = distance || 0;
+          $('#measure-entry').hidden = !distance;
+          if (distance) {
+            const known = state.metresPerUnit ? ` — currently ${formatLength(distance * state.metresPerUnit)}` : '';
+            $('#measure-hint').textContent = `Two points picked${known}. Enter how far apart they really are.`;
+          } else if (count === 1) {
+            $('#measure-hint').textContent = 'One point picked. Tap the second.';
+          } else {
+            updateScaleReadout();
+          }
+        };
         return true;
       } catch {
         toast('3D viewer could not load. You can still download the mesh.', 6000);
@@ -442,7 +463,8 @@ async function showResult(result, seconds) {
     const unused = s.frames.filter((f) => !f.used);
     if (unused.length) setProgressLog(`Not placed in the model: ${unused.map((f) => f.label || f.id).join(', ')}`);
   }
-  $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span><span><b>${s.triangles.toLocaleString()}</b> triangles</span><span><b>${s.vertices.toLocaleString()}</b> vertices</span><span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span><span><b>${seconds.toFixed(0)}s</b></span>`;
+  state.stats = { ...s, seconds };
+  updateStatsLine();
   if (s.rig?.length) {
     setProgressLog(`Camera rig: ` + s.rig.map((r2) => `${r2.camera} tied to the reference camera from ${r2.shots} shots (${r2.spreadDeg.toFixed(1)}° spread)`).join('; '));
   }
@@ -457,6 +479,62 @@ async function showResult(result, seconds) {
 function setProgressLog(line) {
   const log = $('#progress-log');
   log.textContent += line + '\n';
+}
+
+/**
+ * A copy of the mesh scaled into metres, when the user has given a real distance. glTF is
+ * defined in metres, so a scan with a known scale opens at its true size everywhere.
+ */
+function scaledGeometry(geometry) {
+  const k = state.metresPerUnit;
+  if (!k || !Number.isFinite(k) || k <= 0) return geometry;
+  const positions = Float32Array.from(geometry.positions);
+  for (let i = 0; i < positions.length; i++) positions[i] *= k;
+  return { ...geometry, positions };
+}
+
+function formatLength(metres) {
+  if (metres >= 1) return `${metres.toFixed(2)} m`;
+  if (metres >= 0.01) return `${(metres * 100).toFixed(1)} cm`;
+  return `${(metres * 1000).toFixed(0)} mm`;
+}
+
+/** Size of the model along each axis, in metres if the scale is known. */
+function modelDimensions() {
+  const p = state.result?.mesh.positions;
+  if (!p || !p.length) return null;
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < p.length; i += 3) {
+    for (let k = 0; k < 3; k++) {
+      if (p[i + k] < min[k]) min[k] = p[i + k];
+      if (p[i + k] > max[k]) max[k] = p[i + k];
+    }
+  }
+  return [0, 1, 2].map((k) => (max[k] - min[k]) * (state.metresPerUnit || 1));
+}
+
+function updateStatsLine() {
+  const s = state.stats;
+  if (!s) return;
+  const dims = modelDimensions();
+  const size = dims
+    ? `<span>${state.metresPerUnit ? dims.map(formatLength).join(' × ') : 'scale not set'}</span>`
+    : '';
+  $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span>`
+    + `<span><b>${s.triangles.toLocaleString()}</b> triangles</span>`
+    + `<span><b>${s.vertices.toLocaleString()}</b> vertices</span>`
+    + `<span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span>`
+    + `<span><b>${s.seconds.toFixed(0)}s</b></span>` + size;
+}
+
+function updateScaleReadout() {
+  const dims = modelDimensions();
+  const el = $('#measure-hint');
+  if (state.metresPerUnit && dims) {
+    el.innerHTML = `<span class="scale-set">Scale set.</span> The model is ${dims.map(formatLength).join(' × ')} (width × height × depth). Downloads are now in metres. Tap two points to measure again.`;
+  } else {
+    el.textContent = 'Tap two points on the model that span something you know the size of, such as a door or a table edge.';
+  }
 }
 
 function download(name, data, mime) {
@@ -506,13 +584,35 @@ function init() {
   $('#chk-cameras').addEventListener('change', (e) => state.viewer?.setLayer('cameras', e.target.checked));
   $('#chk-grid').addEventListener('change', (e) => state.viewer?.setLayer('grid', e.target.checked));
   $('#btn-fit').addEventListener('click', () => state.viewer?.fit());
-  $('#btn-export-glb').addEventListener('click', () => state.result && download(exportName('glb'), toGLB(state.result.mesh), 'model/gltf-binary'));
-  $('#btn-export-ply').addEventListener('click', () => state.result && download(exportName('ply'), toPLY(state.result.mesh), 'application/octet-stream'));
-  $('#btn-export-obj').addEventListener('click', () => state.result && download(exportName('obj'), toOBJ(state.result.mesh), 'text/plain'));
-  $('#btn-export-points').addEventListener('click', () => state.result?.dense && download(exportName('points.ply'), toPointCloudPLY(state.result.dense), 'application/octet-stream'));
+  $('#btn-measure').addEventListener('click', () => {
+    const on = !$('#btn-measure').classList.contains('active');
+    $('#btn-measure').classList.toggle('active', on);
+    $('#measure').hidden = !on;
+    state.viewer?.setMeasuring(on);
+    if (on) updateScaleReadout();
+  });
+  $('#btn-measure-apply').addEventListener('click', () => {
+    const real = parseFloat($('#measure-value').value) * parseFloat($('#measure-unit').value);
+    if (!(real > 0) || !(state.measuredUnits > 0)) { toast('Tap two points first, then enter how far apart they really are.'); return; }
+    state.metresPerUnit = real / state.measuredUnits;
+    updateScaleReadout();
+    updateStatsLine();
+    toast('Scale set. Downloads are now in metres.', 4000);
+  });
+  $('#btn-measure-clear').addEventListener('click', () => {
+    state.metresPerUnit = null;
+    state.viewer?.clearMeasurement();
+    $('#measure-value').value = '';
+    updateScaleReadout();
+    updateStatsLine();
+  });
+  $('#btn-export-glb').addEventListener('click', () => state.result && download(exportName('glb'), toGLB(scaledGeometry(state.result.mesh)), 'model/gltf-binary'));
+  $('#btn-export-ply').addEventListener('click', () => state.result && download(exportName('ply'), toPLY(scaledGeometry(state.result.mesh)), 'application/octet-stream'));
+  $('#btn-export-obj').addEventListener('click', () => state.result && download(exportName('obj'), toOBJ(scaledGeometry(state.result.mesh)), 'text/plain'));
+  $('#btn-export-points').addEventListener('click', () => state.result?.dense && download(exportName('points.ply'), toPointCloudPLY(scaledGeometry(state.result.dense)), 'application/octet-stream'));
   $('#btn-share').addEventListener('click', async () => {
     if (!state.result) return;
-    const file = new File([toGLB(state.result.mesh)], exportName('glb'), { type: 'model/gltf-binary' });
+    const file = new File([toGLB(scaledGeometry(state.result.mesh))], exportName('glb'), { type: 'model/gltf-binary' });
     try { if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: 'Phonogeometry scan' }); else toast('Sharing files is not supported here'); } catch { /* cancelled */ }
   });
   $('#btn-back-capture').addEventListener('click', () => showScreen('capture'));

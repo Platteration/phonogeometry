@@ -32,7 +32,7 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 | Dense depth | Multi-view plane sweep with zero-mean normalised cross-correlation (robust to exposure differences between physical cameras), sub-plane refinement, cross-view consistency check; runs on the GPU through WebGL2 with an identical CPU fallback | `src/vision/planeSweepGPU.js`, `src/vision/planeSweep.js` |
 | Fusion | Truncated signed distance volume with per-voxel colour; object and person scans focus the volume on the point the cameras converge on | `src/mesh/tsdf.js`, `src/pipeline/reconstruct.js` |
 | Meshing | Naive surface nets, component filtering, Taubin smoothing, vertex colours | `src/mesh/surfaceNets.js`, `src/mesh/meshUtils.js` |
-| Export | GLB (glTF 2.0 binary), binary PLY, OBJ, dense point cloud PLY | `src/mesh/exporters.js` |
+| Export | GLB (glTF 2.0 binary), binary PLY, OBJ, dense point cloud PLY, in metres once a scale is set | `src/mesh/exporters.js` |
 
 The viewer uses three.js (vendored in `vendor/three`, MIT licensed).
 
@@ -112,7 +112,11 @@ in order of how often they bite:
 
 ## Limits
 
-- The scale of the model is arbitrary. A single phone cannot measure absolute size from images alone; export and scale in your 3D tool if you need real units.
+- A phone cannot measure absolute size from photographs alone, so a scan comes out at an
+  arbitrary scale. Tell it the size of one thing and the rest follows: tap **Set scale**, tap
+  two points on the model that span something you know, and type the real distance. The
+  model's dimensions then appear on screen and every download is written in metres, which is
+  what glTF expects, so a GLB opens at its true size in other tools.
 - Moving subjects, mirrors, glass, and textureless surfaces break photogrammetry, here as everywhere.
 - A camera aimed at one flat wall and nothing else is a degenerate case, not merely a hard one: every distance explains the photographs equally well. Phonogeometry places the cameras correctly and returns a flat surface at the wrong distance rather than refusing. Keep something with depth in view.
 - Feature matching, structure from motion and fusion run on the CPU in JavaScript; the dense depth stage runs on the GPU when the browser offers WebGL2 with float render targets (most phones since 2018). Resolutions and voxel counts are modest by design.
