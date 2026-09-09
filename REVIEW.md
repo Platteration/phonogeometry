@@ -2,6 +2,12 @@
 
 Two independent reviewers read every first-party file in this repository; a third then re-read each security or bug claim against the code and tried to refute it. Only claims that survived that check are listed as findings; the ones that did not are recorded at the end so they are not re-raised.
 
+## Status — what has been fixed
+
+No finding here reached a severity that warranted a code change, so this repository's source is unchanged.
+
+Repository hardening applied here as well: every GitHub Action is pinned to a commit rather than a floating tag, each workflow declares a least-privilege `permissions` block, and a Dependabot config, a licence and a security policy are in place.
+
 ## Summary
 
 Phonogeometry is a dependency-free vanilla-JS PWA (index.html, src/, sw.js, vendored three.js r160) that opens every camera a phone exposes, captures from all of them per shutter press, and runs a from-scratch photogrammetry pipeline (ORB features, Hamming matching, incremental SfM with a camera-rig model, sparse LM bundle adjustment with per-camera focal/k1, GPU/CPU plane sweep, TSDF fusion, surface nets) in a Web Worker before exporting GLB/PLY/OBJ. It is an early but unusually well-tested prototype: 17 commits over two days (Sep 6-8 2026), version 0.1.0 never tagged, no lint/typecheck/format tooling, but node:test suites with ground-truth synthetic scenes for every numeric stage plus a Playwright suite (capture, blur flagging, exports, reload persistence, offline) that never runs in CI. Headline recommendations: (1) harden CI (Node 22/24 instead of the EOL 18/20 range, SHA-pinned actions, a permissions block, Dependabot, and a Playwright job so the browser suite actually gates changes); (2) parallelise the matching stage across a worker pool and move photo decoding off the main thread, since the repo's own notes say matching dominates long scans; (3) make 'Add more shots' incremental instead of a full rebuild and persist finished results so a reload does not lose the mesh; (4) break up the 600-line runSfM closure and the 300-line reconstruct() function, name the two dozen tuned thresholds, and add the missing unit tests for exif.js, intrinsics.js, selectCandidatePairs and opticalAxesFocus; (5) fix small product inconsistencies (README says four photos minimum, code says three; index.html's initial tip contradicts PRESET_TIPS) and finish PWA/accessibility polish (manifest id/screenshots, aria-live regions, remove user-scalable=no, reduced-motion).
