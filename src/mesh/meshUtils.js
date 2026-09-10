@@ -52,8 +52,12 @@ export function smoothMesh(positions, indices, iterations = 3, lambda = 0.5, mu 
 /**
  * Remove connected components with fewer than `minFraction` of all triangles
  * (and always keep the largest component).
+ *
+ * Pass any per-vertex attributes that must survive. Omitting them silently drops colours and
+ * normals: the pipeline gets away with that today only because it calls this before colours
+ * exist and recomputes normals afterwards, so anything cleaning a finished mesh must pass them.
  */
-export function removeSmallComponents(positions, indices, minFraction = 0.02) {
+export function removeSmallComponents(positions, indices, minFraction = 0.02, attributes = {}) {
   const n = positions.length / 3;
   const parent = new Int32Array(n);
   for (let i = 0; i < n; i++) parent[i] = i;
@@ -75,7 +79,7 @@ export function removeSmallComponents(positions, indices, minFraction = 0.02) {
   for (const [r, c] of triCount) if (c >= minFraction * total || r === largest) keep.add(r);
   const kept = [];
   for (let i = 0; i < indices.length; i += 3) if (keep.has(find(indices[i]))) kept.push(indices[i], indices[i + 1], indices[i + 2]);
-  return compactMesh(positions, Uint32Array.from(kept));
+  return compactMesh(positions, Uint32Array.from(kept), attributes);
 }
 
 /** Drop unreferenced vertices and remap indices. Extra per-vertex attributes are remapped too. */

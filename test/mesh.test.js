@@ -118,3 +118,36 @@ test('exporters produce well-formed PLY, OBJ and GLB', () => {
   assert.equal(json.buffers[0].byteLength, binLen);
   assert.equal(20 + jsonLen + 8 + binLen, glb.byteLength);
 });
+
+test('removing small components keeps the attributes it was given', () => {
+  // Omitting attributes silently drops colours and normals. The pipeline gets away with it
+  // because it cleans before colours exist, but anything cleaning a finished mesh would not.
+  const n = 24;
+  const sdf = sphereGrid(n, 6);
+  for (let z = 2; z < 5; z++) for (let y = 2; y < 5; y++) for (let x = 2; x < 5; x++) sdf[(z * n + y) * n + x] = -0.5;
+  const mesh = surfaceNets(sdf, [n, n, n]);
+  const count = mesh.positions.length / 3;
+  // Colour every vertex by its own index, so a mismatch after remapping is detectable
+  const colors = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) { colors[i * 3] = i; colors[i * 3 + 1] = i + 0.5; colors[i * 3 + 2] = i + 0.25; }
+  const normals = computeNormals(mesh.positions, mesh.indices);
+
+  const cleaned = removeSmallComponents(mesh.positions, mesh.indices, 0.1, { colors, normals });
+  const kept = cleaned.positions.length / 3;
+  assert.ok(kept > 0 && kept < count, `kept ${kept} of ${count}`);
+  assert.equal(cleaned.colors.length, kept * 3, 'colours were dropped');
+  assert.equal(cleaned.normals.length, kept * 3, 'normals were dropped');
+  // Each surviving vertex must still carry its own colour, not someone else's
+  for (let i = 0; i < kept; i++) {
+    const original = cleaned.colors[i * 3];
+    assert.equal(cleaned.colors[i * 3 + 1], original + 0.5, `colour ${i} is not self-consistent`);
+    assert.equal(cleaned.colors[i * 3 + 2], original + 0.25, `colour ${i} is not self-consistent`);
+    for (let k = 0; k < 3; k++) {
+      assert.equal(cleaned.positions[i * 3 + k], mesh.positions[original * 3 + k], `vertex ${i} moved`);
+    }
+  }
+  // Called without attributes it must still behave exactly as it always has
+  const bare = removeSmallComponents(mesh.positions, mesh.indices, 0.1);
+  assert.equal(bare.positions.length, cleaned.positions.length);
+  assert.equal(bare.colors, undefined);
+});
