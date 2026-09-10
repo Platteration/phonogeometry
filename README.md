@@ -34,7 +34,7 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 | Meshing | Naive surface nets, component filtering, Taubin smoothing, vertex colours | `src/mesh/surfaceNets.js`, `src/mesh/meshUtils.js` |
 | Export | GLB (glTF 2.0 binary), binary PLY, OBJ, dense point cloud PLY, in metres once a scale is set | `src/mesh/exporters.js` |
 
-The viewer uses three.js (vendored in `vendor/three`, MIT licensed).
+The viewer uses three.js (r160, vendored in `vendor/three`, MIT licensed; version, upstream paths and checksums are recorded in [docs/vendored-three.md](docs/vendored-three.md)).
 
 ## Running it
 
@@ -47,6 +47,8 @@ npm run start:https
 There are no dependencies to install and no build step.
 
 The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, deploy the folder to any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages…).
+
+`npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP.
 
 On a desktop browser you can use **Import photos** instead of the cameras.
 
@@ -133,7 +135,7 @@ in order of how often they bite:
 ```bash
 npm test          # unit and end-to-end tests on synthetic scenes (Node >= 18)
 npm run test:browser  # the whole app in a real browser (needs Playwright; skips if absent)
-npm start         # plain HTTP on :8080 for desktop development (imports only)
+npm start         # plain HTTP on localhost:8080 for desktop development (imports only)
 npm run icons     # regenerate the PWA icons
 ```
 
@@ -145,7 +147,8 @@ sharp ones are not, reconstructs a scan and confirms every photo was used, times
 preview against the finished mesh, downloads all three exports, reloads to confirm shots
 survive, feeds it a scan that cannot work and checks the reason reaches whichever screen the
 user is on, and finally cuts the network and runs a whole scan offline. It skips itself with
-a message if Playwright is not installed.
+a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
+instead, which is what continuous integration does so the suite cannot pass by skipping.
 
 The GPU plane sweep needs a browser too. Start the dev server and open
 `test/browser/index.html`: it compares the GPU and CPU depth maps of a synthetic scene against

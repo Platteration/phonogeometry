@@ -39,6 +39,10 @@ export class Viewer {
       normals: new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }),
       marker: new THREE.MeshBasicMaterial({ color: 0xff5c8a, depthTest: false }),
       markerLine: new THREE.LineBasicMaterial({ color: 0xff5c8a, depthTest: false }),
+      // One cloud and one set of frusta are on screen at a time, so these are reused rather
+      // than allocated per result and left for the garbage collector to find.
+      points: new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true }),
+      cameraLines: new THREE.LineBasicMaterial({ color: 0xffb454 }),
     };
     // Measuring: tap two points on the surface. A tap is a press and release without a drag,
     // so turning the model does not drop a marker.
@@ -60,14 +64,27 @@ export class Viewer {
     this._resize = () => this.resize();
     window.addEventListener('resize', this._resize);
     this.resize();
-    this._running = true;
-    const loop = () => {
+    this._running = false;
+    this._loop = () => {
       if (!this._running) return;
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
-      requestAnimationFrame(loop);
+      requestAnimationFrame(this._loop);
     };
-    requestAnimationFrame(loop);
+    this.setActive(true);
+  }
+
+  /**
+   * Draw only while the viewer is the screen the user is on. Otherwise a finished scan
+   * leaves a full-rate WebGL loop running behind a hidden screen, next to several live
+   * camera streams and, during the next build, the plane sweep's own use of the GPU.
+   */
+  setActive(on) {
+    const want = !!on;
+    if (want === this._running) return;
+    this._running = want;
+    this.container.dataset.rendering = want ? 'on' : 'off';
+    if (want) requestAnimationFrame(this._loop);
   }
 
   _pick(event) {
@@ -150,7 +167,8 @@ export class Viewer {
       pg.computeBoundingBox();
       box.union(pg.boundingBox);
       const r = Math.max(1e-3, pg.boundingBox.getSize(new THREE.Vector3()).length() / 2);
-      this.pointsGroup.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: r * 0.01, vertexColors: true, sizeAttenuation: true })));
+      this._materials.points.size = r * 0.01;
+      this.pointsGroup.add(new THREE.Points(pg, this._materials.points));
       this.pointsGroup.visible = true;
     }
     this._addCameras(cameras, Math.max(1e-3, box.getSize(new THREE.Vector3()).length() / 2));
@@ -182,7 +200,7 @@ export class Viewer {
     if (!verts.length) return;
     const cg = new THREE.BufferGeometry();
     cg.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-    this.camerasGroup.add(new THREE.LineSegments(cg, new THREE.LineBasicMaterial({ color: 0xffb454 })));
+    this.camerasGroup.add(new THREE.LineSegments(cg, this._materials.cameraLines));
   }
 
   _frame(centre, radius) {
@@ -211,7 +229,8 @@ export class Viewer {
       pg.setAttribute('position', new THREE.BufferAttribute(sparse.positions, 3));
       pg.setAttribute('color', new THREE.BufferAttribute(sparse.colors, 3));
       const r = geo.boundingSphere.radius;
-      this.pointsGroup.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: r * 0.012, vertexColors: true, sizeAttenuation: true })));
+      this._materials.points.size = r * 0.012;
+      this.pointsGroup.add(new THREE.Points(pg, this._materials.points));
     }
 
     this._addCameras(cameras, geo.boundingSphere.radius);
@@ -244,9 +263,10 @@ export class Viewer {
   }
 
   dispose() {
-    this._running = false;
+    this.setActive(false);
     window.removeEventListener('resize', this._resize);
     this.clear();
+    for (const m of Object.values(this._materials)) m.dispose();
     this.renderer.dispose();
   }
 }

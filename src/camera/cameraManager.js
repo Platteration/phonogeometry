@@ -152,6 +152,9 @@ export class CameraManager extends EventTarget {
    */
   async captureAll({ maxDim = 1280, sequentialFallback = true, onStatus = () => {} } = {}) {
     const frames = [];
+    // Every camera opened during this capture asks for the same resolution, so a lens
+    // captured sequentially does not come back larger than the ones streaming live.
+    const size = { width: maxDim, height: Math.round(maxDim * 0.75) };
     await new Promise((r) => requestAnimationFrame(r));
     for (const entry of this.open.values()) {
       if (!entry.cam.enabled) continue;
@@ -165,17 +168,17 @@ export class CameraManager extends EventTarget {
         const released = Array.from(this.open.values()).map((e) => e.cam);
         let entry = null;
         try {
-          entry = await this.openCamera(cam, { width: maxDim, height: Math.round(maxDim * 0.75) });
+          entry = await this.openCamera(cam, size);
         } catch {
           this.closeAll();
-          try { entry = await this.openCamera(cam, { width: maxDim, height: Math.round(maxDim * 0.75) }); } catch (err) { onStatus(`${cam.shortLabel || cam.label} unavailable: ${err.message}`); }
+          try { entry = await this.openCamera(cam, size); } catch (err) { onStatus(`${cam.shortLabel || cam.label} unavailable: ${err.message}`); }
         }
         if (entry) {
           await new Promise((r) => setTimeout(r, 350)); // let exposure settle
           frames.push(this.grabFrame(entry, maxDim));
           this.closeCamera(cam.deviceId);
         }
-        for (const c of released) if (!this.open.has(c.deviceId)) { try { await this.openCamera(c); } catch { /* ignore */ } }
+        for (const c of released) if (!this.open.has(c.deviceId)) { try { await this.openCamera(c, size); } catch { /* ignore */ } }
       }
     }
     return frames;

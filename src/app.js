@@ -23,7 +23,17 @@ const state = {
   result: null,
   viewer: null,
   cameraTiles: new Map(),
+  // Bumped by every build and by every cancel. A build that started before the current
+  // value is stale and must stop where it is: cancelling can happen while photos are still
+  // being decoded, before there is a worker to terminate.
+  buildGen: 0,
+  // True from the moment a build starts until it finishes, fails or is cancelled. The worker
+  // is not that flag: it is created after the decode and outlives a finished build.
+  building: false,
 };
+// Three frames is the least that can give a depth map with a second view to check it
+// against. Two, and often three, cannot produce a surface at all.
+const MIN_FRAMES = 3;
 const cams = new CameraManager();
 const store = new ShotStore();
 
@@ -44,16 +54,17 @@ function toast(msg, ms = 3000) {
 function showScreen(name) {
   for (const s of ['capture', 'process', 'view']) $(`#screen-${s}`).hidden = s !== name;
   $('#capture-bar').hidden = name !== 'capture';
-  if (name === 'view' && state.viewer) state.viewer.resize();
+  if (state.viewer) {
+    if (name === 'view') state.viewer.resize();
+    // Nothing is on screen to draw otherwise, and the next reconstruction wants the GPU.
+    state.viewer.setActive(name === 'view');
+  }
 }
 function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length, 0); }
 function updateCounts() {
   $('#shot-count').textContent = state.shots.length;
   const n = frameCount();
-  // Three frames is the least that can give a depth map with a second view to check it
-  // against. Two, and often three, cannot produce a surface at all, so the button does not
-  // offer a build that is going to fail.
-  const MIN_FRAMES = 3;
+  // The button does not offer a build that is going to fail.
   let note = '';
   if (n && n < MIN_FRAMES) note = ` · at least ${MIN_FRAMES} needed`;
   else if (n && n < 8) note = ' · more shots will give a fuller model';
@@ -103,6 +114,10 @@ function renderCameraTiles(results) {
   renderLensSettings();
 }
 
+/** The capture long side chosen in Settings, used for both the streams and the grabbed frames. */
+function captureMaxDim() { return parseInt($('#capture-res').value, 10) || 1280; }
+function streamSize() { const d = captureMaxDim(); return { width: d, height: Math.round(d * 0.75) }; }
+
 async function startCameras() {
   const btn = $('#btn-start-cameras');
   btn.disabled = true;
@@ -111,7 +126,7 @@ async function startCameras() {
     await cams.discover();
     if (cams.cameras.length === 0) throw new Error('No cameras found.');
     $('#camera-status').textContent = `Found ${cams.cameras.length} camera${cams.cameras.length > 1 ? 's' : ''}. Opening all of them…`;
-    const results = await cams.openAll({ width: 1280, height: 720 });
+    const results = await cams.openAll(streamSize());
     const live = results.filter((r) => r.ok).length;
     renderCameraTiles(results);
     const seq = results.length - live;
@@ -135,10 +150,32 @@ async function reopenCameras() {
   try {
     const results = [];
     for (const cam of missing) {
-      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, { width: 1280, height: 720 }) }); }
+      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, streamSize()) }); }
       catch (err) { results.push({ cam, ok: false, error: err.message }); }
     }
     renderCameraTiles(results);
+  } finally { reopening = false; }
+}
+
+/**
+ * The resolution is a property of the stream, so changing it has to reopen whatever is
+ * already open; otherwise the setting silently applies only to cameras opened afterwards.
+ */
+async function applyCaptureResolution() {
+  const reopen = cams.cameras.filter((c) => cams.open.has(c.deviceId));
+  if (!reopen.length || reopening) return;
+  reopening = true;
+  try {
+    $('#camera-status').textContent = `Reopening the cameras at ${captureMaxDim()} px…`;
+    for (const cam of reopen) cams.closeCamera(cam.deviceId);
+    const results = [];
+    for (const cam of reopen) {
+      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, streamSize()) }); }
+      catch (err) { results.push({ cam, ok: false, error: err.message }); }
+    }
+    renderCameraTiles(results);
+    const live = results.filter((r) => r.ok).length;
+    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live at up to ${captureMaxDim()} px.`;
   } finally { reopening = false; }
 }
 
@@ -201,13 +238,33 @@ function canvasToBlob(canvas, q = 0.92) {
   return new Promise((resolve) => canvas.toBlob((b) => resolve(b), 'image/jpeg', q));
 }
 
+let storageWarned = false;
+let askedToPersist = false;
+/**
+ * Save a shot for restore after a reload. The write can fail (a phone with no room left),
+ * and a scan the user believes is safe but is not would be lost by the very reload this
+ * exists to survive, so say so — once, not once per shot.
+ */
+function persistShot(shot) {
+  if (!askedToPersist && navigator.storage?.persist) {
+    askedToPersist = true;
+    // Ask the browser not to evict these photographs while a scan is in progress.
+    navigator.storage.persisted?.().then((already) => already || navigator.storage.persist()).catch(() => {});
+  }
+  store.saveShot(shot).then((saved) => {
+    if (saved || storageWarned) return;
+    storageWarned = true;
+    toast('This shot could not be saved for restore: storage is full. The scan is still in memory, but a reload would lose it.', 6000);
+  });
+}
+
 async function captureShot() {
   const btn = $('#btn-capture');
   if (btn.disabled) return;
   btn.disabled = true; btn.classList.add('busy');
   const flash = $('#flash'); flash.hidden = false; setTimeout(() => { flash.hidden = true; }, 260);
   try {
-    const maxDim = parseInt($('#capture-res').value, 10);
+    const maxDim = captureMaxDim();
     const grabbed = await cams.captureAll({ maxDim, sequentialFallback: $('#chk-sequential').checked, onStatus: (m) => { $('#camera-status').textContent = m; } });
     if (!grabbed.length) { toast('No camera frames captured'); return; }
     const frames = [];
@@ -217,7 +274,7 @@ async function captureShot() {
     }
     const shot = { id: `shot-${Date.now()}`, createdAt: Date.now(), frames };
     state.shots.push(shot);
-    store.saveShot(shot);
+    persistShot(shot);
     flagSoftFrames();
     renderShots(); updateCounts();
     const blurry = frames.filter((f) => f.soft).length;
@@ -237,7 +294,7 @@ async function importFiles(files) {
   for (const file of files) {
     try {
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => createImageBitmap(file));
-      const maxDim = Math.max(parseInt($('#capture-res').value, 10), 1280);
+      const maxDim = Math.max(captureMaxDim(), 1280);
       const s = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(bmp.width * s); canvas.height = Math.round(bmp.height * s);
@@ -255,7 +312,7 @@ async function importFiles(files) {
   for (const fr of frames) {
     const shot = { id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, createdAt: Date.now(), frames: [fr] };
     state.shots.push(shot);
-    store.saveShot(shot);
+    persistShot(shot);
   }
   flagSoftFrames();
   renderShots(); updateCounts();
@@ -308,7 +365,7 @@ async function restoreShots() {
   if (!saved.length) return;
   state.shots = saved.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
   renderShots(); updateCounts();
-  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session`, 4000);
+  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session. The photos stay on this device until you press Clear.`, 5000);
 }
 
 // ---------- Reconstruction ----------
@@ -328,7 +385,15 @@ async function decodeForWorker(frame, targetWidth, id, shotIndex) {
 
 let wakeLock = null;
 async function holdWakeLock() {
-  try { if (navigator.wakeLock && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch { /* not allowed or unsupported */ }
+  try {
+    if (navigator.wakeLock && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      // The platform drops a screen lock whenever the document is hidden (an app switch, a
+      // notification shade). Forget the sentinel when that happens, or the guard above turns
+      // every later request into a no-op and a long build is left free to lock the screen.
+      wakeLock.addEventListener?.('release', () => { wakeLock = null; });
+    }
+  } catch { /* not allowed or unsupported */ }
 }
 function releaseWakeLock() {
   try { wakeLock?.release(); } catch { /* ignore */ }
@@ -336,7 +401,9 @@ function releaseWakeLock() {
 }
 
 async function reconstruct() {
-  if (frameCount() < 3) return;
+  if (frameCount() < MIN_FRAMES) return;
+  const gen = ++state.buildGen;
+  state.building = true;
   showScreen('process');
   holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';
@@ -368,10 +435,31 @@ async function reconstruct() {
   setProgress('features', 0, 'Decoding photos…');
   const images = [];
   let k = 0;
+  let unreadable = 0;
   for (let s = 0; s < state.shots.length; s++) {
     for (const fr of state.shots[s].frames) {
-      images.push(await decodeForWorker(fr, targetWidth, `img-${k++}`, s));
+      // Cancel is pressed here more often than anywhere else: decoding thirty frames on the
+      // main thread takes seconds, and there is no worker to terminate yet.
+      if (gen !== state.buildGen) return;
+      try {
+        images.push(await decodeForWorker(fr, targetWidth, `img-${k}`, s));
+      } catch {
+        // A photo the browser cannot decode (a null blob from a canvas under memory
+        // pressure, a record that no longer reads) costs that frame, not the whole scan.
+        unreadable++;
+      }
+      k++;
     }
+  }
+  if (gen !== state.buildGen) return;
+  if (unreadable) {
+    const msg = `${unreadable} photo${unreadable === 1 ? '' : 's'} could not be read and ${unreadable === 1 ? 'was' : 'were'} left out.`;
+    setProgress('log', 0, msg);
+    toast(msg, 5000);
+  }
+  if (images.length < MIN_FRAMES) {
+    reportFailure(`Only ${images.length} of the photos could be read, and at least ${MIN_FRAMES} are needed. Try capturing again.`);
+    return;
   }
   if (state.worker) state.worker.terminate();
   const worker = new Worker(new URL('./pipeline/worker.js', import.meta.url), { type: 'module' });
@@ -383,6 +471,7 @@ async function reconstruct() {
     else if (m.type === 'preview') await showPreview(m);
     else if (m.type === 'error') { reportFailure(m.message); } else if (m.type === 'done') {
       if (state.failed) return;
+      state.building = false;
       releaseWakeLock();
       $('#building').hidden = true;
       state.result = m.result;
@@ -399,6 +488,7 @@ async function reconstruct() {
  */
 function reportFailure(message) {
   state.failed = true;
+  state.building = false;
   releaseWakeLock();
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   setProgressLog('ERROR: ' + message);
@@ -613,6 +703,9 @@ function init() {
   $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
   const stopBuild = () => {
+    // Stops a build that has not created its worker yet, as well as one that has
+    state.buildGen++;
+    state.building = false;
     if (state.worker) { state.worker.terminate(); state.worker = null; }
     releaseWakeLock();
     $('#building').hidden = true;
@@ -671,7 +764,20 @@ function init() {
   window.addEventListener('pagehide', () => cams.closeAll());
   // Phones stop camera streams when the tab is hidden; reopen them when it comes back.
   cams.addEventListener('ended', () => { if (document.visibilityState === 'visible') reopenCameras(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reopenCameras(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    reopenCameras();
+    // Re-take the lock the platform released when the tab was hidden, but only while a
+    // build is actually running.
+    if (state.building) holdWakeLock();
+  });
+  $('#capture-res').addEventListener('change', applyCaptureResolution);
+  // Nothing should be able to leave the user on a progress screen that never moves, with the
+  // wake lock held, because a promise rejected somewhere nobody was catching.
+  window.addEventListener('unhandledrejection', (e) => {
+    if (!state.building) return;
+    reportFailure(e.reason?.message || String(e.reason || 'The reconstruction stopped unexpectedly'));
+  });
   updateCounts();
   restoreShots();
 

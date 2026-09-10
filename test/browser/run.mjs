@@ -4,7 +4,9 @@
 // not part of `npm test`; run them with `npm run test:browser`.
 //
 // Playwright and a Chromium build must be available. Point at them with PLAYWRIGHT_MODULE
-// and CHROMIUM_PATH if they are not where this script looks by default.
+// and CHROMIUM_PATH if they are not where this script looks by default. Without them the
+// suite skips itself, which is what makes it safe to run anywhere — set REQUIRE_BROWSER=1
+// (as CI does) to make a missing browser a failure instead of a silent pass.
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -18,15 +20,13 @@ const root = path.resolve(here, '../..');
 const PORT = Number(process.env.PORT || 8099);
 const BASE = `http://localhost:${PORT}/`;
 
-const CHROMIUM_CANDIDATES = [
-  process.env.CHROMIUM_PATH,
-  '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
-  '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome',
-].filter(Boolean);
+// Where a globally installed Playwright lives for the node running this script, rather than
+// a path from one particular machine: `<prefix>/lib/node_modules/...` next to the binary.
+const globalModules = path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules');
 const PLAYWRIGHT_CANDIDATES = [
   process.env.PLAYWRIGHT_MODULE,
   'playwright',
-  '/opt/node22/lib/node_modules/playwright/index.mjs',
+  path.join(globalModules, 'playwright', 'index.mjs'),
   '/usr/local/lib/node_modules/playwright/index.mjs',
 ].filter(Boolean);
 
@@ -35,6 +35,13 @@ async function loadPlaywright() {
     try { return (await import(spec)).chromium; } catch { /* try the next */ }
   }
   return null;
+}
+
+/** Playwright's own browser first, then whatever the system has; null means "let it decide". */
+function findChromium(chromium) {
+  const own = (() => { try { return chromium.executablePath(); } catch { return null; } })();
+  const candidates = [process.env.CHROMIUM_PATH, own, '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].filter(Boolean);
+  return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || null;
 }
 
 const results = [];
@@ -55,13 +62,14 @@ async function waitForResult(page, timeout = 300000) {
 }
 
 async function main() {
+  const required = process.env.REQUIRE_BROWSER === '1' || process.argv.includes('--require');
   const chromium = await loadPlaywright();
   if (!chromium) {
     console.log('Playwright is not installed, so the browser tests were skipped.');
     console.log('Install it with `npm i -D playwright && npx playwright install chromium`, or set PLAYWRIGHT_MODULE.');
-    return 0;
+    return required ? 1 : 0;
   }
-  const executablePath = CHROMIUM_CANDIDATES.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+  const executablePath = findChromium(chromium);
 
   const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'phonogeometry-'));
   const shots = path.join(fixtures, 'shots');
@@ -219,6 +227,17 @@ async function main() {
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'measure.png') });
       await page.click('#btn-measure');
 
+      // The three.js loop must draw while the viewer is the screen you are on and stop when
+      // it is not: otherwise it runs behind a hidden screen, next to the live camera
+      // previews and the next build's use of the GPU.
+      const drawingOnView = await page.$eval('#viewer', (e) => e.dataset.rendering);
+      await page.click('#btn-back-capture');
+      await page.waitForTimeout(300);
+      const drawingAway = await page.$eval('#viewer', (e) => e.dataset.rendering);
+      check('the viewer stops drawing once you leave it',
+        drawingOnView === 'on' && drawingAway === 'off',
+        `on the viewer: ${drawingOnView}, after leaving: ${drawingAway}`);
+
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 20000 }).catch(() => {});
       const restored = Number(await page.textContent('#shot-count'));
@@ -246,6 +265,69 @@ async function main() {
         !injected && strayImages === 0 && shown.includes('<img'),
         `injected: ${injected}, stray elements: ${strayImages}, label: ${JSON.stringify(shown)}`);
       check('no page errors from an awkward file name', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2c. Cancel during the decode, and a photo that cannot be decoded at all ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Decoding thirty frames on a phone takes seconds. Here it is slowed on purpose so the
+      // Cancel press lands inside that window, which is where there is no worker to terminate.
+      await page.addInitScript(() => {
+        const real = window.createImageBitmap.bind(window);
+        window.createImageBitmap = async (...args) => { await new Promise((r) => setTimeout(r, 400)); return real(...args); };
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      const dir = path.join(fixtures, 'object');
+      await page.setInputFiles('#file-import', fs.readdirSync(dir).sort().map((f) => path.join(dir, f)));
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 60000 });
+      await page.selectOption('#quality', 'fast');
+      await page.click('#btn-reconstruct');
+      await page.waitForTimeout(500);   // still decoding
+      await page.click('#btn-cancel');
+      // A build that ignored the cancel would move past the first stage and then pull the
+      // user onto the viewer when its preview arrives.
+      const carriedOn = await page.waitForFunction(() => !document.querySelector('#screen-view').hidden
+        || /Matching|Solving|Computing|Fusing|Extracting|Done/.test(document.querySelector('#progress-stage').textContent),
+      null, { timeout: 12000 }).then(() => true).catch(() => false);
+      const onCapture = await page.$eval('#screen-capture', (e) => !e.hidden);
+      check('cancelling while the photos are decoding stops the build', !carriedOn && onCapture,
+        `carried on: ${carriedOn}, on the capture screen: ${onCapture}`);
+
+      // A stored photo whose blob cannot be decoded (a canvas that returned null under
+      // memory pressure, a record that no longer reads) must cost that frame, not the scan.
+      await page.evaluate(async () => {
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('phonogeometry', 1);
+          r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+        });
+        await new Promise((res, rej) => {
+          const t = db.transaction('shots', 'readwrite');
+          t.objectStore('shots').put({
+            id: 'shot-unreadable',
+            createdAt: Date.now() + 60000,
+            frames: [{
+              blob: new Blob(['this is not a photograph'], { type: 'image/jpeg' }),
+              thumbUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==',
+              width: 320, height: 240, f: 300, cx: 159.5, cy: 119.5,
+              label: 'unreadable', lens: 'unknown', key: 'import', sharpness: 5,
+            }],
+          });
+          t.oncomplete = res; t.onerror = () => rej(t.error);
+        });
+      });
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 9, null, { timeout: 30000 });
+      await page.selectOption('#quality', 'fast');
+      await page.click('#btn-reconstruct');
+      const outcome = await waitForResult(page, 200000);
+      const log = await page.textContent('#progress-log');
+      check('a photo that cannot be decoded is left out, not left hanging',
+        outcome === 'finished' && /could not be read/.test(log),
+        `${outcome}; log ${/could not be read/.test(log) ? 'says so' : 'is silent'}`);
+      check('no page errors around a cancelled or undecodable build', errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
 

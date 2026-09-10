@@ -15,7 +15,10 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
   camera. It starts its own server and renders its own
-  photographs, and skips itself when Playwright is absent, so it is safe to run anywhere.
+  photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
+  `REQUIRE_BROWSER=1` turns that skip into a failure, which is how CI runs it (the workflow
+  installs a pinned Playwright with `npm install --no-save`, so the repository keeps no
+  dependencies).
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
   a secure context: a self-signed certificate blocks service worker registration outright, so
@@ -96,4 +99,9 @@ metres. The scale is cleared whenever a new build starts.
 - Every pipeline change should keep `npm test` green; add a synthetic-scene test when
   adding a stage. Keep the CPU and GPU plane sweeps behaviourally identical.
 - Do not add build tooling or npm dependencies without a strong reason: the app is meant to
-  be deployable by copying the folder to any static HTTPS host.
+  be deployable by copying the folder to any static HTTPS host. three.js is vendored; its
+  version and checksums live in `docs/vendored-three.md`, and `test/vendor.test.js` fails when
+  the files and the note disagree.
+- The dev server (`server.js`) serves only non-hidden files inside the project directory and
+  binds loopback unless `--https` or an explicit `--host=` asks otherwise. Anything that can
+  reach the port can drive it, so its request handling is covered by `test/server.test.js`.

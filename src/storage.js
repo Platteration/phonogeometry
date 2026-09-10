@@ -31,11 +31,17 @@ function tx(db, mode, fn) {
 export class ShotStore {
   constructor() { this.dbPromise = openDb().catch(() => null); }
 
+  /** Resolves true when the shot is safely stored, false when it is not: the caller says so. */
   async saveShot(shot) {
     const db = await this.dbPromise;
-    if (!db) return;
+    if (!db) return false;
     const record = { id: shot.id, createdAt: shot.createdAt || Date.now(), frames: shot.frames.map((f) => ({ ...f, thumbUrl: f.thumbUrl })) };
-    try { await tx(db, 'readwrite', (s) => s.put(record)); } catch { /* quota or serialisation failure: keep in memory */ }
+    try {
+      await tx(db, 'readwrite', (s) => s.put(record));
+      return true;
+    } catch {
+      return false; // quota or serialisation failure: the shot stays in memory only
+    }
   }
 
   async deleteShot(id) {
