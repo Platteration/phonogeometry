@@ -61,6 +61,11 @@ function showScreen(name) {
   }
 }
 function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length, 0); }
+/** The only place `state.building` moves, so the Build button always agrees with it. */
+function markBuilding(on) {
+  state.building = on;
+  updateCounts();
+}
 function updateCounts() {
   $('#shot-count').textContent = state.shots.length;
   const n = frameCount();
@@ -70,7 +75,9 @@ function updateCounts() {
   else if (n && n < 8) note = ' · more shots will give a fuller model';
   else if (n > 60) note = ' · many frames: Fast quality recommended';
   $('#frame-count').textContent = n ? `· ${n} frames${note}` : '';
-  $('#btn-reconstruct').disabled = n < MIN_FRAMES;
+  // A build already running is the other reason not to offer one: a second press would start
+  // a second decode loop while the first build's worker is still live and talking to the UI.
+  $('#btn-reconstruct').disabled = state.building || n < MIN_FRAMES;
   // Rough on-phone processing time per frame at each quality level
   // Rough seconds per frame on a phone, from timings on a laptop scaled for slower hardware
   const perFrame = { fast: 4, balanced: 8, high: 20 }[$('#quality').value] || 8;
@@ -173,9 +180,18 @@ async function applyCaptureResolution() {
       try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, streamSize()) }); }
       catch (err) { results.push({ cam, ok: false, error: err.message }); }
     }
+    // The cameras this phone refused to stream alongside the others were never in `open`, so
+    // they are not among the reopened ones either. Carry them through as failures: a tile with
+    // no result of its own falls back to a bare "Not open", losing the reason it is dark and
+    // the promise that it will still be captured.
+    for (const cam of cams.cameras) {
+      if (cam.enabled && !results.some((r) => r.cam === cam)) results.push({ cam, ok: false, error: 'Cannot stream alongside the others' });
+    }
     renderCameraTiles(results);
     const live = results.filter((r) => r.ok).length;
-    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live at up to ${captureMaxDim()} px.`;
+    const seq = results.length - live;
+    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live at up to ${captureMaxDim()} px`
+      + (seq ? `, ${seq} will be captured sequentially (the phone limits concurrent streams).` : '.');
   } finally { reopening = false; }
 }
 
@@ -243,7 +259,9 @@ let askedToPersist = false;
 /**
  * Save a shot for restore after a reload. The write can fail (a phone with no room left),
  * and a scan the user believes is safe but is not would be lost by the very reload this
- * exists to survive, so say so — once, not once per shot.
+ * exists to survive, so say so — once, not once per shot. A browser that has no database at
+ * all is a different problem with different advice, so it gets a different sentence: telling
+ * someone in private browsing to free up space sends them after the wrong thing.
  */
 function persistShot(shot) {
   if (!askedToPersist && navigator.storage?.persist) {
@@ -251,10 +269,12 @@ function persistShot(shot) {
     // Ask the browser not to evict these photographs while a scan is in progress.
     navigator.storage.persisted?.().then((already) => already || navigator.storage.persist()).catch(() => {});
   }
-  store.saveShot(shot).then((saved) => {
-    if (saved || storageWarned) return;
+  store.saveShot(shot).then((outcome) => {
+    if (outcome === 'saved' || storageWarned) return;
     storageWarned = true;
-    toast('This shot could not be saved for restore: storage is full. The scan is still in memory, but a reload would lose it.', 6000);
+    toast(outcome === 'unavailable'
+      ? 'This browser is not storing data for this site, so the shots are only in memory: a reload would lose them.'
+      : 'This shot could not be saved for restore: storage is full. The scan is still in memory, but a reload would lose it.', 6000);
   });
 }
 
@@ -402,8 +422,13 @@ function releaseWakeLock() {
 
 async function reconstruct() {
   if (frameCount() < MIN_FRAMES) return;
+  // The preview puts the user back on the viewer screen with "Add more shots" in reach, so
+  // Build can be pressed again while this one is still going. Two overlapping builds fight
+  // over the same screen, and the older one's worker outlives the terminate below only
+  // because it happens after a decode loop that takes seconds.
+  if (state.building) return;
   const gen = ++state.buildGen;
-  state.building = true;
+  markBuilding(true);
   showScreen('process');
   holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';
@@ -465,20 +490,27 @@ async function reconstruct() {
   const worker = new Worker(new URL('./pipeline/worker.js', import.meta.url), { type: 'module' });
   state.worker = worker;
   const t0 = performance.now();
+  // The same token that stops the decode loop: a worker from a build that has been cancelled
+  // or superseded keeps delivering queued messages, and each one would drive the screen,
+  // clear the building flag and drop the wake lock out from under the build that replaced it.
   worker.onmessage = async (ev) => {
+    if (gen !== state.buildGen) return;
     const m = ev.data;
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
     else if (m.type === 'preview') await showPreview(m);
     else if (m.type === 'error') { reportFailure(m.message); } else if (m.type === 'done') {
       if (state.failed) return;
-      state.building = false;
+      markBuilding(false);
       releaseWakeLock();
       $('#building').hidden = true;
       state.result = m.result;
       await showResult(m.result, (performance.now() - t0) / 1000);
     }
   };
-  worker.onerror = (e) => reportFailure(e.message || 'The reconstruction stopped unexpectedly');
+  worker.onerror = (e) => {
+    if (gen !== state.buildGen) return;
+    reportFailure(e.message || 'The reconstruction stopped unexpectedly');
+  };
   worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked, useRig: $('#chk-rig').checked } }, images.map((im) => im.rgba.buffer));
 }
 
@@ -488,7 +520,7 @@ async function reconstruct() {
  */
 function reportFailure(message) {
   state.failed = true;
-  state.building = false;
+  markBuilding(false);
   releaseWakeLock();
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   setProgressLog('ERROR: ' + message);
@@ -705,7 +737,7 @@ function init() {
   const stopBuild = () => {
     // Stops a build that has not created its worker yet, as well as one that has
     state.buildGen++;
-    state.building = false;
+    markBuilding(false);
     if (state.worker) { state.worker.terminate(); state.worker = null; }
     releaseWakeLock();
     $('#building').hidden = true;

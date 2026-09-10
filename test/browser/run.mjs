@@ -143,6 +143,25 @@ async function main() {
 
       const liveTiles = await page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.videoWidth > 0 && !v.paused).length);
       check(`${label}: the previews are still live afterwards`, liveTiles === Math.min(3, limit), `${liveTiles} live of ${Math.min(3, limit)} expected`);
+
+      if (limit === 1) {
+        // Changing the capture resolution reopens the streams. Only the cameras that were
+        // open can be reopened, so the ones this phone will not run alongside the others are
+        // not part of that — and their tiles must keep saying why they are dark and that they
+        // will still be captured, rather than falling back to a bare "Not open".
+        await page.click('#btn-settings');
+        await page.selectOption('#capture-res', '960');
+        await page.waitForFunction(() => /streaming live at up to 960 px/.test(document.querySelector('#camera-status').textContent), null, { timeout: 30000 });
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(300);
+        const explained = await page.$$eval('#camera-grid .cam-tile', (els) => els.filter((e) => /Will capture sequentially/.test(e.textContent)).length);
+        const flagged = await page.$$eval('#camera-grid .cam-tile.failed', (els) => els.length);
+        const status = (await page.textContent('#camera-status')).replace(/\s+/g, ' ').trim();
+        check(`${label}: changing the capture resolution keeps them explained`,
+          explained === 2 && flagged === 2 && /2 will be captured sequentially/.test(status),
+          `${explained} tiles explained, ${flagged} flagged; status: ${status}`);
+      }
+
       check(`${label}: no page errors`, errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
@@ -153,6 +172,20 @@ async function main() {
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       page.on('dialog', (d) => d.accept());
+      // Count the draw calls the page issues, so the viewer's loop can be watched from
+      // outside it: whether it is still drawing is the behaviour, not what it says about
+      // itself. Counting animation frames instead would count this script's own rAF polling.
+      await page.addInitScript(() => {
+        window.__draws = 0;
+        for (const proto of [window.WebGLRenderingContext?.prototype, window.WebGL2RenderingContext?.prototype]) {
+          if (!proto) continue;
+          for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+            const real = proto[name];
+            if (!real) continue;
+            proto[name] = function (...args) { window.__draws++; return real.apply(this, args); };
+          }
+        }
+      });
       await page.goto(BASE, { waitUntil: 'load' });
       const blurredDir = path.join(fixtures, 'blurred');
       await page.setInputFiles('#file-import', fs.readdirSync(blurredDir).sort().map((f) => path.join(blurredDir, f)));
@@ -229,14 +262,22 @@ async function main() {
 
       // The three.js loop must draw while the viewer is the screen you are on and stop when
       // it is not: otherwise it runs behind a hidden screen, next to the live camera
-      // previews and the next build's use of the GPU.
-      const drawingOnView = await page.$eval('#viewer', (e) => e.dataset.rendering);
+      // previews and the next build's use of the GPU. Counted from the frames the loop
+      // actually draws, not from anything the viewer says about itself: a loop that kept
+      // running while claiming to have stopped is exactly the regression this is for.
+      const drawsAtStart = await page.evaluate(() => window.__draws);
+      await page.waitForTimeout(600);
+      const drawsOnView = await page.evaluate(() => window.__draws);
       await page.click('#btn-back-capture');
-      await page.waitForTimeout(300);
-      const drawingAway = await page.$eval('#viewer', (e) => e.dataset.rendering);
+      await page.waitForTimeout(400);           // let a frame already scheduled land
+      const drawsAfterLeaving = await page.evaluate(() => window.__draws);
+      await page.waitForTimeout(600);
+      const drawsLater = await page.evaluate(() => window.__draws);
+      const drewOnView = drawsOnView - drawsAtStart;
+      const drewAway = drawsLater - drawsAfterLeaving;
       check('the viewer stops drawing once you leave it',
-        drawingOnView === 'on' && drawingAway === 'off',
-        `on the viewer: ${drawingOnView}, after leaving: ${drawingAway}`);
+        drewOnView > 0 && drewAway === 0,
+        `${drewOnView} draw calls in 0.6s on the viewer, ${drewAway} in 0.6s after leaving`);
 
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 20000 }).catch(() => {});
@@ -328,6 +369,81 @@ async function main() {
         outcome === 'finished' && /could not be read/.test(log),
         `${outcome}; log ${/could not be read/.test(log) ? 'says so' : 'is silent'}`);
       check('no page errors around a cancelled or undecodable build', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2d. A build that has been superseded must not drive the screen ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Keep every worker the page creates. A worker whose build has been cancelled or
+      // replaced is not stopped the instant that happens — the replacement only terminates it
+      // after decoding the photos, which takes seconds — so its queued messages arrive while
+      // the newer build owns the screen. Holding a reference lets one speak on cue.
+      await page.addInitScript(() => {
+        const Real = window.Worker;
+        window.__workers = [];
+        window.Worker = class extends Real {
+          constructor(...args) { super(...args); window.__workers.push(this); }
+        };
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      const dir = path.join(fixtures, 'object');
+      await page.setInputFiles('#file-import', fs.readdirSync(dir).sort().map((f) => path.join(dir, f)));
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 30000 });
+      await page.selectOption('#quality', 'fast');
+
+      await page.click('#btn-reconstruct');
+      const buildOfferedAgain = await page.$eval('#btn-reconstruct', (e) => !e.disabled);
+      check('the Build button does not offer a second build while one is running', !buildOfferedAgain,
+        buildOfferedAgain ? 'still enabled during a build' : 'disabled during a build');
+      await page.waitForFunction(() => window.__workers.length === 1, null, { timeout: 90000 });
+      await page.click('#btn-cancel');
+
+      // A second build, with the first build's worker still holding the handlers it was given.
+      await page.click('#btn-reconstruct');
+      await page.waitForFunction(() => window.__workers.length === 2, null, { timeout: 90000 });
+      await page.evaluate(() => {
+        const stale = window.__workers[0];
+        stale.onmessage({ data: { type: 'progress', stage: 'log', message: 'STALE-WORKER-SPOKE' } });
+        stale.onmessage({ data: { type: 'progress', stage: 'mesh', fraction: 1, message: 'STALE-WORKER-SPOKE' } });
+        stale.onerror({ message: 'the build that was cancelled fell over' });
+      });
+      const outcome = await waitForResult(page, 200000);
+      await page.waitForTimeout(300);
+      const log = await page.textContent('#progress-log');
+      const stats = (await page.textContent('#stats') || '').replace(/\s+/g, ' ').trim();
+      const failureShown = await page.evaluate(() => /failed/i.test(document.querySelector('#progress-stage').textContent)
+        || /Could not/.test(document.querySelector('#building-stage').textContent));
+      const building = await page.evaluate(() => !document.querySelector('#building').hidden);
+      check('a superseded build cannot report, fail or finish over the one that replaced it',
+        outcome === 'finished' && !/STALE-WORKER-SPOKE/.test(log) && !failureShown && !building && /^8\/8/.test(stats),
+        `${outcome}; the stale worker ${/STALE-WORKER-SPOKE/.test(log) ? 'reached the log' : 'was ignored'}, failure shown: ${failureShown}, stats: ${stats.slice(0, 40)}`);
+      check('no page errors around a superseded build', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2e. A browser that stores nothing is told what is actually wrong ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Private browsing, or site data blocked by policy: there is no database to write to.
+      // That is not a full disk, and telling someone to free up space sends them nowhere.
+      await page.addInitScript(() => {
+        Object.defineProperty(window, 'indexedDB', { configurable: true, get: () => undefined });
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.setInputFiles('#file-import', [path.join(fixtures, 'object', 'photo-0.png')]);
+      const warned = await page.waitForFunction(() => {
+        const t = document.querySelector('#toast');
+        return t && !t.hidden && /reload would lose/.test(t.textContent) ? t.textContent : null;
+      }, null, { timeout: 20000 }).then((h) => h.jsonValue()).catch(() => '');
+      const message = String(warned).replace(/\s+/g, ' ').trim();
+      check('a browser that stores nothing is not told its storage is full',
+        /not storing data/.test(message) && !/storage is full/.test(message), message || 'nothing was said');
+      check('no page errors when nothing can be stored', errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
 

@@ -83,7 +83,6 @@ export class Viewer {
     const want = !!on;
     if (want === this._running) return;
     this._running = want;
-    this.container.dataset.rendering = want ? 'on' : 'off';
     if (want) requestAnimationFrame(this._loop);
   }
 

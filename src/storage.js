@@ -31,16 +31,21 @@ function tx(db, mode, fn) {
 export class ShotStore {
   constructor() { this.dbPromise = openDb().catch(() => null); }
 
-  /** Resolves true when the shot is safely stored, false when it is not: the caller says so. */
+  /**
+   * Resolves 'saved', or why it was not: 'unavailable' when this browser has no database to
+   * write to at all (private browsing, site data blocked by policy), 'failed' when there is
+   * one and the write itself was refused (no room left). The caller tells the user, and the
+   * two need different advice: freeing space does nothing for the first.
+   */
   async saveShot(shot) {
     const db = await this.dbPromise;
-    if (!db) return false;
+    if (!db) return 'unavailable';
     const record = { id: shot.id, createdAt: shot.createdAt || Date.now(), frames: shot.frames.map((f) => ({ ...f, thumbUrl: f.thumbUrl })) };
     try {
       await tx(db, 'readwrite', (s) => s.put(record));
-      return true;
+      return 'saved';
     } catch {
-      return false; // quota or serialisation failure: the shot stays in memory only
+      return 'failed'; // quota or serialisation failure: the shot stays in memory only
     }
   }
 
