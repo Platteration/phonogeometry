@@ -4,9 +4,19 @@ Two independent reviewers read every first-party file in this repository; a thir
 
 ## Status — what has been fixed
 
-No finding here reached a severity that warranted a code change, so this repository's source is unchanged.
+All of the following are fixed on `claude/repo-review-security-baiyud`, each with a regression test that was checked by reverting the fix.
+
+**Second pass** — the remaining medium findings and the low-severity ones that were trivial or small:
+
+`SEC-2`, `SUP-1`, `CI-2`, `BUG-2`, `BUG-3`, `BUG-5`, `VER-2`, `VER-4`, `SEC-1`, `BUG-4`, `VER-1`
+
+Deliberately not done: `SEC-3`, `CI-1`. Each was either already covered by an earlier pass, or judged churn or too risky to make without a device or a measurement. The reasoning is in the commit that touched it.
+
+An independent reviewer then read each commit and tried to find what was wrong with it, and a second reviewer tried to refute every objection raised. What survived that was fixed in a follow-up commit.
 
 Repository hardening applied here as well: every GitHub Action is pinned to a commit rather than a floating tag, each workflow declares a least-privilege `permissions` block, and a Dependabot config, a licence and a security policy are in place.
+
+The rest of this document is the review as written. Fixed items are left in place so the reasoning behind each change stays with it.
 
 ## Summary
 
