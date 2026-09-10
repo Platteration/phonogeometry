@@ -1,5 +1,7 @@
 // Phonogeometry app controller: capture from all cameras -> reconstruct in a worker -> view/export.
 import { CameraManager } from './camera/cameraManager.js';
+import { CaptureGuide } from './camera/captureGuide.js';
+import { MovementGuide } from './camera/moveGuide.js';
 import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
@@ -23,15 +25,73 @@ const state = {
   result: null,
   viewer: null,
   cameraTiles: new Map(),
+  autoShutterTouched: false, // once the user sets the switch, the preset stops moving it
 };
 const cams = new CameraManager();
 const store = new ShotStore();
+
+// How far the view must change before the next shot is worth taking. Displacement is not an
+// angle: the same movement shifts features about twice as far for a subject at arm's length
+// as it does for the walls of a room, so the band comes from what the user said they are
+// scanning. The figures are measured — see src/camera/moveGuide.js.
+const GUIDE_BANDS = {
+  object: { targetPercent: 5, warnPercent: 9 },
+  person: { targetPercent: 5, warnPercent: 9 },
+  room: { targetPercent: 2.5, warnPercent: 4.5 },
+};
+
+const guide = new CaptureGuide(cams, { getBand: () => GUIDE_BANDS[state.preset] || GUIDE_BANDS.object });
 
 const PRESET_TIPS = {
   object: 'Circle the object in small steps, about a hand-width of sideways movement between shots, and keep more than half of each view shared with the last one. Aim for 20–40 shots.',
   person: 'Ask them to stand still. Circle them in small steps at chest height, then add a higher and a lower pass for the head and the legs. Aim for 25–50 shots.',
   room: 'Stand near the middle, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls. Keep furniture or a corner in view, not just a bare wall.',
 };
+
+const GUIDE_MESSAGES = {
+  still: 'Move sideways around your subject',
+  approaching: 'Keep going…',
+  ready: 'Now — take the shot',
+  far: 'Too far, come back toward the last shot',
+  lost: 'Point at something with more detail',
+  pivot: 'You are turning on the spot. Step sideways instead, or there is no depth to measure',
+};
+
+/** Paint the ring and the line under it from one measurement. */
+function renderGuide(sample) {
+  const ring = $('#guide-ring');
+  const fill = $('#guide-fill');
+  const status = $('#guide-status');
+  const on = !!sample && $('#chk-guide').checked && !$('#screen-capture').hidden;
+  // The ring is an <svg>: `hidden` is an HTMLElement property, so assigning it here would set
+  // a JavaScript property nobody reads and leave the attribute — and the ring — in place.
+  ring.toggleAttribute('hidden', !on);
+  status.hidden = !on;
+  ring.parentElement.classList.toggle('guided', on);
+  if (!on) return;
+  const level = sample.pivoting ? 'pivot' : sample.state;
+  const band = GUIDE_BANDS[state.preset] || GUIDE_BANDS.object;
+  // A completely empty ring reads as a control that is not working, so keep a sliver showing
+  const fraction = Math.max(0.04, MovementGuide.fillFraction(sample.percent, band.targetPercent));
+  const CIRCUMFERENCE = 283; // 2 * pi * 45, matching the SVG
+  fill.style.strokeDashoffset = String(CIRCUMFERENCE * (1 - fraction));
+  ring.dataset.level = level;
+  status.dataset.level = level;
+  status.textContent = GUIDE_MESSAGES[level] || '';
+}
+
+/**
+ * The capture bar is fixed to the bottom and grows by a line whenever the guide has something
+ * to say, so the space kept clear for it below the shots cannot be a constant: without this the
+ * status line ends up printed across the last row of thumbnails.
+ */
+function trackCaptureBarHeight() {
+  const bar = $('#capture-bar');
+  const apply = () => document.documentElement.style.setProperty('--capture-bar-h', `${Math.round(bar.offsetHeight)}px`);
+  apply();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(apply).observe(bar);
+  else window.addEventListener('resize', apply);
+}
 
 // ---------- UI helpers ----------
 let toastTimer = null;
@@ -44,6 +104,7 @@ function toast(msg, ms = 3000) {
 function showScreen(name) {
   for (const s of ['capture', 'process', 'view']) $(`#screen-${s}`).hidden = s !== name;
   $('#capture-bar').hidden = name !== 'capture';
+  if (name === 'capture') { if (cams.open.size) startGuide(); } else stopGuide();
   if (name === 'view' && state.viewer) state.viewer.resize();
 }
 function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length, 0); }
@@ -56,9 +117,9 @@ function updateCounts() {
   const MIN_FRAMES = 3;
   let note = '';
   if (n && n < MIN_FRAMES) note = ` · at least ${MIN_FRAMES} needed`;
-  else if (n && n < 8) note = ' · more shots will give a fuller model';
+  else if (n && n < 8) note = ' · add more';
   else if (n > 60) note = ' · many frames: Fast quality recommended';
-  $('#frame-count').textContent = n ? `· ${n} frames${note}` : '';
+  $('#frame-count').textContent = n ? `${n} frames${note}` : '';
   $('#btn-reconstruct').disabled = n < MIN_FRAMES;
   // Rough on-phone processing time per frame at each quality level
   // Rough seconds per frame on a phone, from timings on a laptop scaled for slower hardware
@@ -118,6 +179,7 @@ async function startCameras() {
     $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live` + (seq ? `, ${seq} will be captured sequentially (the phone limits concurrent streams).` : '.');
     $('#btn-capture').disabled = live + seq === 0;
     btn.textContent = 'Re-scan cameras';
+    if (live > 0) startGuide();
   } catch (err) {
     $('#camera-status').textContent = `Camera access failed: ${err.message}. You can still import photos below.`;
     toast(err.message, 5000);
@@ -208,6 +270,9 @@ async function captureShot() {
   const flash = $('#flash'); flash.hidden = false; setTimeout(() => { flash.hidden = true; }, 260);
   try {
     const maxDim = parseInt($('#capture-res').value, 10);
+    // The sequential fallback closes and reopens cameras, so a preview grab mid-capture would
+    // read a dead video element
+    guide.pause();
     const grabbed = await cams.captureAll({ maxDim, sequentialFallback: $('#chk-sequential').checked, onStatus: (m) => { $('#camera-status').textContent = m; } });
     if (!grabbed.length) { toast('No camera frames captured'); return; }
     const frames = [];
@@ -215,6 +280,10 @@ async function captureShot() {
       const blob = await canvasToBlob(g.canvas);
       frames.push({ blob, thumbUrl: makeThumb(g.canvas), width: g.width, height: g.height, f: g.f, cx: g.cx, cy: g.cy, label: g.cameraLabel, lens: g.lens, key: g.cameraKey, hfov: g.hfov, sharpness: measureSharpness(g.canvas) });
     }
+    // Measure the next shot from the photograph just taken, not from a preview tick
+    const reference = grabbed.find((g) => g.cameraKey === guide.referenceEntry()?.cam.key) || grabbed[0];
+    if (reference) guide.setReferenceFromCanvas(reference.canvas, reference);
+
     const shot = { id: `shot-${Date.now()}`, createdAt: Date.now(), frames };
     state.shots.push(shot);
     store.saveShot(shot);
@@ -228,7 +297,31 @@ async function captureShot() {
     toast(`Capture failed: ${err.message}`, 5000);
   } finally {
     btn.disabled = false; btn.classList.remove('busy');
+    guide.resume();
   }
+}
+
+/**
+ * Auto-shutter is on by default for an object or a person, where the user walks and the app
+ * should decide the moment, and off for a room, where they deliberately stand and turn — the
+ * one case where the phone spends much of its time in a state the guide will not fire from.
+ * Once the user sets the switch themselves it stays where they put it.
+ */
+function applyAutoShutterDefault() {
+  if (state.autoShutterTouched) return;
+  $('#chk-auto-shutter').checked = state.preset !== 'room';
+  guide.setAutoShutter($('#chk-auto-shutter').checked);
+}
+
+function startGuide() {
+  guide.refreshBand();
+  guide.setAutoShutter($('#chk-auto-shutter').checked);
+  if ($('#chk-guide').checked) guide.start(); else guide.stop();
+}
+
+function stopGuide() {
+  guide.stop();
+  renderGuide(null);
 }
 
 async function importFiles(files) {
@@ -604,13 +697,22 @@ function init() {
     state.preset = b.dataset.preset;
     $('#preset').querySelectorAll('button').forEach((x) => { x.classList.toggle('active', x === b); x.setAttribute('aria-checked', x === b); });
     $('#preset-tip').textContent = PRESET_TIPS[state.preset];
+    guide.refreshBand();
+    applyAutoShutterDefault();
   });
   $('#btn-start-cameras').addEventListener('click', startCameras);
   $('#quality').addEventListener('change', updateCounts);
+  guide.addEventListener('sample', (e) => renderGuide(e.detail));
+  guide.addEventListener('fire', () => { if (!$('#btn-capture').disabled) captureShot(); });
+  $('#chk-guide').addEventListener('change', () => { if ($('#chk-guide').checked) startGuide(); else stopGuide(); });
+  $('#chk-auto-shutter').addEventListener('change', () => {
+    state.autoShutterTouched = true;
+    guide.setAutoShutter($('#chk-auto-shutter').checked);
+  });
   $('#btn-capture').addEventListener('click', captureShot);
   $('#btn-import').addEventListener('click', () => $('#file-import').click());
   $('#file-import').addEventListener('change', (e) => { importFiles(Array.from(e.target.files)); e.target.value = ''; });
-  $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); renderShots(); updateCounts(); } });
+  $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); guide.clearReference(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
   const stopBuild = () => {
     if (state.worker) { state.worker.terminate(); state.worker = null; }
@@ -666,12 +768,18 @@ function init() {
     try { if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: 'Phonogeometry scan' }); else toast('Sharing files is not supported here'); } catch { /* cancelled */ }
   });
   $('#btn-back-capture').addEventListener('click', () => showScreen('capture'));
-  $('#btn-new-scan').addEventListener('click', () => { if (confirm('Start a new scan? Current shots and mesh will be discarded.')) { state.shots = []; state.result = null; store.clear(); renderShots(); updateCounts(); showScreen('capture'); } });
+  $('#btn-new-scan').addEventListener('click', () => { if (confirm('Start a new scan? Current shots and mesh will be discarded.')) { state.shots = []; state.result = null; store.clear(); guide.clearReference(); renderShots(); updateCounts(); showScreen('capture'); } });
   document.addEventListener('keydown', (e) => { if (e.code === 'Space' && !$('#screen-capture').hidden && document.activeElement?.tagName !== 'BUTTON') { e.preventDefault(); captureShot(); } });
-  window.addEventListener('pagehide', () => cams.closeAll());
+  window.addEventListener('pagehide', () => { stopGuide(); cams.closeAll(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { if (!$('#screen-capture').hidden) startGuide(); } else guide.stop();
+  });
   // Phones stop camera streams when the tab is hidden; reopen them when it comes back.
   cams.addEventListener('ended', () => { if (document.visibilityState === 'visible') reopenCameras(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reopenCameras(); });
+  $('#preset-tip').textContent = PRESET_TIPS[state.preset];
+  applyAutoShutterDefault();
+  trackCaptureBarHeight();
   updateCounts();
   restoreShots();
 

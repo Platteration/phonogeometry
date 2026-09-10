@@ -133,6 +133,46 @@ async function main() {
       const secondShot = await page.$$eval('#thumbs .shot:nth-child(2) .thumb', (els) => els.length);
       check(`${label}: a second press captures from all of them too`, secondShot === 3, `${secondShot} frames`);
 
+      // The movement guide should be measuring against the shot just taken
+      if (limit === 3) {
+        await page.waitForTimeout(1200);
+        // Ask what is on the screen, not what a property says. `hidden` is an HTMLElement
+        // property and the ring is an <svg>, so reading it reported a ring that was never
+        // drawn: the check passed for months of nothing being visible.
+        const ringBox = await page.$eval('#guide-ring', (e) => {
+          const r = e.getBoundingClientRect();
+          return { w: Math.round(r.width), h: Math.round(r.height) };
+        });
+        const level = await page.$eval('#guide-ring', (e) => e.dataset.level || '');
+        const status = (await page.textContent('#guide-status')).trim();
+        check(`${label}: the movement guide reports something after a shot`,
+          ringBox.w > 80 && level.length > 0 && status.length > 0,
+          `ring ${ringBox.w}x${ringBox.h}, level "${level}", status "${status}"`);
+
+        // and the ring has to stand clear of the shutter, or it cannot be read at all
+        const clearance = await page.evaluate(() => {
+          const r = document.querySelector('#guide-ring').getBoundingClientRect();
+          const s = document.querySelector('#btn-capture').getBoundingClientRect();
+          return Math.round((s.left - r.left) * 10) / 10;
+        });
+        check(`${label}: the ring stands outside the shutter`, clearance >= 10, `${clearance}px of ring outside the button`);
+
+        // Turning the guide off must stop it and hide the ring. The switch lives in the
+        // settings dialog, so open it the way a user would.
+        await page.click('#btn-settings');
+        await page.waitForTimeout(200);
+        await page.uncheck('#chk-guide');
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(700);
+        check(`${label}: the guide can be turned off`,
+          await page.$eval('#guide-ring', (e) => e.getBoundingClientRect().width === 0));
+        await page.click('#btn-settings');
+        await page.waitForTimeout(200);
+        await page.check('#chk-guide');
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(200);
+      }
+
       const liveTiles = await page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.videoWidth > 0 && !v.paused).length);
       check(`${label}: the previews are still live afterwards`, liveTiles === Math.min(3, limit), `${liveTiles} live of ${Math.min(3, limit)} expected`);
       check(`${label}: no page errors`, errors.length === 0, errors.slice(0, 2).join(' | '));

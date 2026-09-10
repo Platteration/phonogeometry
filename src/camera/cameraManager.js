@@ -1,6 +1,7 @@
 // Discovers every camera on the device, opens as many as the hardware allows at the
 // same time, and captures synchronised frames from all of them.
 import { guessFacing, guessLens, loadLensOverrides, intrinsicsFor } from './intrinsics.js';
+import { rgbaToGray } from '../vision/image.js';
 
 function waitForVideo(video, timeoutMs = 4000) {
   return new Promise((resolve) => {
@@ -143,6 +144,32 @@ export class CameraManager extends EventTarget {
     const zoom = settings.zoom && settings.zoom > 0 ? settings.zoom : 1;
     const intr = intrinsicsFor(cam, w, h, zoom);
     return { canvas, width: w, height: h, cameraKey: cam.key, cameraLabel: cam.shortLabel || cam.label, lens: cam.lens, facing: cam.facing, ...intr, zoom, timestamp: performance.now() };
+  }
+
+  /**
+   * A small greyscale grab for the movement guide, which runs several times a second while
+   * the user lines up a shot. It reuses one canvas across calls: allocating a fresh one at
+   * this rate is avoidable rubbish for the collector to deal with on a phone.
+   * @returns {{gray: Float32Array, w, h, f, cx, cy}|null} null when the camera has no frame yet
+   */
+  grabPreviewGray(entry, targetWidth = 160) {
+    const { video, cam, track } = entry;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const s = Math.min(1, targetWidth / Math.max(vw, vh));
+    const w = Math.max(16, Math.round(vw * s)), h = Math.max(16, Math.round(vh * s));
+    if (!this._previewCanvas) {
+      this._previewCanvas = document.createElement('canvas');
+      this._previewCtx = this._previewCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    const canvas = this._previewCanvas;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    this._previewCtx.drawImage(video, 0, 0, w, h);
+    const { data } = this._previewCtx.getImageData(0, 0, w, h);
+    const settings = track.getSettings ? track.getSettings() : {};
+    const zoom = settings.zoom && settings.zoom > 0 ? settings.zoom : 1;
+    const intr = intrinsicsFor(cam, w, h, zoom);
+    return { gray: rgbaToGray(data, w, h), w, h, f: intr.f, cx: intr.cx, cy: intr.cy };
   }
 
   /**

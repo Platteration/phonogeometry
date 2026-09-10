@@ -48,7 +48,7 @@
           </select>
         </label>
       </div>
-      <p id="preset-tip" class="tip">Walk slowly around the object and capture every 20–30° with plenty of overlap. Aim for 12–30 shots.</p>
+      <p id="preset-tip" class="tip"></p>
     </section>
 
     <section class="panel cameras">
@@ -74,9 +74,18 @@
   </main>
 
   <footer id="capture-bar" class="capture-bar">
-    <button id="btn-reconstruct" class="primary big" disabled>Build 3D mesh</button>
-    <button id="btn-capture" class="shutter" title="Capture from all cameras" aria-label="Capture from all cameras" disabled><span></span></button>
-    <div class="spacer"></div>
+    <p id="guide-status" class="guide-status" hidden></p>
+    <div class="capture-row">
+      <button id="btn-reconstruct" class="primary big" disabled>Build 3D mesh</button>
+      <div class="shutter-wrap">
+        <svg id="guide-ring" class="guide-ring" viewBox="0 0 100 100" aria-hidden="true" hidden>
+          <circle class="guide-track" cx="50" cy="50" r="45" />
+          <circle id="guide-fill" class="guide-fill" cx="50" cy="50" r="45" />
+        </svg>
+        <button id="btn-capture" class="shutter" title="Capture from all cameras" aria-label="Capture from all cameras" disabled><span></span></button>
+      </div>
+      <div class="spacer"></div>
+    </div>
   </footer>
 
   <!-- ============ Processing ============ -->
@@ -163,6 +172,8 @@
         </select>
       </label>
       <label class="check"><input type="checkbox" id="chk-sequential" checked /> If a camera cannot stream at the same time as the others, switch to it and capture sequentially</label>
+      <label class="check"><input type="checkbox" id="chk-guide" checked /> Show a movement guide while the cameras preview, so you can see when you have moved far enough for the next shot</label>
+      <label class="check"><input type="checkbox" id="chk-auto-shutter" /> Take each shot automatically once you have moved far enough and the phone is steady</label>
       <h3>Processing</h3>
       <label class="check"><input type="checkbox" id="chk-gpu" checked /> Compute depth maps on the GPU (WebGL2). Turn off if reconstruction fails or the browser crashes.</label>
       <label class="check"><input type="checkbox" id="chk-rig" checked /> Use the camera rig: cameras fired in the same shot are rigidly attached, so a pose found for one places the others. This is what lets the front camera join a scan of the room behind you.</label>

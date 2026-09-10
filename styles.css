@@ -37,6 +37,9 @@ p { margin: 8px 0; }
 .topbar-actions { display: flex; gap: 8px; }
 
 .screen { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 0 12px 140px; }
+/* The capture bar is fixed and changes height when the guide's status line appears, so the
+   space kept clear for it is measured rather than guessed (see app.js). */
+#screen-capture { padding-bottom: calc(var(--capture-bar-h, 140px) + 20px); }
 .screen[hidden] { display: none; }
 .panel { background: var(--panel); border-radius: var(--radius); padding: 14px; }
 .panel.center { text-align: center; margin-top: 10vh; }
@@ -77,8 +80,16 @@ select { background: var(--panel-2); border: 1px solid #2c313d; border-radius: 8
 .thumb-flag.warn { background: #7a5a12; color: #ffe1a8; }
 .thumb-flag.bad { background: #5a2020; color: #ffc9c9; }
 .shot .shot-delete { background: transparent; color: var(--muted); font-size: 18px; padding: 4px 8px; }
+/* The frame count wraps under the heading on a narrow phone, so it is a flex item with its
+   own gap rather than a string with a leading separator that would be left stranded. */
+.shots h2 { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+#frame-count { white-space: nowrap; }
 
-.capture-bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 12px; padding: 12px 16px calc(env(safe-area-inset-bottom) + 12px); background: linear-gradient(to top, rgba(15,17,21,0.98), rgba(15,17,21,0.9)); z-index: 5; }
+/* The bar is opaque, not a gradient: the shots underneath scroll behind it and anything
+   translucent left the guide's status line reading as if it were printed over a thumbnail.
+   The fade sits above the bar instead, where there is nothing to collide with. */
+.capture-bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 12px; padding: 12px 16px calc(env(safe-area-inset-bottom) + 12px); background: var(--bg); z-index: 5; }
+.capture-bar::before { content: ""; position: absolute; left: 0; right: 0; bottom: 100%; height: 22px; background: linear-gradient(to top, var(--bg), rgba(15,17,21,0)); pointer-events: none; }
 .capture-bar .spacer { flex: 1; }
 .capture-bar[hidden] { display: none; }
 .shutter { width: 74px; height: 74px; border-radius: 50%; background: #fff; padding: 0; display: grid; place-items: center; border: 4px solid #cfd4dc; box-shadow: 0 0 0 4px rgba(255,255,255,0.15); }
@@ -137,3 +148,35 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .field-inline input { width: 88px; background: var(--panel); border: 1px solid #2c313d; border-radius: 8px; padding: 6px 8px; color: var(--text); }
 #btn-measure.active { background: var(--accent); color: #1a1200; border-color: var(--accent); font-weight: 600; }
 .scale-set { color: var(--ok); }
+
+/* Movement guide: a ring around the shutter that fills as the phone moves away from the
+   last shot, and a line saying what to do next. */
+.capture-row { display: flex; align-items: center; gap: 12px; width: 100%; }
+.shutter-wrap { position: relative; width: 74px; height: 74px; flex: 0 0 auto; margin: 14px; }
+.shutter-wrap .shutter { position: absolute; inset: 0; }
+/* The shutter's own white halo sits at the same radius as the ring and swallowed it, so it
+   gives way while the guide is showing. */
+.shutter-wrap.guided .shutter { box-shadow: none; }
+.guide-ring { position: absolute; inset: -14px; width: 102px; height: 102px; transform: rotate(-90deg); pointer-events: none; z-index: 1; }
+.guide-ring[hidden] { display: none; }
+.guide-ring circle { fill: none; stroke-width: 7; stroke-linecap: round; }
+.guide-track { stroke: rgba(255, 255, 255, 0.3); }
+.guide-fill {
+  stroke: var(--muted);
+  stroke-dasharray: 283;               /* 2 * pi * r, r = 45 */
+  stroke-dashoffset: 283;
+  transition: stroke-dashoffset 0.18s linear, stroke 0.2s;
+}
+.guide-ring[data-level="approaching"] .guide-fill { stroke: var(--accent); }
+.guide-ring[data-level="ready"] .guide-fill { stroke: var(--ok); }
+.guide-ring[data-level="far"] .guide-fill { stroke: var(--danger); }
+.guide-ring[data-level="lost"] .guide-fill,
+.guide-ring[data-level="pivot"] .guide-fill { stroke: var(--danger); opacity: 0.5; }
+.guide-status {
+  margin: 0 auto 6px; font-size: 13px; color: var(--muted); text-align: center;
+  background: var(--panel-2); padding: 6px 12px; border-radius: 999px; max-width: 100%;
+}
+.guide-status[hidden] { display: none; }
+.guide-status[data-level="ready"] { color: var(--ok); }
+.guide-status[data-level="far"], .guide-status[data-level="pivot"] { color: var(--danger); }
+.capture-bar { flex-direction: column; align-items: stretch; }
