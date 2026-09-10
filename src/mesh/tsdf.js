@@ -27,10 +27,18 @@ export class TSDFVolume {
    * confidence was tried and changed nothing, because the cross-view consistency check has
    * already removed most of what confidence would have discounted, and averaging over views
    * outvotes the rest. See the note in CLAUDE.md before trying it again.
-   * @param view {depth: Float32Array, w, h, f, cx, cy, R, t, rgb?: Uint8ClampedArray (RGBA at depth resolution)}
+   * @param view {depth: Float32Array, w, h, f, cx, cy, R, t, rgb?: Uint8ClampedArray}
+   *   `rgb` is RGBA at the depth resolution unless the view also carries `rgbW`, `rgbH` and
+   *   the matching `rgbF`, `rgbCx`, `rgbCy`, in which case it is a separate, larger picture
+   *   of the same pinhole camera and the voxel is projected into it in its own right. Depth
+   *   maps are small because the plane sweep is expensive; colour has no such excuse, and
+   *   sampling it from the depth-sized copy threw away detail the photograph had.
    */
   integrate(view, opts = {}) {
     const { depth, w, h, f, cx, cy, R, t, rgb } = view;
+    const rw = view.rgbW || w, rh = view.rgbH || h;
+    const rf = view.rgbF ?? f, rcx = view.rgbCx ?? cx, rcy = view.rgbCy ?? cy;
+    const sameGrid = rw === w && rh === h && rf === f && rcx === cx && rcy === cy;
     const maxWeight = opts.maxWeight ?? 64;
     const [nx, ny, nz] = this.dims;
     const vs = this.voxelSize, trunc = this.trunc;
@@ -58,7 +66,12 @@ export class TSDFVolume {
           const wNew = Math.min(maxWeight, wOld + 1);
           this.tsdf[idx] = (this.tsdf[idx] * wOld + tsdf) / wNew;
           if (rgb && Math.abs(sdf) < trunc) {
-            const o = (py * w + px) * 4, c = idx * 3;
+            let rx = px, ry = py;
+            if (!sameGrid) {
+              rx = Math.round(rf * cxw / czw + rcx); ry = Math.round(rf * cyw / czw + rcy);
+              if (rx < 0 || ry < 0 || rx >= rw || ry >= rh) { this.weight[idx] = wNew; continue; }
+            }
+            const o = (ry * rw + rx) * 4, c = idx * 3;
             this.color[c] = (this.color[c] * wOld + rgb[o]) / wNew;
             this.color[c + 1] = (this.color[c + 1] * wOld + rgb[o + 1]) / wNew;
             this.color[c + 2] = (this.color[c + 2] * wOld + rgb[o + 2]) / wNew;

@@ -65,6 +65,21 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   error unchanged (rejection merely cost three to six percent of the triangles). Tested down
   to four views, where fusion has fewest votes to spare. Do not spend time here again without
   a scenario that defeats the consistency check.
+- Colour and depth want different resolutions, and colour is no longer sampled from the depth
+  copy. Measured on the synthetic object, retained contrast against the photographs: 83% when
+  vertex colours came from the volume fed by the 240 px depth copy, 86% from a 640 px colour
+  copy, 93% projecting each vertex into a 480 px colour copy directly, 95% at 640 px. The
+  volume's own colour field is as coarse as its grid whatever it is fed — raising `voxelRes`
+  from 128 to 200 alone moved 86% to 89% — which is why the vertices are projected into the
+  pictures instead and the volume's colour is only a fallback for vertices no view can see
+  (7 of 33,415 on that scene). The colour copies cost about 0.7 MB a frame at Balanced and
+  push the peak up around 6%.
+- A texture atlas remains deferred, and by more than before. The median triangle covers 3.0
+  source pixels, so an atlas would carry about 9.3x the samples the vertices hold — but with
+  vertex colours now keeping 95% of the contrast at High there is very little left for it to
+  win. The caveat still stands: this scene's procedural texture is smoother than wood grain,
+  print or fabric. Re-measure on a genuinely detailed real object before deciding; below about
+  60% retention there an atlas earns its weeks, near 80% it does not.
 
 ## Memory
 
@@ -74,6 +89,11 @@ the full-size image and greyscale are dropped there, and `releaseInputs` lets th
 the transferred pixel buffers as it goes (tests reuse their images and so must not set it).
 Dense samples go straight into typed arrays. Forty frames at Balanced peak near 250 MB; keep
 new per-frame state small or free it explicitly.
+
+The one buffer that outlives the dense stage is the per-frame colour copy (`colorWidth` in
+`QUALITY`), because the surface is coloured from the photographs after it is meshed. It is
+freed as soon as that is done. A sixteen-frame scan measured 264 MB peak before it existed and
+280 MB with it.
 
 ## Scale
 

@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { reconstruct } from '../src/pipeline/reconstruct.js';
 import { renderRoom, renderObject, renderFurnishedRoom } from './synthScene.js';
-import { lookAt, fitSimilarity } from './helpers.js';
+import { lookAt, fitSimilarity, rng, gauss } from './helpers.js';
+import { projectPoint } from '../src/vision/geometry.js';
 import { rotvecToMat, matMul, matVec } from '../src/vision/linalg.js';
 import { eulerCharacteristic } from '../src/mesh/meshUtils.js';
 
@@ -239,4 +240,72 @@ test('a blurred frame is flagged, per camera', async () => {
   ];
   markSoftFrames(mixed);
   assert.ok(mixed.find((i) => i.id === 'b0').soft);
+});
+
+test('the mesh keeps the colour the photographs had', async () => {
+  // Mesh colour used to be sampled from the same small copy the plane sweep works on — 240 px
+  // wide at Balanced, from photographs several times that — and then averaged again over the
+  // voxel grid. Measured on this scene, that returned 83% of the photograph's contrast. The
+  // vertices are now projected into a colour copy of their own, which measures 93%.
+  //
+  // The method here is the measurement that decided it, kept as a test so the two agree by
+  // construction: align the reconstruction to the truth, find the photograph that sees each
+  // vertex most directly and is not occluded there, and compare the spread of what the mesh
+  // carries against the spread of what the photograph shows.
+  const w = 640, h = 480, f = 520, cx = (w - 1) / 2, cy = (h - 1) / 2;
+  const r = rng(9);
+  const images = [], sources = [];
+  for (let i = 0; i < 8; i++) {
+    const ang = -0.55 + i * (1.1 / 7), dist = 2.8 + 0.2 * Math.sin(i * 1.3);
+    const cam = lookAt([Math.sin(ang) * dist, 0.3 * Math.sin(i), -Math.cos(ang) * dist], [0, 0, 0]);
+    const rr = renderObject(cam, w, h, f, cx, cy, 1, 3);
+    const rgba = Uint8ClampedArray.from(rr.rgba);
+    for (let p = 0; p < w * h; p++) for (let c = 0; c < 3; c++) rgba[p * 4 + c] += gauss(r) * 4;
+    images.push({ id: `c${i}`, label: `c${i}`, width: w, height: h, rgba: Uint8ClampedArray.from(rgba), f, cx, cy, shotIndex: i, rigKey: 'back', focalGroup: 'back' });
+    const C = [
+      -(cam.R[0] * cam.t[0] + cam.R[3] * cam.t[1] + cam.R[6] * cam.t[2]),
+      -(cam.R[1] * cam.t[0] + cam.R[4] * cam.t[1] + cam.R[7] * cam.t[2]),
+      -(cam.R[2] * cam.t[0] + cam.R[5] * cam.t[1] + cam.R[8] * cam.t[2]),
+    ];
+    sources.push({ rgba, cam, depth: rr.depth, centre: C });
+  }
+  const res = await reconstruct(images, { quality: 'balanced', preset: 'object' });
+  assert.equal(res.stats.registered, 8);
+
+  const from = [], to = [];
+  res.cameras.forEach((c, i) => { if (c) { from.push(c.center); to.push([sources[i].centre[0], -sources[i].centre[1], -sources[i].centre[2]]); } });
+  const sim = fitSimilarity(from, to);
+  assert.ok(sim.residual < 0.02, `camera fit residual ${sim.residual.toFixed(4)}`);
+
+  const P = res.mesh.positions, C = res.mesh.colors;
+  const meshVals = [], srcVals = [];
+  let compared = 0, sumAbs = 0;
+  for (let i = 0; i < P.length; i += 3) {
+    const a = sim.apply([P[i], P[i + 1], P[i + 2]]);
+    const X = [a[0], -a[1], -a[2]]; // back into the rendering convention
+    let best = null;
+    for (const s of sources) {
+      const pr = projectPoint(s.cam.R, s.cam.t, X);
+      if (pr[2] <= 0) continue;
+      const px = Math.round(pr[0] * f + cx), py = Math.round(pr[1] * f + cy);
+      if (px < 2 || py < 2 || px >= w - 2 || py >= h - 2) continue;
+      const d = s.depth[py * w + px];
+      if (!(d > 0) || Math.abs(d - pr[2]) > 0.05 * d) continue; // occluded, or off the surface
+      if (!best || pr[2] < best.z) best = { z: pr[2], o: (py * w + px) * 4, rgba: s.rgba };
+    }
+    if (!best) continue;
+    compared++;
+    for (let c = 0; c < 3; c++) sumAbs += Math.abs(C[i + c] * 255 - best.rgba[best.o + c]) / 3;
+    meshVals.push(C[i + 1] * 255); srcVals.push(best.rgba[best.o + 1]);
+  }
+  assert.ok(compared > 10000, `only ${compared} vertices could be compared`);
+  const sd = (arr) => {
+    const m = arr.reduce((x, y) => x + y, 0) / arr.length;
+    return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
+  };
+  const retained = sd(meshVals) / sd(srcVals);
+  const meanErr = sumAbs / compared;
+  assert.ok(retained > 0.88,
+    `kept ${(100 * retained).toFixed(0)}% of the photograph's contrast (was 83% when colour came from the depth copy)`);
+  assert.ok(meanErr < 12.5, `mean colour error ${meanErr.toFixed(1)} of 255`);
 });

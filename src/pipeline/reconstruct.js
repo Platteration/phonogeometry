@@ -17,10 +17,15 @@ import { computeNormals, smoothMesh, removeSmallComponents } from '../mesh/meshU
 // 16 degrees of viewpoint change, while 3000 features at threshold 12 still recover it at 25
 // degrees. Being able to take fewer, wider-spaced shots more than pays for the extra matching
 // time, because the number of image pairs grows with the square of the number of shots.
+// `colorWidth` is the long side of the copy the mesh takes its colour from, which is a
+// separate picture from the depth maps: those are small because the plane sweep is what costs,
+// and colour was only sharing their size out of convenience. Each copy is about 0.7 MB at
+// Balanced and is held from feature extraction until the surface has been coloured, so it is
+// deliberately below the feature width rather than the full capture size.
 export const QUALITY = {
-  fast: { featureWidth: 560, maxFeatures: 2000, cornerThreshold: 14, depthWidth: 160, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
-  balanced: { featureWidth: 640, maxFeatures: 3000, cornerThreshold: 12, depthWidth: 240, numPlanes: 64, voxelRes: 128, neighbors: 3, radius: 3 },
-  high: { featureWidth: 800, maxFeatures: 4500, cornerThreshold: 10, depthWidth: 320, numPlanes: 96, voxelRes: 176, neighbors: 4, radius: 3 },
+  fast: { featureWidth: 560, maxFeatures: 2000, cornerThreshold: 14, depthWidth: 160, colorWidth: 400, numPlanes: 48, voxelRes: 96, neighbors: 2, radius: 3 },
+  balanced: { featureWidth: 640, maxFeatures: 3000, cornerThreshold: 12, depthWidth: 240, colorWidth: 480, numPlanes: 64, voxelRes: 128, neighbors: 3, radius: 3 },
+  high: { featureWidth: 800, maxFeatures: 4500, cornerThreshold: 10, depthWidth: 320, colorWidth: 640, numPlanes: 96, voxelRes: 176, neighbors: 4, radius: 3 },
 };
 
 export const PRESETS = {
@@ -98,6 +103,55 @@ export function markSoftFrames(items, threshold = 0.7) {
     }
   }
   return items;
+}
+
+/**
+ * Colour mesh vertices from the photographs directly, instead of from the colour the volume
+ * carries. The volume averages colour over voxels, so its colour field is as coarse as the
+ * grid however sharp the pictures were: measured on the synthetic object, raising the grid
+ * from 128 to 200 voxels lifted retained contrast from 86% to 89% on its own. Projecting each
+ * vertex into the pictures skips that averaging entirely.
+ *
+ * A vertex is only coloured from a view whose depth map agrees that this surface is what the
+ * view can see there, which is the same occlusion test used when measuring colour accuracy.
+ * Views that pass are averaged, so a vertex seen by several cameras does not take a seam from
+ * whichever one happened to be nearest.
+ *
+ * @param verts vertex positions in the camera convention (y down, z forward), xyz per vertex
+ * @param views the depth views, each carrying its colour picture and both sets of intrinsics
+ * @returns {{colors: Float32Array, covered: Uint8Array}} colours in 0..1; `covered` marks the
+ *   vertices no view could see, which the caller fills from the volume.
+ */
+function colorVerticesFromViews(verts, views, { tol = 0.05 } = {}) {
+  const nv = verts.length / 3;
+  const colors = new Float32Array(nv * 3);
+  const covered = new Uint8Array(nv);
+  for (let i = 0; i < nv; i++) {
+    const wx = verts[i * 3], wy = verts[i * 3 + 1], wz = verts[i * 3 + 2];
+    let r = 0, g = 0, b = 0, n = 0;
+    for (const v of views) {
+      if (!v || !v.rgb) continue;
+      const R = v.R, t = v.t;
+      const z = R[6] * wx + R[7] * wy + R[8] * wz + t[2];
+      if (z <= 1e-6) continue;
+      const x = R[0] * wx + R[1] * wy + R[2] * wz + t[0];
+      const y = R[3] * wx + R[4] * wy + R[5] * wz + t[1];
+      const px = Math.round(v.f * x / z + v.cx), py = Math.round(v.f * y / z + v.cy);
+      if (px < 0 || py < 0 || px >= v.w || py >= v.h) continue;
+      const d = v.depth[py * v.w + px];
+      if (!(d > 0) || Math.abs(d - z) > tol * d) continue; // unmeasured, or something in front
+      const rw = v.rgbW || v.w, rh = v.rgbH || v.h;
+      const rx = Math.round((v.rgbF ?? v.f) * x / z + (v.rgbCx ?? v.cx));
+      const ry = Math.round((v.rgbF ?? v.f) * y / z + (v.rgbCy ?? v.cy));
+      if (rx < 0 || ry < 0 || rx >= rw || ry >= rh) continue;
+      const o = (ry * rw + rx) * 4;
+      r += v.rgb[o]; g += v.rgb[o + 1]; b += v.rgb[o + 2]; n++;
+    }
+    if (!n) continue;
+    covered[i] = 1;
+    colors[i * 3] = r / n / 255; colors[i * 3 + 1] = g / n / 255; colors[i * 3 + 2] = b / n / 255;
+  }
+  return { colors, covered };
 }
 
 function percentile(sortedArr, p) {
@@ -190,7 +244,12 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     const ds = Math.min(1, q.depthWidth / Math.max(fw, fh));
     const dw = Math.max(16, Math.round(fw * ds)), dh = Math.max(16, Math.round(fh * ds));
     const depthGrayRaw = resizeGray(gray, fw, fh, dw, dh);
-    const depthRGBARaw = resizeRGBA(im.rgba, im.width, im.height, dw, dh);
+    // Colour gets its own copy, larger than the depth maps: sampling vertex colours from the
+    // 240 px depth copy of a 1280 px photograph was measured to lose 17% of the picture's
+    // contrast, and this is most of that back for 0.7 MB a frame.
+    const cs = Math.min(1, q.colorWidth / Math.max(fw, fh));
+    const cw = Math.max(16, Math.round(fw * cs)), ch = Math.max(16, Math.round(fh * cs));
+    const colorRGBARaw = resizeRGBA(im.rgba, im.width, im.height, cw, ch);
     // The worker owns the pixel buffers it was handed and nothing else will read them, so it
     // asks for them to be released here; callers that keep their images simply omit this.
     if (options.releaseInputs) im.rgba = null;
@@ -198,7 +257,7 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
       id: im.id, label: im.label, shotIndex: im.shotIndex ?? i, focalGroup: im.focalGroup ?? im.id,
       rigKey: im.rigKey ?? im.focalGroup ?? im.id,
       width: fw, height: fh, fullW: im.width, fullH: im.height,
-      depthGrayRaw, depthRGBARaw, dw, dh,
+      depthGrayRaw, colorRGBARaw, dw, dh, cw, ch,
       f: im.f * sx, cx: (im.cx + 0.5) * sx - 0.5, cy: (im.cy + 0.5) * sy - 0.5,
       keypoints: feat.keypoints, count: feat.count, descriptors: feat.descriptors,
       sharpness: sharp,
@@ -275,10 +334,10 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     sparse[p * 3] = sfm.points[p * 3]; sparse[p * 3 + 1] = -sfm.points[p * 3 + 1]; sparse[p * 3 + 2] = -sfm.points[p * 3 + 2];
     const [fr, kp] = sfm.tracks[p][0];
     const f = frames[fr];
-    const src = f.depthRGBARaw || f.depthRGBA;
-    const px = Math.min(f.dw - 1, Math.max(0, Math.round(f.keypoints[kp * 2] * (f.dw / f.width))));
-    const py = Math.min(f.dh - 1, Math.max(0, Math.round(f.keypoints[kp * 2 + 1] * (f.dh / f.height))));
-    const o = (py * f.dw + px) * 4;
+    const src = f.colorRGBARaw || f.colorRGBA;
+    const px = Math.min(f.cw - 1, Math.max(0, Math.round(f.keypoints[kp * 2] * (f.cw / f.width))));
+    const py = Math.min(f.ch - 1, Math.max(0, Math.round(f.keypoints[kp * 2 + 1] * (f.ch / f.height))));
+    const o = (py * f.cw + px) * 4;
     sparseColors[p * 3] = src[o] / 255; sparseColors[p * 3 + 1] = src[o + 1] / 255; sparseColors[p * 3 + 2] = src[o + 2] / 255;
   }
 
@@ -360,11 +419,18 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
         // The plane sweep assumes pinhole cameras, so resample onto the pinhole grid using
         // the distortion that bundle adjustment settled on.
         f.depthGray = undistortGray(f.depthGrayRaw, f.dw, f.dh, f.df, f.dcx, f.dcy, f.k1 || 0);
-        f.depthRGBA = undistortRGBA(f.depthRGBARaw, f.dw, f.dh, f.df, f.dcx, f.dcy, f.k1 || 0);
-        f.depthGrayRaw = null; f.depthRGBARaw = null;
+        // The colour copy is put on the same pinhole grid, at its own resolution and with the
+        // intrinsics that go with it, so a point can be projected into it directly.
+        const kx = f.cw / f.width, ky = f.ch / f.height;
+        f.cf = f.f * kx; f.ccx = (f.cx + 0.5) * kx - 0.5; f.ccy = (f.cy + 0.5) * ky - 0.5;
+        f.colorRGBA = undistortRGBA(f.colorRGBARaw, f.cw, f.ch, f.cf, f.ccx, f.ccy, f.k1 || 0);
+        f.depthGrayRaw = null; f.colorRGBARaw = null;
       }
       const cam = sfm.cameras[idx];
-      return { gray: f.depthGray, w: f.dw, h: f.dh, f: f.df, cx: f.dcx, cy: f.dcy, R: cam.R, t: cam.t, rgb: f.depthRGBA };
+      return {
+        gray: f.depthGray, w: f.dw, h: f.dh, f: f.df, cx: f.dcx, cy: f.dcy, R: cam.R, t: cam.t,
+        rgb: f.colorRGBA, rgbW: f.cw, rgbH: f.ch, rgbF: f.cf, rgbCx: f.ccx, rgbCy: f.ccy,
+      };
     };
     const ref = view(fr);
     const res = sweep(ref, nbs.map(view), { dmin, dmax, numPlanes: q.numPlanes, radius: q.radius, minZncc: preset.minZncc });
@@ -374,7 +440,8 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     depthViews[fr] = { ...ref, depth: res.depth, confidence: res.confidence };
   }
   if (gpu) { gpu.dispose(); gpu = null; }
-  for (const f of frames) { f.depthGray = null; f.depthGrayRaw = null; f.depthRGBARaw = null; f.global = null; }
+  // The colour copies are still needed: fusion has not read them yet.
+  for (const f of frames) { f.depthGray = null; f.depthGrayRaw = null; f.global = null; }
   const haveDepth = depthViews.filter((v) => v);
   if (haveDepth.length === 0) throw new Error('No depth maps could be computed. Add more overlapping photos.');
 
@@ -399,6 +466,10 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
     for (const v of depthViews) {
       if (!v) continue;
       const step = denseStep(v), R = v.R, t = v.t;
+      // The colour image is the same pinhole camera at a larger size, so a depth pixel maps
+      // into it by the ratio of their focal lengths about their own principal points.
+      const rw = v.rgbW || v.w, rh = v.rgbH || v.h, rk = (v.rgbF ?? v.f) / v.f;
+      const rcx = v.rgbCx ?? v.cx, rcy = v.rgbCy ?? v.cy;
       for (let y = 0; y < v.h; y += step) for (let x = 0; x < v.w; x += step) {
         const d = v.depth[y * v.w + x];
         if (!(d > 0)) continue;
@@ -406,7 +477,9 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
         dense[k] = R[0] * a + R[3] * b + R[6] * c;
         dense[k + 1] = R[1] * a + R[4] * b + R[7] * c;
         dense[k + 2] = R[2] * a + R[5] * b + R[8] * c;
-        const o = (y * v.w + x) * 4;
+        const rx = Math.min(rw - 1, Math.max(0, Math.round((x - v.cx) * rk + rcx)));
+        const ry = Math.min(rh - 1, Math.max(0, Math.round((y - v.cy) * rk + rcy)));
+        const o = (ry * rw + rx) * 4;
         denseColors[k] = v.rgb ? v.rgb[o] / 255 : 0.6;
         denseColors[k + 1] = v.rgb ? v.rgb[o + 1] / 255 : 0.6;
         denseColors[k + 2] = v.rgb ? v.rgb[o + 2] / 255 : 0.6;
@@ -457,15 +530,32 @@ export async function reconstruct(images, options = {}, progress = () => {}) {
   const nv = smoothed.length / 3;
   const positions = new Float32Array(nv * 3);
   const colors = new Float32Array(nv * 3);
+  const world = new Float64Array(nv * 3);
   for (let i = 0; i < nv; i++) {
-    const wx = vol.origin[0] + smoothed[i * 3] * vol.voxelSize;
-    const wy = vol.origin[1] + smoothed[i * 3 + 1] * vol.voxelSize;
-    const wz = vol.origin[2] + smoothed[i * 3 + 2] * vol.voxelSize;
-    const c = tsdf.sampleColor(wx, wy, wz);
+    world[i * 3] = vol.origin[0] + smoothed[i * 3] * vol.voxelSize;
+    world[i * 3 + 1] = vol.origin[1] + smoothed[i * 3 + 1] * vol.voxelSize;
+    world[i * 3 + 2] = vol.origin[2] + smoothed[i * 3 + 2] * vol.voxelSize;
+  }
+  progress('mesh', 0.6, 'Colouring the surface');
+  const shaded = colorVerticesFromViews(world, depthViews);
+  let fromVolume = 0;
+  for (let i = 0; i < nv; i++) {
+    const wx = world[i * 3], wy = world[i * 3 + 1], wz = world[i * 3 + 2];
     // Convert from the camera convention (y down, z forward) to y-up for viewing/export
     positions[i * 3] = wx; positions[i * 3 + 1] = -wy; positions[i * 3 + 2] = -wz;
-    colors[i * 3] = c[0] / 255; colors[i * 3 + 1] = c[1] / 255; colors[i * 3 + 2] = c[2] / 255;
+    if (shaded.covered[i]) {
+      colors[i * 3] = shaded.colors[i * 3]; colors[i * 3 + 1] = shaded.colors[i * 3 + 1]; colors[i * 3 + 2] = shaded.colors[i * 3 + 2];
+    } else {
+      // No view's depth map agrees that this vertex is what it sees there, so the colour the
+      // volume fused is all there is. This is why the volume still carries colour at all.
+      const c = tsdf.sampleColor(wx, wy, wz);
+      colors[i * 3] = c[0] / 255; colors[i * 3 + 1] = c[1] / 255; colors[i * 3 + 2] = c[2] / 255;
+      fromVolume++;
+    }
   }
+  log(`Coloured ${nv - fromVolume} of ${nv} vertices from the photographs, ${fromVolume} from the volume`);
+  for (const v of depthViews) if (v) v.rgb = null;
+  for (const f of frames) { f.colorRGBA = null; f.colorRGBARaw = null; }
   // Flipping two axes preserves handedness, so the winding stays valid.
   const normals = computeNormals(positions, mesh.indices);
 
