@@ -8,6 +8,8 @@ A dedicated security pass, separate from and later than the review in `REVIEW.md
 
 Every finding below was fixed on `claude/repo-review-security-baiyud` in c5738c6, each with a regression test that was checked by reverting the fix and confirming the test fails. The findings are kept as written so the reasoning behind each change stays with it.
 
+One exception, found by a later adversarial pass over those fixes and since closed: L4-2's fix is a flag in a CI workflow, and nothing in `test/` read that workflow, so it had no regression test at all while this section claimed otherwise. `test/workflow.test.js` is that test now — it fails if an install in CI loses `--ignore-scripts` or stops naming an exact version.
+
 These were deliberately left for a decision rather than guessed at:
 
 - L3-5 — no Content-Security-Policy. Shipping one means first removing the import map, which means editing the vendored three.js file the integrity check has just been tightened to require byte-identical to upstream; and frame-ancestors is ignored in a meta policy.

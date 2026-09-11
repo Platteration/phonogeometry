@@ -53,10 +53,16 @@ export class ShotStore {
     }
   }
 
+  /**
+   * Resolves true when the record is gone. A refused delete — a store in a read-only state, a
+   * blocked upgrade, the browser reclaiming storage mid-transaction — is reported rather than
+   * swallowed, because loadAll decides what to do about it: a record dropped from the restore
+   * *and* left on the disk is the worst of both, and is reachable by nothing afterwards.
+   */
   async deleteShot(id) {
     const db = await this.dbPromise;
-    if (!db) return;
-    try { await tx(db, 'readwrite', (s) => s.delete(id)); } catch { /* ignore */ }
+    if (!db) return false;
+    try { await tx(db, 'readwrite', (s) => s.delete(id)); return true; } catch { return false; }
   }
 
   async clear() {
@@ -66,22 +72,33 @@ export class ShotStore {
   }
 
   /**
-   * The shots worth restoring, oldest first. Anything past MAX_AGE_MS is deleted here as well
-   * as left out: a record that is not offered back to the user but stays on the disk is the
-   * worst of both, and a photograph with no createdAt to judge is treated as old.
+   * Resolves `{shots, expired}`: the shots worth restoring, oldest first, and how many were
+   * deleted for being older than MAX_AGE_MS. A photograph with no createdAt to judge is
+   * treated as old.
+   *
+   * Anything past MAX_AGE_MS is deleted here as well as left out: a record that is not offered
+   * back to the user but stays on the disk is the worst of both. The count comes back so the
+   * caller can say so — the person whose photographs were deleted is the one person who cannot
+   * tell that from a bug, since all they are shown is an empty screen.
+   *
+   * A delete the database refuses is not counted, and its record is kept in `shots`: it is
+   * still on the disk, so leaving it out of the list would hide it from the only interface
+   * that could delete it.
    */
   async loadAll() {
     const db = await this.dbPromise;
-    if (!db) return [];
+    if (!db) return { shots: [], expired: 0 };
     try {
       const all = await tx(db, 'readonly', (s) => s.getAll());
       const cutoff = Date.now() - MAX_AGE_MS;
-      const fresh = [];
+      const shots = [];
+      let expired = 0;
       for (const r of all || []) {
-        if (r.createdAt >= cutoff) fresh.push(r);
-        else await this.deleteShot(r.id);
+        if (r.createdAt >= cutoff) shots.push(r);
+        else if (await this.deleteShot(r.id)) expired++;
+        else shots.push(r);
       }
-      return fresh.sort((a, b) => a.createdAt - b.createdAt);
-    } catch { return []; }
+      return { shots: shots.sort((a, b) => a.createdAt - b.createdAt), expired };
+    } catch { return { shots: [], expired: 0 }; }
   }
 }

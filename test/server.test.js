@@ -57,7 +57,16 @@ test('ordinary files inside the project resolve to themselves', () => {
   assert.deepEqual(resolveRequest('/src/vision/'), { status: 200, file: path.join(root, 'src', 'vision', 'index.html') });
 });
 
-function request(port, urlPath, method = 'GET') {
+/**
+ * A request with a deadline of its own. The failure this guards against is not a refusal but
+ * a silence: a crash inside the request listener leaves the connection accepted and never
+ * answered, and this promise then never settles. A pending promise inside a test stalls the
+ * whole file — the runner's own `{ timeout }` does not rescue it, measured: with the control
+ * character check deleted, `node --test` printed no result for this test, no summary, and
+ * never exited. A client-side deadline turns that silence into a failed assertion, which is
+ * what a test is for.
+ */
+function request(port, urlPath, method = 'GET', deadlineMs = 5000) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: urlPath, method }, (res) => {
       let body = '';
@@ -65,13 +74,14 @@ function request(port, urlPath, method = 'GET') {
       res.on('data', (c) => { body += c; });
       res.on('end', () => resolve({ status: res.statusCode, body, headers: res.headers }));
     });
+    req.setTimeout(deadlineMs, () => req.destroy(new Error(`no response to ${method} ${urlPath} within ${deadlineMs} ms`)));
     req.on('error', reject);
     req.end();
   });
 }
 
-// Both live tests carry a timeout: a crash in the request listener leaves the socket hanging
-// rather than answering, and a stalled `npm test` reports nothing at all.
+// The live tests carry a runner timeout as well, as a backstop for a stall that happens
+// somewhere other than in a request.
 test('the running server survives the requests it refuses', { timeout: 15000 }, async (t) => {
   const server = await startServer({ port: 0, host: '127.0.0.1' });
   t.after(() => new Promise((r) => server.close(r)));
@@ -116,6 +126,53 @@ test('a read that fails after stat costs one response, not the server', { timeou
 
   const ok = await request(port, '/index.html');
   assert.equal(ok.status, 200);
+});
+
+// Asking for a file and walking away costs a client nothing. It must not cost the server a
+// file descriptor: `pipe` handles a failure of the *source* only, so when the destination
+// goes away it unpipes and leaves the fs.ReadStream open and paused, descriptor held,
+// autoClose never fired. Measured at 60 leaked for 60 abandoned downloads, still held
+// afterwards, unauthenticated on the LAN bind `npm run start:https` documents.
+test('a client that abandons a download does not leak the open file', { timeout: 20000 }, async (t) => {
+  const server = await startServer({ port: 0, host: '127.0.0.1' });
+  t.after(() => new Promise((r) => server.close(r)));
+  const port = server.address().port;
+
+  // The premise is the file's own size, measured here rather than assumed: it has to be
+  // bigger than the socket buffers, or the whole response is written before anyone can walk
+  // away and nothing is left holding a descriptor either way.
+  const big = path.join(root, 'vendor', 'three', 'three.module.min.js');
+  assert.ok(fs.statSync(big).size > 256 * 1024, 'this test needs a file larger than the socket buffer');
+
+  const opened = [];
+  const realCreateReadStream = fs.createReadStream;
+  t.mock.method(fs, 'createReadStream', (...args) => {
+    const stream = realCreateReadStream(...args);
+    opened.push(stream);
+    return stream;
+  });
+
+  const n = 20;
+  await Promise.all(Array.from({ length: n }, () => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/vendor/three/three.module.min.js' }, (res) => {
+      res.once('data', () => { req.destroy(); resolve(); });   // first chunk, then gone
+    });
+    req.on('error', () => resolve());
+    req.end();
+  })));
+  await new Promise((r) => setTimeout(r, 300));
+  t.mock.restoreAll();
+
+  assert.equal(opened.length, n, `${opened.length} reads for ${n} requests`);
+  const stillOpen = opened.filter((s) => !s.destroyed).length;
+  assert.equal(stillOpen, 0, `${stillOpen} of ${n} reads left open by clients that went away`);
+  // And the descriptors themselves are back, where the platform will say so.
+  if (fs.existsSync('/proc/self/fd')) {
+    const held = fs.readdirSync('/proc/self/fd').filter((fd) => {
+      try { return fs.readlinkSync(`/proc/self/fd/${fd}`) === big; } catch { return false; }
+    }).length;
+    assert.equal(held, 0, `${held} descriptors still open on the file`);
+  }
 });
 
 test('the server binds loopback only unless told otherwise', async (t) => {

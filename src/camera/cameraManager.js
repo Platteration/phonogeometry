@@ -2,16 +2,53 @@
 // same time, and captures synchronised frames from all of them.
 import { guessFacing, guessLens, loadLensOverrides, intrinsicsFor } from './intrinsics.js';
 
+/**
+ * Wait for the first frame of a stream, or give up.
+ *
+ * The deadline is armed with setTimeout and only the polling uses animation frames. It used
+ * to be evaluated inside the rAF callback itself, which means it was never evaluated at all
+ * in a tab the browser had stopped painting — and a hidden tab is exactly when this app is
+ * running, since a reconstruction takes minutes and people switch away from it.
+ */
 function waitForVideo(video, timeoutMs = 4000) {
   return new Promise((resolve) => {
-    const start = performance.now();
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; clearTimeout(timer); resolve(ok); } };
+    const timer = setTimeout(() => finish(false), timeoutMs);
     const check = () => {
-      if (video.readyState >= 2 && video.videoWidth > 0) return resolve(true);
-      if (performance.now() - start > timeoutMs) return resolve(false);
+      if (settled) return;
+      if (video.readyState >= 2 && video.videoWidth > 0) return finish(true);
       requestAnimationFrame(check);
     };
     check();
   });
+}
+
+/**
+ * Reject with `message` if `promise` has not settled within `ms`.
+ *
+ * A promise that never settles is a different failure from one that rejects, and the camera
+ * path is full of the first kind: `video.play()` for a track that grants but delivers no
+ * frames simply never settles, and `getUserMedia` on a lens the system is still tearing down
+ * can sit there too. Anything awaited with no deadline turns one stuck lens into an app that
+ * is waiting forever with nothing on screen to say so.
+ */
+function withDeadline(promise, ms, message) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutError(message)), ms); }),
+  ]);
+}
+
+function timeoutError(message) {
+  const err = new Error(message);
+  err.name = 'TimeoutError';
+  return err;
+}
+
+function stopStream(stream) {
+  try { stream.getTracks().forEach((t) => t.stop()); } catch { /* already gone */ }
 }
 
 export class CameraManager extends EventTarget {
@@ -23,6 +60,19 @@ export class CameraManager extends EventTarget {
     // camera at a time is closed and reopened during a capture, and the preview tile holds
     // whichever element it was given: handing it a new one each time would leave it blank.
     this.videos = new Map(); // deviceId -> HTMLVideoElement
+    // Opens that have started and not yet finished. A stream lives here from the moment
+    // getUserMedia hands it over until it is either registered in `open` or stopped, so there
+    // is no window in which the app holds a live lens it cannot close.
+    this.attempts = new Set(); // {cam, stream, cancelled, gen}
+    // Bumped by every close. An open that started before the current value has been overtaken
+    // by a close and must not register the stream it is about to receive.
+    this.closeGen = 0;
+    // While an open sequence is running, the time it is allowed to run until. See openSequence.
+    this.sequenceUntil = 0;
+    // How long each step may take, in milliseconds. Fields rather than constants so a test
+    // can make them short: `open` covers the whole of openCamera, including getUserMedia, so
+    // no step inside it can outlast it.
+    this.timeouts = { open: 10000, play: 4000, frames: 4000 };
     this.supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   }
 
@@ -60,13 +110,51 @@ export class CameraManager extends EventTarget {
     return this.cameras;
   }
 
-  async openCamera(cam, { width = 1280, height = 720 } = {}) {
+  /**
+   * Open one camera, with a deadline on the whole attempt.
+   *
+   * Every failure path — a rejection, the deadline, a close that overtook this open — stops
+   * the stream if one was acquired. A MediaStream that reaches nobody is a lens that keeps
+   * streaming with the app unable to release it: neither closeAll nor the pagehide handler
+   * can reach what is not in `open`.
+   */
+  async openCamera(cam, opts = {}) {
     if (this.open.has(cam.deviceId)) return this.open.get(cam.deviceId);
+    const attempt = { cam, stream: null, cancelled: false, gen: this.closeGen };
+    this.attempts.add(attempt);
+    try {
+      return await withDeadline(
+        this.openStream(cam, attempt, opts),
+        this.timeouts.open,
+        `${cam.shortLabel || cam.label} did not open in time`,
+      );
+    } catch (err) {
+      this.cancelAttempt(attempt);
+      throw err;
+    } finally {
+      this.attempts.delete(attempt);
+    }
+  }
+
+  /** True once a close has overtaken this open, or the attempt was abandoned. */
+  stale(attempt) { return attempt.cancelled || attempt.gen !== this.closeGen; }
+
+  /** Abandon an open: stop the stream it holds, and the one it has not received yet. */
+  cancelAttempt(attempt) {
+    attempt.cancelled = true;
+    if (attempt.stream) { stopStream(attempt.stream); attempt.stream = null; }
+  }
+
+  async openStream(cam, attempt, { width = 1280, height = 720 } = {}) {
     const constraints = {
       audio: false,
       video: { deviceId: { exact: cam.deviceId }, width: { ideal: width }, height: { ideal: height } },
     };
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Registered before anything else can be awaited, and checked immediately: a close that
+    // happened while getUserMedia was in flight has to reach this stream too.
+    attempt.stream = stream;
+    if (this.stale(attempt)) { this.cancelAttempt(attempt); throw new Error('Camera closed while it was opening'); }
     const track = stream.getVideoTracks()[0];
     const settings = track.getSettings ? track.getSettings() : {};
     try {
@@ -85,13 +173,20 @@ export class CameraManager extends EventTarget {
       this.videos.set(cam.deviceId, video);
     }
     video.srcObject = stream;
-    try { await video.play(); } catch { /* autoplay policies: the frame check below still works */ }
-    const ready = await waitForVideo(video);
-    if (!ready) {
-      stream.getTracks().forEach((t) => t.stop());
-      throw new Error('Camera did not deliver frames');
+    // Two different failures, one line apart. A play() the browser refuses (an autoplay
+    // policy) rejects, and the frame check below still works — that is the old comment and it
+    // is true. A play() for a track that grants but delivers no frames never settles at all,
+    // and no catch handles a promise that never rejects: this await had no deadline, and it
+    // is the one that actually hangs. The frame wait one line down has had a deadline all
+    // along; what it lacked was a way to evaluate it without animation frames.
+    try { await withDeadline(video.play(), this.timeouts.play, 'play() did not settle'); } catch { /* fall through to the frame check */ }
+    const ready = await waitForVideo(video, this.timeouts.frames);
+    if (!ready || this.stale(attempt)) {
+      this.cancelAttempt(attempt);
+      throw new Error(ready ? 'Camera closed while it was opening' : 'Camera did not deliver frames');
     }
     const entry = { cam, stream, track, video, settings };
+    attempt.stream = null;   // handed over: `open` owns it from here
     this.open.set(cam.deviceId, entry);
     track.addEventListener('ended', () => { this.open.delete(cam.deviceId); this.dispatchEvent(new CustomEvent('ended', { detail: cam })); });
     return entry;
@@ -109,14 +204,63 @@ export class CameraManager extends EventTarget {
         const entry = await this.openCamera(cam, opts);
         results.push({ cam, ok: true, entry });
       } catch (err) {
-        results.push({ cam, ok: false, error: err.message || String(err) });
+        // The name as well as the message: what the interface may promise about a camera that
+        // is not open depends on which failure it was, and the message alone cannot say.
+        results.push({ cam, ok: false, error: err.message || String(err), name: err.name });
       }
     }
     this.dispatchEvent(new CustomEvent('opened', { detail: results }));
     return results;
   }
 
+  /**
+   * Open a list of cameras one after another for as long as the reason for opening them
+   * holds. Resolves `{results, cancelled}`, or `null` when a sequence is already running.
+   *
+   * `shouldContinue` is asked again after every open, not once at entry. One getUserMedia per
+   * lens is 200-800 ms on a phone and there can be four of them, so the screen these cameras
+   * belong to can be gone long before the loop ends — and `closeAll` can only close what is
+   * already in `open`. A camera that came up after that point is closed here instead of
+   * streaming on, with the OS indicator lit, for the whole of a reconstruction.
+   */
+  async openSequence(list, opts = {}, shouldContinue = () => true) {
+    // The latch is a deadline rather than a flag. A flag cleared only in a `finally` stays set
+    // for the life of the page if an awaited open never settles, and every later attempt to
+    // open a camera then returns at the top having done nothing: the app silently stops being
+    // a scanner until it is reloaded. Each open below carries its own deadline; this one only
+    // has to outlast all of them.
+    if (Date.now() < this.sequenceUntil) return null;
+    this.sequenceUntil = Date.now() + (list.length + 1) * (this.timeouts.open + 500);
+    const results = [];
+    let cancelled = false;
+    try {
+      for (const cam of list) {
+        if (!shouldContinue()) { cancelled = true; break; }
+        const gen = this.closeGen;
+        try {
+          const entry = await this.openCamera(cam, opts);
+          // A close during the open (a screen change, a capture taking the cameras) counts
+          // even when the predicate cannot see it.
+          if (!shouldContinue() || this.closeGen !== gen) {
+            this.closeCamera(cam.deviceId);
+            cancelled = true;
+            break;
+          }
+          results.push({ cam, ok: true, entry });
+        } catch (err) {
+          results.push({ cam, ok: false, error: err.message || String(err), name: err.name });
+          if (!shouldContinue() || this.closeGen !== gen) { cancelled = true; break; }
+        }
+      }
+      return { results, cancelled };
+    } finally { this.sequenceUntil = 0; }
+  }
+
   closeCamera(deviceId) {
+    // Bumped whether or not this camera is open: an open that is in flight for it has to be
+    // overtaken too, or it registers a stream nobody asked for any more.
+    this.closeGen++;
+    for (const attempt of this.attempts) if (attempt.cam.deviceId === deviceId) this.cancelAttempt(attempt);
     const entry = this.open.get(deviceId);
     if (!entry) return;
     entry.stream.getTracks().forEach((t) => t.stop());
@@ -126,6 +270,10 @@ export class CameraManager extends EventTarget {
   }
 
   closeAll() {
+    this.closeGen++;
+    // Cameras still opening are not in `open`, so closing that map alone would leave them
+    // streaming the moment they arrive. This is what makes a close able to cancel a reopen.
+    for (const attempt of this.attempts) this.cancelAttempt(attempt);
     for (const id of Array.from(this.open.keys())) this.closeCamera(id);
   }
 

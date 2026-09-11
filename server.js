@@ -8,6 +8,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pipeline } from 'node:stream';
 import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -75,7 +76,15 @@ export function handler(req, res) {
     // stat and open are two calls: a file removed or made unreadable between them raises an
     // 'error' event on the stream, and an unhandled one ends the process as surely as the
     // throw above. The headers are already out, so the honest answer is a dropped response.
-    fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
+    //
+    // pipeline, not pipe, and not a bare 'error' listener: pipe handles a failure of the
+    // *source* only. When the destination goes away instead — a client that asks for a file
+    // and walks away mid-transfer, which costs it nothing — pipe unpipes and leaves the
+    // fs.ReadStream paused with its descriptor held, and autoClose never fires. That is one
+    // descriptor per abandoned request, never released, from anything that can reach the
+    // port; `npm run start:https` binds the LAN. pipeline destroys both ends whichever one
+    // fails.
+    pipeline(fs.createReadStream(file), res, () => { /* either end failing costs this one response */ });
   });
 }
 

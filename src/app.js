@@ -109,8 +109,20 @@ function renderCameraTiles(results) {
       tile.appendChild(entry.video);
       tile.insertAdjacentHTML('beforeend', '<span class="cam-dot" title="Live"></span>');
     } else {
-      const msg = res && !res.ok ? `Cannot stream simultaneously.<br>Will capture sequentially.` : 'Not open';
-      tile.insertAdjacentHTML('beforeend', `<div class="cam-error">${msg}</div>`);
+      // "Cannot stream simultaneously. Will capture sequentially" is a promise, and it is only
+      // true of the failure it was written for. A permission revoked between a release and a
+      // reopen, a lens claimed by another app, a constraint the device refuses: those will
+      // fail again at the shutter, and saying otherwise sends the user on shooting a scan
+      // that is missing a camera. The reason comes from the platform, so it is set as text.
+      const box = el('div', 'cam-error');
+      if (res && !res.ok && willCaptureSequentially(res)) {
+        box.append('Cannot stream simultaneously.', document.createElement('br'), 'Will capture sequentially.');
+      } else if (res && !res.ok) {
+        box.append('Not available.', document.createElement('br'), res.error || 'Unknown error');
+      } else {
+        box.textContent = 'Not open';
+      }
+      tile.appendChild(box);
       if (res && !res.ok) tile.classList.add('failed');
     }
     // Labels come from the operating system, so they are set as text rather than pasted
@@ -144,11 +156,10 @@ async function startCameras() {
     if (cams.cameras.length === 0) throw new Error('No cameras found.');
     $('#camera-status').textContent = `Found ${cams.cameras.length} camera${cams.cameras.length > 1 ? 's' : ''}. Opening all of them…`;
     const results = await cams.openAll(streamSize());
-    const live = results.filter((r) => r.ok).length;
     renderCameraTiles(results);
-    const seq = results.length - live;
-    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live` + (seq ? `, ${seq} will be captured sequentially (the phone limits concurrent streams).` : '.');
-    $('#btn-capture').disabled = live + seq === 0;
+    // Counting every failure as one the sequential fallback will pick up is what made a
+    // permission failure read as a concurrency limit; reportCameras tells them apart.
+    reportCameras(results);
     btn.textContent = 'Re-scan cameras';
   } catch (err) {
     $('#camera-status').textContent = `Camera access failed: ${err.message}. You can still import photos below.`;
@@ -158,22 +169,52 @@ async function startCameras() {
   }
 }
 
-let reopening = false;
+// The failures the sequential fallback actually works around: the lens is there, and the phone
+// will not run it alongside the others. Anything else fails the same way when the fallback
+// tries it, so the interface must not promise a capture that is not coming.
+const BUSY_ERRORS = new Set(['NotReadableError', 'AbortError', 'TrackStartError']);
+function willCaptureSequentially(res) {
+  if (!$('#chk-sequential').checked) return false;
+  // A failure carried with no name of its own is the app's own note that a camera was left out
+  // of a concurrent open, which is this case by construction.
+  return !res.name || BUSY_ERRORS.has(res.name);
+}
+
+/** Say what the cameras are doing, and stop offering a shutter that cannot capture anything. */
+function reportCameras(results, what = 'streaming live') {
+  const live = cams.cameras.filter((c) => c.enabled && cams.open.has(c.deviceId)).length;
+  const sequential = results.filter((r) => !r.ok && willCaptureSequentially(r)).length;
+  const broken = results.filter((r) => !r.ok && !willCaptureSequentially(r));
+  $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} ${what}`
+    + (sequential ? `, ${sequential} will be captured sequentially (the phone limits concurrent streams).` : '.')
+    + (broken.length ? ` ${broken.length} unavailable: ${broken.map((r) => r.error).join('; ')}` : '');
+  $('#btn-capture').disabled = live + sequential === 0;
+  // A reopen that fails is otherwise silent: the preview tile is dark, the status line still
+  // shows the last shot, and the first anyone hears of it is a capture with no frames in it.
+  if (broken.length && !live && !sequential) toast(`Cameras unavailable: ${broken[0].error}`, 6000);
+}
+
+/**
+ * Open every enabled camera that is not streaming, because the screen that owns them is back.
+ *
+ * Whether they are still wanted is asked again after every open rather than once at entry:
+ * one getUserMedia per lens is 200-800 ms on a phone, `closeAll` can only close what is
+ * already in `cams.open`, and a camera that comes up after the screen has gone would stream
+ * for the whole of a reconstruction with nothing left that could stop it.
+ */
 async function reopenCameras() {
   // A capture in flight releases and reopens cameras as it goes (the sequential fallback),
   // so opening one here would be opening it underneath that.
-  if (reopening || state.capturing || !cams.cameras.length || $('#screen-capture').hidden) return;
+  const wanted = () => !state.capturing && !$('#screen-capture').hidden;
+  if (!wanted() || !cams.cameras.length) return;
   const missing = cams.cameras.filter((c) => c.enabled && !cams.open.has(c.deviceId));
   if (!missing.length) return;
-  reopening = true;
-  try {
-    const results = [];
-    for (const cam of missing) {
-      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, streamSize()) }); }
-      catch (err) { results.push({ cam, ok: false, error: err.message }); }
-    }
-    renderCameraTiles(results);
-  } finally { reopening = false; }
+  const outcome = await cams.openSequence(missing, streamSize(), wanted);
+  // null: another sequence is already running, and it is opening the same cameras. cancelled:
+  // the screen went away, and openSequence has already closed whatever came up after it did.
+  if (!outcome || outcome.cancelled || !wanted()) return;
+  renderCameraTiles(outcome.results);
+  reportCameras(outcome.results);
 }
 
 /**
@@ -182,29 +223,25 @@ async function reopenCameras() {
  */
 async function applyCaptureResolution() {
   const reopen = cams.cameras.filter((c) => cams.open.has(c.deviceId));
-  if (!reopen.length || reopening) return;
-  reopening = true;
-  try {
-    $('#camera-status').textContent = `Reopening the cameras at ${captureMaxDim()} px…`;
-    for (const cam of reopen) cams.closeCamera(cam.deviceId);
-    const results = [];
-    for (const cam of reopen) {
-      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, streamSize()) }); }
-      catch (err) { results.push({ cam, ok: false, error: err.message }); }
-    }
-    // The cameras this phone refused to stream alongside the others were never in `open`, so
-    // they are not among the reopened ones either. Carry them through as failures: a tile with
-    // no result of its own falls back to a bare "Not open", losing the reason it is dark and
-    // the promise that it will still be captured.
-    for (const cam of cams.cameras) {
-      if (cam.enabled && !results.some((r) => r.cam === cam)) results.push({ cam, ok: false, error: 'Cannot stream alongside the others' });
-    }
-    renderCameraTiles(results);
-    const live = results.filter((r) => r.ok).length;
-    const seq = results.length - live;
-    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live at up to ${captureMaxDim()} px`
-      + (seq ? `, ${seq} will be captured sequentially (the phone limits concurrent streams).` : '.');
-  } finally { reopening = false; }
+  if (!reopen.length) return;
+  const wanted = () => !state.capturing && !$('#screen-capture').hidden;
+  if (!wanted()) return;
+  $('#camera-status').textContent = `Reopening the cameras at ${captureMaxDim()} px…`;
+  for (const cam of reopen) cams.closeCamera(cam.deviceId);
+  // Same discipline as a reopen, and the same reason: these opens are one getUserMedia each,
+  // and the screen can go away in the middle of them.
+  const outcome = await cams.openSequence(reopen, streamSize(), wanted);
+  if (!outcome || outcome.cancelled || !wanted()) return;
+  const results = outcome.results;
+  // The cameras this phone refused to stream alongside the others were never in `open`, so
+  // they are not among the reopened ones either. Carry them through as failures: a tile with
+  // no result of its own falls back to a bare "Not open", losing the reason it is dark and
+  // the promise that it will still be captured.
+  for (const cam of cams.cameras) {
+    if (cam.enabled && !results.some((r) => r.cam === cam)) results.push({ cam, ok: false, error: 'Cannot stream alongside the others' });
+  }
+  renderCameraTiles(results);
+  reportCameras(results, `streaming live at up to ${captureMaxDim()} px`);
 }
 
 function renderLensSettings() {
@@ -279,8 +316,11 @@ function persistShot(shot) {
   if (!askedToPersist && navigator.storage?.persist) {
     askedToPersist = true;
     // Ask the browser not to evict these photographs while a scan is in progress. Nothing can
-    // take that request back, so what bounds it is ShotStore's own retention: it deletes a
-    // scan a day after it was taken.
+    // take that request back, and what bounds it is ShotStore's retention — which runs when
+    // the app is opened, not on a clock: a scan more than a day old is deleted the next time
+    // somebody launches this, which for an app that is never opened again is never. Eviction
+    // was the one mechanism that would have removed it, and this asks for that to be turned
+    // off, so this grant is the thing to reconsider first if the residue matters.
     navigator.storage.persisted?.().then((already) => already || navigator.storage.persist()).catch(() => {});
   }
   store.saveShot(shot).then((outcome) => {
@@ -398,12 +438,27 @@ function flagSoftFrames() {
   markSoftFrames(all);
 }
 
+/**
+ * Put back what the last session left, and say what happened to the rest.
+ *
+ * The deletion is told to the person it happened to. It used to be announced only to whoever
+ * still had shots — the message sat after an early return taken when the list came back empty,
+ * which is exactly the case where everything had just been deleted. That person got an empty
+ * capture screen, a shot count of zero and not one word anywhere: indistinguishable from the
+ * scan having been lost to a bug, which is the thing the store exists to prevent.
+ */
 async function restoreShots() {
-  const saved = await store.loadAll();
-  if (!saved.length) return;
-  state.shots = saved.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
-  renderShots(); updateCounts();
-  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session. The photos stay on this device until you press Clear, or until they are a day old.`, 5000);
+  const { shots, expired } = await store.loadAll();
+  if (shots.length) {
+    state.shots = shots.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
+    renderShots(); updateCounts();
+  }
+  const said = [];
+  if (shots.length) said.push(`Restored ${shots.length} shot${shots.length === 1 ? '' : 's'} from your previous session.`);
+  if (expired) said.push(`${expired} shot${expired === 1 ? '' : 's'} from more than a day ago ${expired === 1 ? 'was' : 'were'} deleted.`);
+  if (!said.length) return;
+  said.push('Photos stay on this device until you press Clear, or until they are a day old.');
+  toast(said.join(' '), 6000);
 }
 
 // ---------- Reconstruction ----------
