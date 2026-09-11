@@ -3,3 +3,7 @@ node_modules/
 *.log
 .DS_Store
 scratch/
+
+# Secrets: ignore every .env variant, but keep the documented template.
+.env*
+!.env.example
