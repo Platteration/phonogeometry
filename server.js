@@ -34,6 +34,11 @@ export function resolveRequest(url) {
     // that ends the process, so anyone who can reach the port could stop the dev server.
     return { status: 400 };
   }
+  // `%00` is the escape that does not throw: decodeURIComponent hands back a real NUL, and
+  // fs.stat then rejects it by throwing *synchronously* inside the request listener — the
+  // same process-ending shape one step later. Refuse every control character while here, so
+  // a raw CR or LF cannot reach a header either.
+  if (/[\u0000-\u001f]/.test(urlPath)) return { status: 400 };
   if (urlPath.endsWith('/')) urlPath += 'index.html';
   const file = path.normalize(path.join(root, urlPath));
   // path.relative, not a startsWith prefix test: `/..%2fphonogeometry-old/.env` keeps its
@@ -67,7 +72,10 @@ export function handler(req, res) {
       'Cross-Origin-Opener-Policy': 'same-origin',
     });
     if (req.method === 'HEAD') return res.end();
-    fs.createReadStream(file).pipe(res);
+    // stat and open are two calls: a file removed or made unreadable between them raises an
+    // 'error' event on the stream, and an unhandled one ends the process as surely as the
+    // throw above. The headers are already out, so the honest answer is a dropped response.
+    fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
   });
 }
 

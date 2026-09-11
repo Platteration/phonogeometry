@@ -20,6 +20,7 @@ function fakeDb({ writeFails = false } = {}) {
         objectStore: () => ({
           put: (record) => { written.set(record.id, record); return { result: record.id }; },
           getAll: () => ({ result: Array.from(written.values()) }),
+          delete: (id) => { written.delete(id); return { result: undefined }; },
         }),
       };
       // The handlers are attached after this call returns, as they are on a real transaction.
@@ -87,7 +88,26 @@ test('the other operations still do nothing quietly without a database', async (
 test('saved shots come back oldest first', async () => {
   useIndexedDb(fakeDb());
   const store = new ShotStore();
-  await store.saveShot({ ...shot, id: 'b', createdAt: 20 });
-  await store.saveShot({ ...shot, id: 'a', createdAt: 10 });
+  await store.saveShot({ ...shot, id: 'b', createdAt: Date.now() - 1000 });
+  await store.saveShot({ ...shot, id: 'a', createdAt: Date.now() - 2000 });
   assert.deepEqual((await store.loadAll()).map((r) => r.id), ['a', 'b']);
+});
+
+// These are photographs of rooms and of people on a device that gets lent and handed on. The
+// store exists so a tab that reloads mid-scan does not lose one, which is a matter of hours.
+test('a scan older than the restore window is deleted rather than restored', async () => {
+  const db = fakeDb();
+  useIndexedDb(db);
+  const store = new ShotStore();
+  const hour = 60 * 60 * 1000;
+  await store.saveShot({ ...shot, id: 'yesterday', createdAt: Date.now() - 25 * hour });
+  await store.saveShot({ ...shot, id: 'this-morning', createdAt: Date.now() - 2 * hour });
+  // saveShot stamps every record it writes, so a record with no timestamp is one that was
+  // written by an older version or tampered with. Put it in behind the store's back.
+  db.written.set('undated', { id: 'undated', frames: shot.frames });
+
+  assert.deepEqual((await store.loadAll()).map((r) => r.id), ['this-morning']);
+  // Left out of the restore *and* gone from the database: one without the other is the worst
+  // of both. A record with no timestamp to judge goes with them.
+  assert.deepEqual(Array.from(db.written.keys()), ['this-morning']);
 });

@@ -7,6 +7,7 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { resolveRequest, startServer } from '../server.js';
 
@@ -16,6 +17,17 @@ test('a malformed percent-escape is a bad request, not a crash', () => {
   assert.equal(resolveRequest('/%').status, 400);
   assert.equal(resolveRequest('/%zz').status, 400);
   assert.equal(resolveRequest('/ok/%E0%A4%A').status, 400);
+});
+
+test('a NUL byte in the path is refused before it reaches fs', () => {
+  // %00 is the escape decodeURIComponent does not throw on: it hands back a real NUL, and
+  // this is what fs then does with one, inside the request listener and before any callback.
+  assert.throws(() => fs.stat(path.join(root, 'a\u0000b'), () => {}), { code: 'ERR_INVALID_ARG_VALUE' });
+  for (const url of ['/a%00b', '/%00', '/index.html%00.png', '/src/%00app.js', 'http://evil/%00']) {
+    assert.equal(resolveRequest(url).status, 400, url);
+  }
+  // Every other control character goes the same way, so a raw CR or LF cannot reach a header.
+  assert.equal(resolveRequest('/a%0d%0aX-Evil:%201').status, 400);
 });
 
 test('an escaped slash cannot walk out of the project directory', () => {
@@ -58,12 +70,16 @@ function request(port, urlPath, method = 'GET') {
   });
 }
 
-test('the running server survives the requests it refuses', async (t) => {
+// Both live tests carry a timeout: a crash in the request listener leaves the socket hanging
+// rather than answering, and a stalled `npm test` reports nothing at all.
+test('the running server survives the requests it refuses', { timeout: 15000 }, async (t) => {
   const server = await startServer({ port: 0, host: '127.0.0.1' });
   t.after(() => new Promise((r) => server.close(r)));
   const port = server.address().port;
 
   assert.equal((await request(port, '/%')).status, 400);
+  assert.equal((await request(port, '/a%00b')).status, 400);
+  assert.equal((await request(port, '/index.html%00.png')).status, 400);
   assert.equal((await request(port, '/.gitignore')).status, 403);
   assert.equal((await request(port, '/index.html', 'POST')).status, 405);
   assert.equal((await request(port, '/does-not-exist.js')).status, 404);
@@ -77,6 +93,29 @@ test('the running server survives the requests it refuses', async (t) => {
   const head = await request(port, '/index.html', 'HEAD');
   assert.equal(head.status, 200);
   assert.equal(head.body, '');
+});
+
+test('a read that fails after stat costs one response, not the server', { timeout: 15000 }, async (t) => {
+  const server = await startServer({ port: 0, host: '127.0.0.1' });
+  t.after(() => new Promise((r) => server.close(r)));
+  const port = server.address().port;
+
+  // stat and open are two calls, so a file can go away between them. Without an 'error'
+  // listener on the stream that is an unhandled event, which ends the process.
+  t.mock.method(fs, 'createReadStream', () => {
+    const stream = new Readable({ read() {} });
+    queueMicrotask(() => stream.emit('error', Object.assign(new Error('gone'), { code: 'ENOENT' })));
+    return stream;
+  });
+  const doomed = http.request({ host: '127.0.0.1', port, path: '/index.html' });
+  doomed.on('error', () => {});   // that response is dropped mid-flight, which is the point
+  doomed.end();
+  await new Promise((r) => setTimeout(r, 100));
+  doomed.destroy();
+  t.mock.restoreAll();
+
+  const ok = await request(port, '/index.html');
+  assert.equal(ok.status, 200);
 });
 
 test('the server binds loopback only unless told otherwise', async (t) => {

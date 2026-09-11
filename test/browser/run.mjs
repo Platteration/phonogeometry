@@ -144,6 +144,35 @@ async function main() {
       const liveTiles = await page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.videoWidth > 0 && !v.paused).length);
       check(`${label}: the previews are still live afterwards`, liveTiles === Math.min(3, limit), `${liveTiles} live of ${Math.min(3, limit)} expected`);
 
+      if (limit === 3) {
+        // The cameras belong to the capture screen. A build runs for minutes on a phone that
+        // is already hot, and the OS indicator stays lit through all of it while nothing is
+        // being captured. Held track objects are what says so: closing a stream also clears
+        // the <video>'s srcObject, so counting live previews would pass on a detached but
+        // still-running track.
+        await page.evaluate(() => {
+          window.__tracks = [];
+          for (const v of document.querySelectorAll('video')) for (const t of v.srcObject?.getVideoTracks() || []) window.__tracks.push(t);
+        });
+        const states = () => page.evaluate(() => window.__tracks.map((t) => t.readyState));
+        const before = await states();
+        await page.click('#btn-reconstruct');
+        await page.waitForFunction(() => document.querySelector('#screen-capture').hidden, null, { timeout: 20000 });
+        await page.waitForTimeout(400);
+        const during = await states();
+        // A build that fails fast can put the preview on screen instead, which carries the
+        // other stop button.
+        await page.click(await page.$eval('#screen-process', (e) => e.hidden) ? '#btn-cancel-build' : '#btn-cancel');
+        await page.waitForFunction(() => !document.querySelector('#screen-capture').hidden, null, { timeout: 20000 });
+        const liveNow = () => page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.srcObject?.getVideoTracks().some((t) => t.readyState === 'live')).length);
+        // Reopening is one getUserMedia per lens, so give them all a moment to come back.
+        for (let i = 0; i < 40 && (await liveNow()) < 3; i++) await page.waitForTimeout(250);
+        const live = await liveNow();
+        check(`${label}: the cameras stop while a build runs, and come back with the screen`,
+          before.length === 3 && before.every((r) => r === 'live') && during.every((r) => r === 'ended') && live === 3,
+          `before ${before.join(',')} · during ${during.join(',')} · after ${live} live`);
+      }
+
       if (limit === 1) {
         // Changing the capture resolution reopens the streams. Only the cameras that were
         // open can be reopened, so the ones this phone will not run alongside the others are

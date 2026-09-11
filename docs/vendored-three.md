@@ -15,8 +15,15 @@ up if it is possible to say exactly what those files are, so this is the record.
   what the checksums above are for. `OrbitControls.js` imports the bare specifier `three`,
   which the import map in `index.html` resolves to the file next to it.
 
-`test/vendor.test.js` recomputes these checksums on every `npm test`, so an edit to a vendored
-file — or an update that forgets this page — fails the suite rather than passing quietly.
+`test/vendor.test.js` recomputes these checksums on every `npm test` and compares each one with
+its own row, so an edit to a vendored file — or an update that forgets this page — fails the
+suite rather than passing quietly. That is a consistency check and not a provenance one: this
+page sits in the same tree as the files, so a changed blob committed with a changed row agrees
+with itself. `npm run verify:vendor` (`tools/verify-three.js`) is the half that cannot be edited
+into agreement — it downloads `three@<version>` from the registry, checks the tarball against
+`dist.integrity` and against the signature the registry publishes for it, and then requires each
+file above to be byte-identical to the published one. It needs the network, so CI runs it as a
+job of its own rather than inside `npm test`.
 
 ## Verifying or updating
 
@@ -27,6 +34,7 @@ sha256sum package/build/three.module.min.js package/examples/jsm/controls/OrbitC
 ```
 
 Copy those three files into `vendor/three/`, put the new version and checksums in the table
-above, and check the viewer still loads (`npm run test:browser` drives it end to end). Watch
+above, run `npm run verify:vendor` to confirm the copies are the published bytes, and check the
+viewer still loads (`npm run test:browser` drives it end to end). Watch
 the [three.js release notes](https://github.com/mrdoob/three.js/releases) for anything that
 matters to a `WebGLRenderer` plus `OrbitControls` viewer; nothing else of the library is used.

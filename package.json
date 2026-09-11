@@ -8,6 +8,7 @@
     "start:https": "node server.js --https",
     "test": "node --test \"test/**/*.test.js\"",
     "icons": "node tools/make-icons.js",
+    "verify:vendor": "node tools/verify-three.js",
     "test:browser": "node test/browser/run.mjs"
   },
   "engines": {

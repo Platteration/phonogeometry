@@ -19,6 +19,19 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm test
 
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      # The checksums in the tree only prove the note and the vendored files agree with each
+      # other, which a backdoored copy plus an edited note also manages. This compares the
+      # bytes with the signed package on the registry, so it needs the network and cannot be
+      # part of `npm test`.
+      - run: npm run verify:vendor
+
   browser:
     runs-on: ubuntu-latest
     steps:
@@ -27,8 +40,10 @@ jobs:
         with:
           node-version: 22
       # The app has no dependencies and no lockfile, so Playwright is pinned here and
-      # installed for this job only, without touching package.json.
-      - run: npm install --no-save --no-package-lock playwright@1.56.1
+      # installed for this job only, without touching package.json. --ignore-scripts because
+      # the only install script in that tree is skipped today by a field the package itself
+      # controls (fsevents' `os: ["darwin"]`), which is not a decision to delegate.
+      - run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.56.1
       - run: npx playwright install --with-deps chromium
       # REQUIRE_BROWSER makes a missing browser a failure: the suite skips itself by design
       # when run on a bare checkout, which would otherwise make this job pass without testing.

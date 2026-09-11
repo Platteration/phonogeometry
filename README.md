@@ -52,7 +52,7 @@ The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (sam
 
 On a desktop browser you can use **Import photos** instead of the cameras.
 
-Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phones do this under memory pressure) they are restored when you come back.
+Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phones do this under memory pressure) they are restored when you come back. They are photographs, and they are on the device: they outlive the tab and the browser, and the app asks the browser not to evict them, so they are still there when the app is next opened — by whoever is holding the phone. **Clear** deletes them, and so does **New scan**; a scan older than a day is deleted the next time the app opens.
 
 ### Scanning tips
 

@@ -1,5 +1,9 @@
 // Service worker: offline-capable app shell (all code, including three.js, is served from this origin).
-const VERSION = 'phonogeometry-v16';
+// Cache Storage is partitioned by origin, not by worker scope, so on a shared static host
+// (GitHub Pages puts every project of an account on one origin) this worker sees the caches
+// of every other app there. The prefix is what tells its own caches from theirs.
+const PREFIX = 'phonogeometry-';
+const VERSION = `${PREFIX}v17`;
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'src/app.js', 'src/storage.js', 'src/camera/cameraManager.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
@@ -14,7 +18,7 @@ self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
-  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
+  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith(PREFIX) && k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
 // Only the shell is cached at runtime, so an unexpected 200 from elsewhere on the origin
 // cannot displace a file the app needs offline.
@@ -29,7 +33,9 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
   if (url.origin === location.origin) {
     e.respondWith(
-      caches.match(e.request).then((cached) => {
+      // Read from this app's own cache, not the origin's: the bare caches.match searches every
+      // cache there, so offline it could answer with a file another app cached under this URL.
+      caches.open(VERSION).then((c) => c.match(e.request)).then((cached) => {
         const fetched = fetch(e.request).then((res) => {
           if (res && res.ok && isShell(url)) caches.open(VERSION).then((c) => c.put(e.request, res.clone()));
           return res;

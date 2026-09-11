@@ -30,6 +30,9 @@ const state = {
   // True from the moment a build starts until it finishes, fails or is cancelled. The worker
   // is not that flag: it is created after the decode and outlives a finished build.
   building: false,
+  // True while a shot is being grabbed. The sequential fallback closes and reopens cameras as
+  // it goes, so nothing else may close them underneath it.
+  capturing: false,
 };
 // Three frames is the least that can give a depth map with a second view to check it
 // against. Two, and often three, cannot produce a surface at all.
@@ -54,6 +57,13 @@ function toast(msg, ms = 3000) {
 function showScreen(name) {
   for (const s of ['capture', 'process', 'view']) $(`#screen-${s}`).hidden = s !== name;
   $('#capture-bar').hidden = name !== 'capture';
+  // The cameras belong to this screen. A reconstruction runs for minutes on a phone that is
+  // already hot, and an indicator left lit while nothing is being captured is worse than
+  // useless to whoever is in front of the lens: release them on the way out, open them again
+  // on the way back. A capture in flight is the exception — it opens and closes cameras of
+  // its own — and closes them itself if the screen went away while it ran.
+  if (name === 'capture') reopenCameras();
+  else if (!state.capturing) cams.closeAll();
   if (state.viewer) {
     if (name === 'view') state.viewer.resize();
     // Nothing is on screen to draw otherwise, and the next reconstruction wants the GPU.
@@ -150,7 +160,9 @@ async function startCameras() {
 
 let reopening = false;
 async function reopenCameras() {
-  if (reopening || !cams.cameras.length || $('#screen-capture').hidden) return;
+  // A capture in flight releases and reopens cameras as it goes (the sequential fallback),
+  // so opening one here would be opening it underneath that.
+  if (reopening || state.capturing || !cams.cameras.length || $('#screen-capture').hidden) return;
   const missing = cams.cameras.filter((c) => c.enabled && !cams.open.has(c.deviceId));
   if (!missing.length) return;
   reopening = true;
@@ -266,7 +278,9 @@ let askedToPersist = false;
 function persistShot(shot) {
   if (!askedToPersist && navigator.storage?.persist) {
     askedToPersist = true;
-    // Ask the browser not to evict these photographs while a scan is in progress.
+    // Ask the browser not to evict these photographs while a scan is in progress. Nothing can
+    // take that request back, so what bounds it is ShotStore's own retention: it deletes a
+    // scan a day after it was taken.
     navigator.storage.persisted?.().then((already) => already || navigator.storage.persist()).catch(() => {});
   }
   store.saveShot(shot).then((outcome) => {
@@ -282,6 +296,7 @@ async function captureShot() {
   const btn = $('#btn-capture');
   if (btn.disabled) return;
   btn.disabled = true; btn.classList.add('busy');
+  state.capturing = true;
   const flash = $('#flash'); flash.hidden = false; setTimeout(() => { flash.hidden = true; }, 260);
   try {
     const maxDim = captureMaxDim();
@@ -304,6 +319,9 @@ async function captureShot() {
   } catch (err) {
     toast(`Capture failed: ${err.message}`, 5000);
   } finally {
+    state.capturing = false;
+    // Leaving the capture screen mid-shot skipped the close; it is owed here.
+    if ($('#screen-capture').hidden) cams.closeAll();
     btn.disabled = false; btn.classList.remove('busy');
   }
 }
@@ -385,7 +403,7 @@ async function restoreShots() {
   if (!saved.length) return;
   state.shots = saved.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
   renderShots(); updateCounts();
-  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session. The photos stay on this device until you press Clear.`, 5000);
+  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session. The photos stay on this device until you press Clear, or until they are a day old.`, 5000);
 }
 
 // ---------- Reconstruction ----------

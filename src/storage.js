@@ -3,6 +3,10 @@
 
 const DB_NAME = 'phonogeometry';
 const STORE = 'shots';
+// What is stored here is photographs of rooms and of people, kept so a reload does not lose a
+// scan in progress. That is a matter of hours, so a scan older than this is deleted on the next
+// read rather than restored: the phone gets lent, handed on and picked up by somebody else.
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -61,12 +65,23 @@ export class ShotStore {
     try { await tx(db, 'readwrite', (s) => s.clear()); } catch { /* ignore */ }
   }
 
+  /**
+   * The shots worth restoring, oldest first. Anything past MAX_AGE_MS is deleted here as well
+   * as left out: a record that is not offered back to the user but stays on the disk is the
+   * worst of both, and a photograph with no createdAt to judge is treated as old.
+   */
   async loadAll() {
     const db = await this.dbPromise;
     if (!db) return [];
     try {
       const all = await tx(db, 'readonly', (s) => s.getAll());
-      return (all || []).sort((a, b) => a.createdAt - b.createdAt);
+      const cutoff = Date.now() - MAX_AGE_MS;
+      const fresh = [];
+      for (const r of all || []) {
+        if (r.createdAt >= cutoff) fresh.push(r);
+        else await this.deleteShot(r.id);
+      }
+      return fresh.sort((a, b) => a.createdAt - b.createdAt);
     } catch { return []; }
   }
 }
