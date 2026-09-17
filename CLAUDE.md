@@ -1,5 +1,7 @@
 # Phonogeometry
 
+Read AGENTS.md first. It holds the working rules every coding agent follows in this repository; this file adds the notes specific to this project.
+
 Progressive web app that captures from every camera on a phone at once and reconstructs
 textured 3D meshes on-device. Plain ES modules, no build step, no runtime dependencies
 (three.js is vendored in `vendor/three`).
