@@ -1,8 +1,16 @@
 node_modules/
-.certs/
-*.log
 .DS_Store
+*.log
+
+# project
+.certs/
 scratch/
+
+# editors
+.vscode/
+.idea/
+
+.claude/settings.local.json
 
 # Secrets: ignore every .env variant, but keep the documented template.
 .env*

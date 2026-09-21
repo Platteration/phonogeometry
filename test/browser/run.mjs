@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Browser tests for the whole application: capture with a fake camera, a scan that works,
 // a scan that cannot work, and offline operation. These need a real browser, so they are
-// not part of `npm test`; run them with `npm run test:browser`.
+// not part of `npm test`; run them with `npm run test:e2e`.
 //
 // Playwright and a Chromium build must be available. Point at them with PLAYWRIGHT_MODULE
 // and CHROMIUM_PATH if they are not where this script looks by default. Without them the

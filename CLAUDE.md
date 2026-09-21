@@ -7,10 +7,11 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 ## Commands
 
 - `npm test` runs the node:test suites in `test/` (synthetic scenes with ground truth).
+- `npm run check` is the gate before a push: `npm test`, then `npm run test:conventions`.
 - `npm start` serves over HTTP on :8080 (desktop development, photo import only).
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
-- `npm run test:browser` runs the application end to end in Chromium (multi-camera capture, a
+- `npm run test:e2e` runs the application end to end in Chromium (multi-camera capture, a
   good scan, a hopeless one, exports, reload, offline). `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
@@ -85,7 +86,7 @@ and give the real distance between them, which sets `state.metresPerUnit`; expor
 positions by it (`scaledGeometry`) so a GLB opens at its true size, glTF being defined in
 metres. The scale is cleared whenever a new build starts.
 
-## Conventions
+## Code conventions
 
 - Never paste text that came from outside into markup. Camera labels come from the operating
   system and photo labels from file names, so the interface builds those nodes with
@@ -105,3 +106,13 @@ metres. The scale is cleared whenever a new build starts.
 - The dev server (`server.js`) serves only non-hidden files inside the project directory and
   binds loopback unless `--https` or an explicit `--host=` asks otherwise. Anything that can
   reach the port can drive it, so its request handling is covered by `test/server.test.js`.
+
+## Conventions
+
+This repository follows `CONVENTIONS.md`, which is identical in every platteration
+repository and pinned by the conventions test (`npm run test:conventions`, or
+`tests/test_conventions.py` in a Python repository): the script set (`test`,
+`typecheck`, `lint`, `check`, `test:e2e`, `test:all`), Node 22 via `.nvmrc`, one
+`.editorconfig`, ESLint per stack, the `ci.yml` shape, the documents every repository
+carries and the README skeleton. `npm run check` is the gate before a push. To change a
+convention, change it in every repository in one pass and update the hashes in the test.

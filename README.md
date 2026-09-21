@@ -36,43 +36,6 @@ The reconstruction pipeline is written from scratch in plain JavaScript and runs
 
 The viewer uses three.js (r160, vendored in `vendor/three`, MIT licensed; version, upstream paths and checksums are recorded in [docs/vendored-three.md](docs/vendored-three.md)).
 
-## Running it
-
-Phones only allow camera access from a secure origin, so you need HTTPS (or `localhost`).
-
-```bash
-npm run start:https
-```
-
-There are no dependencies to install and no build step.
-
-The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, deploy the folder to any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages…).
-
-`npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP.
-
-On a desktop browser you can use **Import photos** instead of the cameras.
-
-Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phones do this under memory pressure) they are restored when you come back. They are photographs, and they are on the device: they outlive the tab and the browser, and the app asks the browser not to evict them, so they are still there when the app is next opened — by whoever is holding the phone. **Clear** deletes them, and so does **New scan**; a scan older than a day is deleted the next time the app opens.
-
-### Scanning tips
-
-- Four photographs is about the fewest that can produce any surface at all, and a good scan
-  needs many more. Fewer than that, and the app will not offer to build.
-- **Object**: circle it in small steps, roughly 10° apart, 20–40 shots. Matte, textured objects work best.
-- **Person**: they stand still; you circle them at chest height in small steps, then add a higher and a lower pass.
-- **Room**: stand near the centre, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
-- **Overlap generously.** Each shot should share well over half its view with the previous one. This is the single thing that decides whether a scan works. Measured on a synthetic object, consecutive views about 8° apart reconstruct completely, 12° apart partially, and beyond about 16° the matching gives out and the scan breaks into pieces. Fewer, wider-spaced shots are a false economy: the work grows with the number of image pairs, and a broken scan costs everything.
-- Keep something with depth in view, such as furniture or a corner. A flat wall filling the frame is ambiguous: no method can recover its distance from photographs alone.
-- Keep the phone steady. Phonogeometry measures the sharpness of every frame and marks any that are much softer than the others from the same camera, because one blurred shot in the middle of a sequence can fail to match its neighbours and strand everything after it: in testing a single frame blurred by three pixels halved the number of images that could be placed. Retake the ones it flags.
-- Vary your distance to the subject in a few shots (step in, step back). That is what lets the app calibrate each lens's focal length, which browsers do not report.
-- **Fast** quality takes well under a minute for a dozen shots on a recent phone; **High** can take several minutes.
-
-### Camera lenses
-
-Browsers do not report focal lengths. Each camera is mapped to a lens type (wide, ultra-wide, telephoto, front) from its label, which sets its initial field of view; bundle adjustment then refines one focal length and one radial distortion coefficient per physical camera. This corrects focal errors of 10–20% and the barrel distortion of ultra-wide lenses when the shots vary in distance. The calibrated values are printed under Details on the processing screen. If a phone reports generic names ("camera2 0, facing back") check the mapping under **Settings**: a closer starting guess still helps. Imported photos use the 35 mm-equivalent focal length from EXIF when present.
-
-Some phones refuse to stream several rear cameras at the same time. Cameras that cannot be opened concurrently are captured sequentially right after the simultaneous ones (this is on by default and can be disabled in Settings); hold still for that half second.
-
 ## The camera rig
 
 The cameras fired in one shot are bolted to the same phone, so the transform between them is
@@ -130,18 +93,58 @@ in order of how often they bite:
   you are still finding out whether a scan works.
 - Long scans are bounded by memory rather than patience. Forty frames at Balanced quality peak at about 250 MB in the worker, which fits comfortably on a modern phone; High quality costs roughly twice that, so keep High for scans of thirty frames or fewer unless the phone is a recent flagship.
 
+## Running it
+
+Phones only allow camera access from a secure origin, so you need HTTPS (or `localhost`).
+
+```bash
+npm run start:https
+```
+
+There are no dependencies to install and no build step.
+
+The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, deploy the folder to any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages…).
+
+`npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP.
+
+On a desktop browser you can use **Import photos** instead of the cameras.
+
+Shots are kept in the browser's IndexedDB, so if the tab reloads mid-scan (phones do this under memory pressure) they are restored when you come back. They are photographs, and they are on the device: they outlive the tab and the browser, and the app asks the browser not to evict them, so they are still there when the app is next opened — by whoever is holding the phone. **Clear** deletes them, and so does **New scan**; a scan older than a day is deleted the next time the app opens.
+
+### Scanning tips
+
+- Four photographs is about the fewest that can produce any surface at all, and a good scan
+  needs many more. Fewer than that, and the app will not offer to build.
+- **Object**: circle it in small steps, roughly 10° apart, 20–40 shots. Matte, textured objects work best.
+- **Person**: they stand still; you circle them at chest height in small steps, then add a higher and a lower pass.
+- **Room**: stand near the centre, shoot, step half a metre sideways, shoot again; go round twice at two heights. Front and back cameras fire together, so each shot covers two walls.
+- **Overlap generously.** Each shot should share well over half its view with the previous one. This is the single thing that decides whether a scan works. Measured on a synthetic object, consecutive views about 8° apart reconstruct completely, 12° apart partially, and beyond about 16° the matching gives out and the scan breaks into pieces. Fewer, wider-spaced shots are a false economy: the work grows with the number of image pairs, and a broken scan costs everything.
+- Keep something with depth in view, such as furniture or a corner. A flat wall filling the frame is ambiguous: no method can recover its distance from photographs alone.
+- Keep the phone steady. Phonogeometry measures the sharpness of every frame and marks any that are much softer than the others from the same camera, because one blurred shot in the middle of a sequence can fail to match its neighbours and strand everything after it: in testing a single frame blurred by three pixels halved the number of images that could be placed. Retake the ones it flags.
+- Vary your distance to the subject in a few shots (step in, step back). That is what lets the app calibrate each lens's focal length, which browsers do not report.
+- **Fast** quality takes well under a minute for a dozen shots on a recent phone; **High** can take several minutes.
+
+### Camera lenses
+
+Browsers do not report focal lengths. Each camera is mapped to a lens type (wide, ultra-wide, telephoto, front) from its label, which sets its initial field of view; bundle adjustment then refines one focal length and one radial distortion coefficient per physical camera. This corrects focal errors of 10–20% and the barrel distortion of ultra-wide lenses when the shots vary in distance. The calibrated values are printed under Details on the processing screen. If a phone reports generic names ("camera2 0, facing back") check the mapping under **Settings**: a closer starting guess still helps. Imported photos use the 35 mm-equivalent focal length from EXIF when present.
+
+Some phones refuse to stream several rear cameras at the same time. Cameras that cannot be opened concurrently are captured sequentially right after the simultaneous ones (this is on by default and can be disabled in Settings); hold still for that half second.
+
 ## Development
 
 ```bash
-npm test          # unit and end-to-end tests on synthetic scenes (Node >= 18)
-npm run test:browser  # the whole app in a real browser (needs Playwright; skips if absent)
-npm start         # plain HTTP on localhost:8080 for desktop development (imports only)
-npm run icons     # regenerate the PWA icons
+npm test                  # unit tests and whole reconstructions on synthetic scenes (Node >= 22)
+npm run test:conventions  # the repository's shape against CONVENTIONS.md
+npm run check             # the gate before a push: both of the above
+npm run test:e2e          # the whole app in a real browser (needs Playwright; skips if absent)
+npm run test:all          # npm test, then the browser suite
+npm start                 # plain HTTP on localhost:8080 for desktop development (imports only)
+npm run icons             # regenerate the PWA icons
 ```
 
 The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence and focal-length recovery, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as full reconstructions.
 
-`npm run test:browser` drives the real application in Chromium: it captures from the
+`npm run test:e2e` drives the real application in Chromium: it captures from the
 browser's fake camera, imports rendered photographs, checks that a blurred one is flagged and
 sharp ones are not, reconstructs a scan and confirms every photo was used, times the camera
 preview against the finished mesh, downloads all three exports, reloads to confirm shots
@@ -149,6 +152,9 @@ survive, feeds it a scan that cannot work and checks the reason reaches whicheve
 user is on, and finally cuts the network and runs a whole scan offline. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
+CI runs `npm test`, `npm run test:conventions` and the browser suite, and a separate job
+compares the vendored three.js with the package on the npm registry
+(`npm run verify:vendor`), which needs the network.
 
 The GPU plane sweep needs a browser too. Start the dev server and open
 `test/browser/index.html`: it compares the GPU and CPU depth maps of a synthetic scene against

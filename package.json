@@ -7,12 +7,16 @@
     "start": "node server.js",
     "start:https": "node server.js --https",
     "test": "node --test \"test/**/*.test.js\"",
+    "test:conventions": "node --test test/conventions.mjs",
+    "check": "npm test && npm run test:conventions",
+    "test:e2e": "node test/browser/run.mjs",
+    "test:browser": "npm run test:e2e",
+    "test:all": "npm test && npm run test:e2e",
     "icons": "node tools/make-icons.js",
-    "verify:vendor": "node tools/verify-three.js",
-    "test:browser": "node test/browser/run.mjs"
+    "verify:vendor": "node tools/verify-three.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "MIT",
   "private": true

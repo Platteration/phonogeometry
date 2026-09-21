@@ -35,6 +35,6 @@ sha256sum package/build/three.module.min.js package/examples/jsm/controls/OrbitC
 
 Copy those three files into `vendor/three/`, put the new version and checksums in the table
 above, run `npm run verify:vendor` to confirm the copies are the published bytes, and check the
-viewer still loads (`npm run test:browser` drives it end to end). Watch
+viewer still loads (`npm run test:e2e` drives it end to end). Watch
 the [three.js release notes](https://github.com/mrdoob/three.js/releases) for anything that
 matters to a `WebGLRenderer` plus `OrbitControls` viewer; nothing else of the library is used.
