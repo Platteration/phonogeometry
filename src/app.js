@@ -1,6 +1,7 @@
 // Phonogeometry app controller: capture from all cameras -> reconstruct in a worker -> view/export.
 import { CameraManager } from './camera/cameraManager.js';
-import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
+import { LENS_TYPES, HFOV_RANGE, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
+import { loadPrefs, savePrefs } from './prefs.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
@@ -145,6 +146,23 @@ function renderCameraTiles(results) {
 
 /** The capture long side chosen in Settings, used for both the streams and the grabbed frames. */
 function captureMaxDim() { return parseInt($('#capture-res').value, 10) || 1280; }
+
+// ---------- Preferences ----------
+// The four controls of the settings dialog are the record `phonogeometry.prefs.v1` holds: read
+// once at start-up, through the validator, and written whenever one of them changes.
+const PREF_CONTROLS = { captureRes: '#capture-res', sequential: '#chk-sequential', gpu: '#chk-gpu', rig: '#chk-rig' };
+function applyPrefs(prefs) {
+  $(PREF_CONTROLS.captureRes).value = prefs.captureRes;
+  for (const name of ['sequential', 'gpu', 'rig']) $(PREF_CONTROLS[name]).checked = prefs[name];
+}
+function persistPrefs() {
+  savePrefs({
+    captureRes: $(PREF_CONTROLS.captureRes).value,
+    sequential: $(PREF_CONTROLS.sequential).checked,
+    gpu: $(PREF_CONTROLS.gpu).checked,
+    rig: $(PREF_CONTROLS.rig).checked,
+  });
+}
 function streamSize() { const d = captureMaxDim(); return { width: d, height: Math.round(d * 0.75) }; }
 
 async function startCameras() {
@@ -261,7 +279,7 @@ function renderLensSettings() {
       sel.append(opt);
     }
     const num = document.createElement('input');
-    Object.assign(num, { type: 'number', min: '20', max: '140', step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
+    Object.assign(num, { type: 'number', min: String(HFOV_RANGE.min), max: String(HFOV_RANGE.max), step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
     const fov = el('label', 'muted', 'FOV° ');
     fov.append(num);
     row.append(name, sel, fov);
@@ -273,7 +291,7 @@ function renderLensSettings() {
     });
     num.addEventListener('change', () => {
       const v = parseFloat(num.value);
-      if (v >= 20 && v <= 140) { cam.hfovOverride = v; saveLensOverride(cam.key, cam.lens, v); }
+      if (v >= HFOV_RANGE.min && v <= HFOV_RANGE.max) { cam.hfovOverride = v; saveLensOverride(cam.key, cam.lens, v); }
     });
     box.appendChild(row);
   }
@@ -793,6 +811,7 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 
 // ---------- Wiring ----------
 function init() {
+  applyPrefs(loadPrefs());
   $('#preset').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-preset]');
     if (!b) return;
@@ -876,7 +895,8 @@ function init() {
     // build is actually running.
     if (state.building) holdWakeLock();
   });
-  $('#capture-res').addEventListener('change', applyCaptureResolution);
+  $('#capture-res').addEventListener('change', () => { persistPrefs(); applyCaptureResolution(); });
+  for (const name of ['sequential', 'gpu', 'rig']) $(PREF_CONTROLS[name]).addEventListener('change', persistPrefs);
   // Nothing should be able to leave the user on a progress screen that never moves, with the
   // wake lock held, because a promise rejected somewhere nobody was catching.
   window.addEventListener('unhandledrejection', (e) => {

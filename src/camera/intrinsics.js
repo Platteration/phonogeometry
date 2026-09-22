@@ -2,6 +2,8 @@
 // Browsers do not expose focal lengths, so we infer the lens type from the device label
 // and use typical horizontal fields of view. Users can override the lens per camera.
 
+import { KEYS, LEGACY_KEYS, fields, has, num, migrateKey, readRecord, writeRecord, defaultStorage } from '../prefs.js';
+
 export const LENS_TYPES = {
   ultrawide: { label: 'Ultra-wide', hfov: 104 },
   wide: { label: 'Wide (main)', hfov: 69 },
@@ -31,16 +33,53 @@ export function focalFromFov(width, height, hfovDeg) {
   return (Math.max(width, height) / 2) / Math.tan((hfovDeg * Math.PI) / 360);
 }
 
-const STORAGE_KEY = 'phonogeometry.lensOverrides';
+/**
+ * The field of view an override may carry, in degrees. The only writer is the number input in
+ * the settings dialog (app.js, `min: '20', max: '140'`, and its change handler checks the same
+ * bounds), so anything outside them was never written by this app. focalFromFov itself is
+ * finite and positive for the wider (0, 180), but at either end of that the focal length is
+ * absurd rather than merely wrong, and the input would refuse the value on its next edit.
+ */
+export const HFOV_RANGE = Object.freeze({ min: 20, max: 140 });
 
-export function loadLensOverrides() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
+/**
+ * The stored overrides, one record per camera key, checked field by field. The lens has to be
+ * one of LENS_TYPES' own names: every other lookup guards with `?.`, but renderLensSettings
+ * reads `LENS_TYPES[cam.lens].hfov` bare, so a name it does not know throws after the streams
+ * are open and disables capture on every launch until site data is cleared (REVIEW.md BUG-1).
+ * Each field that fails falls back on its own — a bad lens keeps a good field of view — and a
+ * record with nothing usable left is dropped, since it would set nothing anyway.
+ *
+ * The result has no prototype, because the camera key it is looked up by is the label the
+ * operating system gave the lens: on a plain object a label of `constructor` finds a function.
+ */
+export function cleanLensOverrides(raw) {
+  const out = Object.create(null);
+  const all = fields(raw);
+  for (const key of Object.keys(all)) {
+    const ov = fields(all[key]);
+    const lens = has(LENS_TYPES, ov.lens) ? ov.lens : null;
+    const hfov = num(ov.hfov, HFOV_RANGE.min, HFOV_RANGE.max) ?? null;
+    if (lens === null && hfov === null) continue;
+    out[key] = { lens, hfov };
+  }
+  return out;
 }
 
-export function saveLensOverride(cameraKey, lens, hfov) {
-  const all = loadLensOverrides();
+/**
+ * Read the overrides, moving them from the key earlier builds wrote first. The migration is
+ * here, at the one read site, because localStorage is synchronous: nothing can read the new
+ * key before this has run.
+ */
+export function loadLensOverrides(storage = defaultStorage()) {
+  migrateKey(storage, LEGACY_KEYS.lensOverrides, KEYS.lensOverrides);
+  return cleanLensOverrides(readRecord(storage, KEYS.lensOverrides));
+}
+
+export function saveLensOverride(cameraKey, lens, hfov, storage = defaultStorage()) {
+  const all = loadLensOverrides(storage);
   all[cameraKey] = { lens, hfov };
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(all)); } catch { /* storage unavailable */ }
+  return writeRecord(storage, KEYS.lensOverrides, all);
 }
 
 /**
