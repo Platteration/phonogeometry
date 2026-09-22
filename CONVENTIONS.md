@@ -15,7 +15,7 @@ defensible, the one most repositories already used was chosen.
 | `typecheck` | `tsc --noEmit` (Next.js: `next typegen && tsc --noEmit`) | every TypeScript repository |
 | `lint` | `eslint .` | every repository with an ESLint config |
 | `test:conventions` | `node --test test/conventions.mjs` | all |
-| `check` | `lint && typecheck && test && test:conventions`, omitting what the repository lacks — the local gate before a push | all |
+| `check` | `lint && typecheck && test && test:conventions`, omitting what the repository lacks — the local gate before a push (a Python repository's gate is `ruff check .` then `pytest -q`) | all |
 | `test:e2e` | the browser suite, self-contained: it builds and serves what it needs | every repository with one |
 | `test:all` | `test && test:e2e` plus any other suites the repository has | every repository with `test:e2e` |
 | `start` | the dev server (Expo: `expo start`; static apps: the serve script) | Expo, static |
@@ -47,7 +47,9 @@ attributed to one step. Repository-specific scripts keep their names.
     `typescript`), overrides only for documented exceptions.
   - Node workspaces: `typescript-eslint` recommended, one config per workspace.
   - Static apps and the extension: no ESLint; their notes forbid tooling.
-  - Python: `ruff check .` with the default rules.
+  - Python: `ruff check .` with `select = ["E4", "E7", "E9", "F"]` spelled out in
+    `pyproject.toml` (ruff's own default set, pinned so CI and laptops agree) and
+    `target-version = "py310"`.
 - tsconfig: Expo apps extend `expo/tsconfig.base` with `strict: true` and `types` for the
   test runner where it needs them; hand-written configs use `strict`, `target: ES2022`,
   `skipLibCheck`, `esModuleInterop`, `noEmit`. `noUncheckedIndexedAccess` is opt-in per
@@ -127,9 +129,10 @@ The stack's template block (create-expo-app, create-next-app, or `node_modules/`
 
 ## .claude
 
-Every repository with a lockfile has `.claude/settings.json` with a `SessionStart` hook,
-`.claude/hooks/session-start.sh`, that installs dependencies when the session runs in
-Claude Code on the web (`CLAUDE_CODE_REMOTE=true`) and is a no-op elsewhere.
+Every repository that installs dependencies (an npm lockfile, or a Python project) has
+`.claude/settings.json` with a `SessionStart` hook, `.claude/hooks/session-start.sh`, that
+installs them when the session runs in Claude Code on the web (`CLAUDE_CODE_REMOTE=true`)
+and is a no-op elsewhere; the Python form creates or reuses `.venv`.
 `.claude/settings.local.json` is ignored.
 
 ## Expo native configuration (`app.json`)

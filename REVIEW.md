@@ -424,12 +424,14 @@ record of what was found, and this block is a record of what was done about it.
 10. Open: the owner's decision; `main` still does not exist. The Pages workflows also
     accept `workflow_dispatch` now, so a deploy can be started by hand from any branch.
 11. Open: drawdraw stays on SDK 53 (presented, not implemented; a store submission would
-    change the call). Node is pinned to 22 everywhere through `.nvmrc`.
+    change the call). Node is pinned to 22 in every npm repository through `.nvmrc`.
 12. Open: a shared package is presented, not implemented. The twins' configuration and
     settings changes land as one identical diff in both, and each carries the other's tests.
 
-The workflow below is the shape every `ci.yml` now follows, without the `npm audit`
-step (item 4) and with `npm run test:conventions`; the exact form is in `CONVENTIONS.md`.
+The workflow below is the shape every npm repository's `ci.yml` now follows, without the
+`npm audit` step (item 4) and with `npm run test:conventions` (the Python repository runs
+`ruff check .`, `pytest -q` and its own conventions test); the exact form is in
+`CONVENTIONS.md`.
 
 ### A hardened workflow to copy
 
