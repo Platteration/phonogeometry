@@ -186,7 +186,9 @@ user's data.
   `has` is changed to `in`.
 - **Theme**: `system | light | dark`; the system value `null` resolves to dark
   (`system === 'light' ? 'light' : 'dark'`). An app with one palette has no theme row
-  and pins `userInterfaceStyle` to that palette in its config test.
+  and pins `userInterfaceStyle` to that palette in its config test. An app whose schemes
+  are not a light/dark pair names its own set instead, with no `system` value to resolve,
+  and pins that set in its contract test.
 - **Sound** and **Vibration**: two independent switches, each only where the app
   produces that feedback; a module-level flag set by the settings provider gates every
   call.
