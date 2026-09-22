@@ -107,6 +107,8 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .lens-settings { display: flex; flex-direction: column; gap: 10px; }
 .lens-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; font-size: 13.5px; background: var(--panel-2); padding: 8px 10px; border-radius: 10px; }
 .lens-row input[type=number] { width: 64px; background: var(--panel); border: 1px solid #2c313d; border-radius: 8px; padding: 5px; }
+.about p { margin: 6px 0; }
+.about a { color: var(--accent-2); }
 .help-list { padding-left: 18px; color: #c9cfdb; }
 .help-list li { margin: 8px 0; }
 

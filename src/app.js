@@ -2,6 +2,7 @@
 import { CameraManager } from './camera/cameraManager.js';
 import { LENS_TYPES, HFOV_RANGE, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
 import { loadPrefs, savePrefs } from './prefs.js';
+import { APP_VERSION } from './version.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
@@ -273,6 +274,8 @@ function renderLensSettings() {
     name.title = cam.label;
     name.append(document.createElement('br'), el('span', 'muted', cam.label));
     const sel = document.createElement('select');
+    // The row's only text is the camera's name, so the two controls say whose they are.
+    sel.setAttribute('aria-label', `Lens type of ${cam.shortLabel || cam.label}`);
     for (const [k, v] of Object.entries(LENS_TYPES)) {
       const opt = new Option(v.label, k);
       opt.selected = cam.lens === k;
@@ -280,6 +283,7 @@ function renderLensSettings() {
     }
     const num = document.createElement('input');
     Object.assign(num, { type: 'number', min: String(HFOV_RANGE.min), max: String(HFOV_RANGE.max), step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
+    num.setAttribute('aria-label', `Field of view of ${cam.shortLabel || cam.label}, in degrees`);
     const fov = el('label', 'muted', 'FOV° ');
     fov.append(num);
     row.append(name, sel, fov);
@@ -812,6 +816,7 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 // ---------- Wiring ----------
 function init() {
   applyPrefs(loadPrefs());
+  $('#about-version').textContent = `v${APP_VERSION}`;
   $('#preset').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-preset]');
     if (!b) return;

@@ -3,10 +3,10 @@
 // (GitHub Pages puts every project of an account on one origin) this worker sees the caches
 // of every other app there. The prefix is what tells its own caches from theirs.
 const PREFIX = 'phonogeometry-';
-const VERSION = `${PREFIX}v19`;
+const VERSION = `${PREFIX}v20`;
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
-  'src/app.js', 'src/storage.js', 'src/prefs.js', 'src/camera/cameraManager.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
+  'src/app.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/camera/cameraManager.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
   'src/pipeline/reconstruct.js', 'src/pipeline/worker.js',
   'src/vision/linalg.js', 'src/vision/image.js', 'src/vision/fast.js', 'src/vision/orb.js', 'src/vision/match.js',
   'src/vision/geometry.js', 'src/vision/ba.js', 'src/vision/sfm.js', 'src/vision/planeSweep.js', 'src/vision/planeSweepGPU.js',

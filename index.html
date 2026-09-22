@@ -148,9 +148,9 @@
   </main>
 
   <!-- ============ Settings ============ -->
-  <dialog id="settings">
+  <dialog id="settings" aria-labelledby="settings-title">
     <form method="dialog">
-      <h2>Settings</h2>
+      <h2 id="settings-title">Settings</h2>
       <h3>Camera lenses</h3>
       <p class="tip">Browsers do not report focal lengths, so each camera is mapped to a lens type that sets its field of view. Fix any that are wrong: it improves accuracy.</p>
       <div id="lens-settings" class="lens-settings"><p class="muted">Enable cameras first.</p></div>
@@ -166,15 +166,22 @@
       <h3>Processing</h3>
       <label class="check"><input type="checkbox" id="chk-gpu" checked /> Compute depth maps on the GPU (WebGL2). Turn off if reconstruction fails or the browser crashes.</label>
       <label class="check"><input type="checkbox" id="chk-rig" checked /> Use the camera rig: cameras fired in the same shot are rigidly attached, so a pose found for one places the others. This is what lets the front camera join a scan of the room behind you.</label>
+      <h3>About</h3>
+      <div class="about">
+        <p><strong>Phonogeometry</strong> <span id="about-version" class="muted"></span></p>
+        <p class="tip">Turns every camera on your phone into a 3D scanner: one press captures from all of its lenses at once, and the phone builds a textured mesh of the room, person or object by itself.</p>
+        <p class="tip">MIT licence · <a href="https://github.com/Platteration/phonogeometry" target="_blank" rel="noopener">source</a></p>
+        <p class="tip">Photographs, shots and meshes stay on this device: nothing is uploaded, and a file leaves only when you download or share one.</p>
+      </div>
       <div class="row gap end">
         <button value="close" class="primary">Done</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="help">
+  <dialog id="help" aria-labelledby="help-title">
     <form method="dialog">
-      <h2>How to scan</h2>
+      <h2 id="help-title">How to scan</h2>
       <ol class="help-list">
         <li><strong>Enable all cameras.</strong> Every lens the browser exposes (wide, ultra-wide, telephoto, front) shows up as a tile. Each shot captures from all of them at once, so one press covers more of the scene and gives both wide context and sharp detail. The cameras are bolted to the same phone, so a position worked out for one places the others, and the front camera joins the scan even though it never sees what the back cameras see.</li>
         <li><strong>Move a little, then shoot.</strong> Small steps: about 10° around an object or person, half a metre sideways in a room. Parallax from movement is what makes the 3D, but move too far between shots and the app can no longer tell that two photos show the same thing. More shots with lots of overlap beat fewer shots from further apart.</li>

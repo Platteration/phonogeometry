@@ -18,6 +18,7 @@ import { fakePhoneCameras } from './fakeCameras.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const PORT = Number(process.env.PORT || 8099);
+const pkgVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
 const BASE = `http://localhost:${PORT}/`;
 
 // Where a globally installed Playwright lives for the node running this script, rather than
@@ -308,10 +309,22 @@ async function main() {
         drewOnView > 0 && drewAway === 0,
         `${drewOnView} draw calls in 0.6s on the viewer, ${drewAway} in 0.6s after leaving`);
 
+      // A preference is written when its control changes and read back on the next load.
+      await page.click('#btn-settings');
+      await page.selectOption('#capture-res', '1920');
+      await page.keyboard.press('Escape');
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 20000 }).catch(() => {});
       const restored = Number(await page.textContent('#shot-count'));
       check('shots survive a reload', restored === 8, `${restored} restored`);
+      const kept = await page.$eval('#capture-res', (s) => s.value);
+      check('a changed preference survives a reload', kept === '1920', `capture resolution came back as ${kept}`);
+      // The About block is filled from the version module, not typed into the markup.
+      await page.click('#btn-settings');
+      const about = (await page.textContent('#about-version')).trim();
+      check('the About block shows the package version', about === `v${pkgVersion}`, `shows "${about}", package.json says ${pkgVersion}`);
+      await page.selectOption('#capture-res', '1280');   // back to the default for the sections after this one
+      await page.keyboard.press('Escape');
       check('no page errors during a good scan', errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }

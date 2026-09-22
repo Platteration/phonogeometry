@@ -86,6 +86,24 @@ and give the real distance between them, which sets `state.metresPerUnit`; expor
 positions by it (`scaledGeometry`) so a GLB opens at its true size, glTF being defined in
 metres. The scale is cleared whenever a new build starts.
 
+## Settings
+
+Two localStorage records, both named in `src/prefs.js` (`KEYS`) and pinned as literals by
+`test/settings-contract.test.js`. `phonogeometry.prefs.v1` holds the four controls of the
+settings dialog (`captureRes`, `sequential`, `gpu`, `rig`): read once in `init()` through
+`cleanPrefs`, written on every change. `phonogeometry.lensOverrides.v1` holds the per-camera
+lens and field-of-view overrides: migrated from the unversioned `phonogeometry.lensOverrides`
+at its one read site (`loadLensOverrides`, which copies the bytes and deletes the old key only
+once the write has succeeded) and checked by `cleanLensOverrides` in `src/camera/intrinsics.js`,
+which returns a null-prototype object because the camera label is the key. Every read goes
+through a validator, `has` is an own-property lookup, and `test/prefs.test.js` walks
+`Object.getOwnPropertyNames(Object.prototype)` through both records. There is no Theme row: the
+app has one dark palette (`color-scheme: dark`) and no theme preference. There is no Reset:
+four controls, each one click from its default. The About block's version is `APP_VERSION` in
+`src/version.js`, pinned to `package.json`; the `VERSION` in `sw.js` is the service worker's
+cache generation, bumped on every shell edit, and is not that. The shots are IndexedDB
+(`src/storage.js`), not a preference, and none of this touches them.
+
 ## Code conventions
 
 - Never paste text that came from outside into markup. Camera labels come from the operating
