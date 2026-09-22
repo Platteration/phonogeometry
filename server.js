@@ -22,11 +22,62 @@ const MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
 };
 
+// Loopback names only, so a page the developer visits cannot reach this server by pointing
+// its own hostname at 127.0.0.1. ALLOWED_HOST adds one more name for anyone who really does
+// front this with something else; it goes through the same normalisation, so
+// `dev.example.com:8080` is the name it looks like and not a value nothing can ever match.
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]', '::1'];
+
+/**
+ * The name in a Host header, without its port. A bare IPv6 literal carries no port — RFC 7230
+ * requires brackets for that — so stripping `:\d+$` from one turned `::1` into `:` and made
+ * that entry unmatchable.
+ */
+export function hostName(raw) {
+  const h = String(raw ?? '').trim().toLowerCase();
+  if (h.startsWith('[')) return h.slice(0, h.indexOf(']') + 1) || h; // bracketed IPv6: the port is outside
+  return h.indexOf(':') === h.lastIndexOf(':') ? h.replace(/:\d+$/, '') : h;
+}
+
+const WILDCARDS = new Set(['0.0.0.0', '::', '[::]']);
+
+/**
+ * The Host names a server bound to `host` answers. Bound to loopback, loopback names only.
+ * Bound off it — `--host=`, or `--https`, whose certificate carries a SAN of the same
+ * addresses — the server exists to be reached from a phone, and what the phone types into its
+ * browser is one of this machine's addresses, so every interface address is a name of this
+ * server there, with or without a port (hostName drops the port before the comparison). A
+ * loopback-only set on a LAN bind would refuse every phone, which is the case the LAN modes
+ * are for. `interfaces` is a parameter so the test can supply a machine.
+ */
+export function allowedHosts(host = '127.0.0.1', interfaces = os.networkInterfaces()) {
+  const names = new Set(LOOPBACK_HOSTS);
+  if (process.env.ALLOWED_HOST) names.add(hostName(process.env.ALLOWED_HOST));
+  const bound = hostName(host);
+  if (names.has(bound)) return names;
+  for (const list of Object.values(interfaces)) {
+    for (const i of list || []) names.add(i.family === 'IPv6' || i.family === 6 ? `[${i.address.toLowerCase()}]` : i.address);
+  }
+  if (!WILDCARDS.has(bound)) names.add(bound);
+  return names;
+}
+
+const DEFAULT_HOSTS = allowedHosts('127.0.0.1');
+
 /**
  * Turn a request URL into the file to serve, or the status to refuse it with.
  * Everything a request can influence is decided here, so it can be tested without a socket.
+ * `host` is the request's Host header; `hosts` the names this server answers to.
  */
-export function resolveRequest(url) {
+export function resolveRequest(url, host, hosts = DEFAULT_HOSTS) {
+  // Binding to loopback stops a network peer; it does not stop a browser that has been told
+  // the attacker's own name resolves to 127.0.0.1 (DNS rebinding). The rebound request still
+  // carries that name in Host, so this is the check that keeps a visited web page out of the
+  // checkout. A request that claims no name at all cannot be a rebound one: a browser always
+  // sends Host and a page cannot set it, so the only clients this refuses are
+  // `curl --http1.0` and raw-socket probes on loopback.
+  const name = hostName(host);
+  if (name && !hosts.has(name)) return { status: 403 };
   let urlPath;
   try {
     urlPath = decodeURIComponent(new URL(url, 'http://x').pathname);
@@ -53,12 +104,12 @@ export function resolveRequest(url) {
   return { status: 200, file };
 }
 
-export function handler(req, res) {
+export function handler(req, res, hosts = DEFAULT_HOSTS) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { Allow: 'GET, HEAD' });
     return res.end('Method not allowed');
   }
-  const resolved = resolveRequest(req.url);
+  const resolved = resolveRequest(req.url, req.headers.host, hosts);
   if (resolved.status !== 200) {
     res.writeHead(resolved.status);
     return res.end(resolved.status === 400 ? 'Bad request' : 'Forbidden');
@@ -109,7 +160,10 @@ function ensureCert() {
 
 /** Start a server. `host` defaults to loopback, so nothing is exposed to the network by accident. */
 export function startServer({ port = 0, host = '127.0.0.1', useHttps = false } = {}) {
-  const server = useHttps ? https.createServer(ensureCert(), handler) : http.createServer(handler);
+  // The names this server answers to follow from where it is bound, decided once here.
+  const hosts = allowedHosts(host);
+  const serve = (req, res) => handler(req, res, hosts);
+  const server = useHttps ? https.createServer(ensureCert(), serve) : http.createServer(serve);
   // A half-open or malformed connection must not hold the dev server open.
   server.on('clientError', (err, socket) => { try { socket.destroy(); } catch { /* already gone */ } });
   server.headersTimeout = 10000;

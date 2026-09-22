@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { resolveRequest, startServer } from '../server.js';
+import { resolveRequest, startServer, hostName, allowedHosts } from '../server.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -44,6 +44,58 @@ test('an escaped slash cannot walk out of the project directory', () => {
   assert.deepEqual(resolveRequest('/%2e%2e/secrets.txt'), { status: 200, file: path.join(root, 'secrets.txt') });
 });
 
+// Binding to loopback stops a network peer, not a browser that has been told an attacker's
+// name resolves to 127.0.0.1. The rebound request carries that name in Host.
+test('a Host that is not this server is refused, and no Host is not a rebound browser', () => {
+  assert.equal(resolveRequest('/index.html', 'evil.example').status, 403);
+  assert.equal(resolveRequest('/index.html', 'evil.example:8080').status, 403);
+  assert.equal(resolveRequest('/', '127.0.0.1.evil.example').status, 403);
+  // The refusal comes first: a rebound page gets nothing, not even a 400 to probe with.
+  assert.equal(resolveRequest('/%', 'evil.example').status, 403);
+  for (const host of ['localhost', 'localhost:8080', '127.0.0.1', '127.0.0.1:8080', 'LOCALHOST:8080', '[::1]', '[::1]:8080', '::1']) {
+    assert.equal(resolveRequest('/index.html', host).status, 200, host);
+  }
+  // A browser always sends Host and a page cannot set it, so a request with none cannot be a
+  // rebound one: curl --http1.0 and the tests above still work.
+  assert.equal(resolveRequest('/index.html').status, 200);
+  assert.equal(resolveRequest('/index.html', undefined).status, 200);
+  assert.equal(resolveRequest('/index.html', '').status, 200);
+});
+
+test('hostName drops the port and keeps a bare IPv6 literal whole', () => {
+  assert.equal(hostName('localhost:8080'), 'localhost');
+  assert.equal(hostName('Dev.Example.com:8080 '), 'dev.example.com');
+  assert.equal(hostName('[::1]:8080'), '[::1]');
+  assert.equal(hostName('::1'), '::1', 'a bare IPv6 literal carries no port, so nothing is stripped');
+  assert.equal(hostName(undefined), '');
+});
+
+test('bound off loopback, the server answers to this machine\'s addresses, with or without the port', () => {
+  // The LAN modes (`--host=`, `--https`) exist so a phone can reach the app, and the phone
+  // types an interface address. simplacad's loopback-only set would refuse every phone.
+  const machine = {
+    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }, { address: '::1', family: 'IPv6', internal: true }],
+    wlan0: [{ address: '192.168.1.23', family: 'IPv4', internal: false }, { address: 'fe80::1a2b', family: 'IPv6', internal: false }],
+  };
+  const loop = allowedHosts('127.0.0.1', machine);
+  assert.equal(loop.has('192.168.1.23'), false, 'a loopback bind answers loopback names only');
+  for (const bind of ['0.0.0.0', '::', '192.168.1.23']) {
+    const lan = allowedHosts(bind, machine);
+    for (const host of ['192.168.1.23', '192.168.1.23:8443', '[fe80::1a2b]:8443', 'localhost:8443']) {
+      assert.equal(resolveRequest('/index.html', host, lan).status, 200, `${bind} <- ${host}`);
+    }
+    assert.equal(resolveRequest('/index.html', 'evil.example', lan).status, 403, `${bind} still refuses a foreign name`);
+    assert.equal(resolveRequest('/index.html', '192.168.1.99', lan).status, 403, `${bind} answers this machine, not the subnet`);
+  }
+  assert.equal(allowedHosts('0.0.0.0', machine).has('0.0.0.0'), false, 'a wildcard bind is not a name');
+  assert.equal(allowedHosts('192.168.1.23', machine).has('192.168.1.23'), true);
+  // The real machine: whatever it has, the running server would answer to it.
+  const real = allowedHosts('0.0.0.0');
+  for (const list of Object.values(os.networkInterfaces())) for (const i of list || []) {
+    assert.equal(real.has(hostName(i.family === 'IPv6' || i.family === 6 ? `[${i.address}]:8443` : `${i.address}:8443`)), true, i.address);
+  }
+});
+
 test('hidden files and directories are never served', () => {
   for (const url of ['/.gitignore', '/.env', '/.git/config', '/.certs/key.pem', '/src/../.git/HEAD', '/.config/tokens.json']) {
     assert.equal(resolveRequest(url).status, 403, url);
@@ -66,9 +118,9 @@ test('ordinary files inside the project resolve to themselves', () => {
  * never exited. A client-side deadline turns that silence into a failed assertion, which is
  * what a test is for.
  */
-function request(port, urlPath, method = 'GET', deadlineMs = 5000) {
+function request(port, urlPath, method = 'GET', deadlineMs = 5000, headers = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method, headers }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { body += c; });
@@ -93,6 +145,10 @@ test('the running server survives the requests it refuses', { timeout: 15000 }, 
   assert.equal((await request(port, '/.gitignore')).status, 403);
   assert.equal((await request(port, '/index.html', 'POST')).status, 405);
   assert.equal((await request(port, '/does-not-exist.js')).status, 404);
+  // The Host header is what a rebound browser carries; node's own client sets it freely.
+  assert.equal((await request(port, '/index.html', 'GET', 5000, { Host: 'evil.example' })).status, 403);
+  assert.equal((await request(port, '/index.html', 'GET', 5000, { Host: `localhost:${port}` })).status, 200);
+  assert.equal((await request(port, '/index.html', 'GET', 5000, { Host: `127.0.0.1:${port}` })).status, 200);
 
   // Still alive and serving after all of that
   const ok = await request(port, '/index.html');

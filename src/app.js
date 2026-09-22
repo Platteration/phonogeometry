@@ -3,6 +3,7 @@ import { CameraManager } from './camera/cameraManager.js';
 import { LENS_TYPES, HFOV_RANGE, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
 import { loadPrefs, savePrefs } from './prefs.js';
 import { APP_VERSION } from './version.js';
+import { wireInstallPrompt } from './install.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
@@ -817,6 +818,9 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 function init() {
   applyPrefs(loadPrefs());
   $('#about-version').textContent = `v${APP_VERSION}`;
+  // Chromium offers an install prompt for a page with a manifest and a worker; Safari never
+  // does, so the button is hidden until the offer arrives and stays hidden where none comes.
+  wireInstallPrompt(window, $('#btn-install'));
   $('#preset').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-preset]');
     if (!b) return;

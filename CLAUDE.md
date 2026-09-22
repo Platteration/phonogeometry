@@ -124,6 +124,11 @@ cache generation, bumped on every shell edit, and is not that. The shots are Ind
 - The dev server (`server.js`) serves only non-hidden files inside the project directory and
   binds loopback unless `--https` or an explicit `--host=` asks otherwise. Anything that can
   reach the port can drive it, so its request handling is covered by `test/server.test.js`.
+  It also refuses a request whose `Host` is not one of its own names (a page the developer
+  visits can point its hostname at 127.0.0.1; the rebound request still says so in `Host`).
+  Bound to loopback those names are the loopback ones; bound off it (`--host=`, `--https`)
+  they include every interface address, because a phone types one of those, and
+  `ALLOWED_HOST` adds one more. No `Host` at all is answered: a browser always sends one.
 
 ## Conventions
 

@@ -402,6 +402,35 @@ The same gaps recur in every repository; fixing them once as a template and copy
 11. **`drawdraw` is the one repository still on Expo SDK 53** (the rest are on 57). Its eight high-severity `npm audit` findings (`image-size`, `metro`) disappear with the SDK upgrade; it is also the only app not written in TypeScript and the only one pinned to Node 20 in CI.
 12. **`multidcheckers` and `multidconnect4` are near-identical copies** (same branch name, same 65-file layout, same dependencies). The timeline/multiverse engine, persistence and share code should live in one shared package so fixes land in both.
 
+### Status of the shared items (2026-09-21)
+
+Recorded after the security audit and the cohesion pass; the numbering above is kept
+because other findings in this file cite it. The items are not edited: this file is a
+record of what was found, and this block is a record of what was done about it.
+
+1. Done: every workflow sets `permissions: contents: read` (security audit).
+2. Done: every `uses:` is pinned to a commit SHA with the tag in a comment (security audit).
+3. Done: `.github/dependabot.yml` in every repository that has a manifest (tradetrade gets
+   one with its first code).
+4. Open, by decision: no `npm audit` step. Unactioned advisories only turn CI red;
+   Dependabot's security updates are the channel. Reconsider if those go unmerged.
+5. Done: `npm ci || npm install` appears nowhere.
+6. Half: abientnoiser and simplacad have lockfiles and `npm ci`; selfreportle and
+   phonogeometry deliberately keep none and install Playwright at a pinned version with
+   `--no-save --no-package-lock --ignore-scripts` (there are no dependencies to track).
+7. Not verifiable from the tree: a repository setting, still recommended.
+8. Done: every repository has an MIT `LICENSE` and a `license` field.
+9. Done: every repository has `SECURITY.md`.
+10. Open: the owner's decision; `main` still does not exist. The Pages workflows also
+    accept `workflow_dispatch` now, so a deploy can be started by hand from any branch.
+11. Open: drawdraw stays on SDK 53 (presented, not implemented; a store submission would
+    change the call). Node is pinned to 22 everywhere through `.nvmrc`.
+12. Open: a shared package is presented, not implemented. The twins' configuration and
+    settings changes land as one identical diff in both, and each carries the other's tests.
+
+The workflow below is the shape every `ci.yml` now follows, without the `npm audit`
+step (item 4) and with `npm run test:conventions`; the exact form is in `CONVENTIONS.md`.
+
 ### A hardened workflow to copy
 
 ```yaml
