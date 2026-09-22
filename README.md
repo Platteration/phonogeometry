@@ -105,7 +105,7 @@ There are no dependencies to install and no build step.
 
 The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, deploy the folder to any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages…).
 
-`npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP. The server answers only to its own names — `localhost` and this machine's addresses — so a web page cannot reach it by DNS rebinding; set `ALLOWED_HOST=name` if you front it with another name.
+`npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP. In the LAN modes the server answers to this machine's own names — its addresses, its hostname, and mDNS names such as `laptop.local` — and reads its interfaces again on a miss, so a Wi-Fi joined after the start still works. Reaching it any other way — a port forwarded by Docker, WSL2, a VM or a tunnel, or a name your router hands out — needs that address in `ALLOWED_HOST` (a comma-separated list; ports are ignored). Any other `Host` gets a 403 and one line on the terminal saying so, which is what keeps a page you visit from reaching the checkout by pointing its own name at 127.0.0.1.
 
 On a desktop browser you can use **Import photos** instead of the cameras.
 

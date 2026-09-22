@@ -41,3 +41,12 @@ test('the About block shows the version package.json declares', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.equal(APP_VERSION, pkg.version);
 });
+
+// Two apps from the same account showing the same card two ways is what this pins: the
+// wording is the sibling PWA's, so whichever is read second says what the first one said.
+test('the About block is written the way the sibling apps write it', () => {
+  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  const about = html.match(/<div class="about">([\s\S]*?)<\/div>/)[1];
+  assert.match(about, /Version <span id="about-version"><\/span>/, 'the version is a line of its own, not a suffix on the name');
+  assert.match(about, /MIT licence · <a [^>]*>source on GitHub<\/a>/, 'and the link says where it goes');
+});

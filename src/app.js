@@ -817,7 +817,7 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 // ---------- Wiring ----------
 function init() {
   applyPrefs(loadPrefs());
-  $('#about-version').textContent = `v${APP_VERSION}`;
+  $('#about-version').textContent = APP_VERSION;   // the markup says "Version"; this is the number
   // Chromium offers an install prompt for a page with a manifest and a worker; Safari never
   // does, so the button is hidden until the offer arrives and stays hidden where none comes.
   wireInstallPrompt(window, $('#btn-install'));

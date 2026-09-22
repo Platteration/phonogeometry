@@ -70,10 +70,19 @@ export function cleanLensOverrides(raw) {
  * Read the overrides, moving them from the key earlier builds wrote first. The migration is
  * here, at the one read site, because localStorage is synchronous: nothing can read the new
  * key before this has run.
+ *
+ * When that copy could not be written — a quota the origin's other tenants filled, a storage
+ * that refuses writes — the record is still intact under the old key, and reading the new one
+ * would hand this session an empty set: every camera back on its guessed lens, with nothing
+ * said, though the user's choices are on the disk. So the old key is read instead for this
+ * session. The copy is retried on the next launch, and the new key stays absent until it
+ * succeeds, which is what keeps `saveLensOverride` from writing one camera over the rest:
+ * what it saves is merged into what this read returned.
  */
 export function loadLensOverrides(storage = defaultStorage()) {
   migrateKey(storage, LEGACY_KEYS.lensOverrides, KEYS.lensOverrides);
-  return cleanLensOverrides(readRecord(storage, KEYS.lensOverrides));
+  const record = readRecord(storage, KEYS.lensOverrides);
+  return cleanLensOverrides(record === undefined ? readRecord(storage, LEGACY_KEYS.lensOverrides) : record);
 }
 
 export function saveLensOverride(cameraKey, lens, hfov, storage = defaultStorage()) {

@@ -127,8 +127,15 @@ cache generation, bumped on every shell edit, and is not that. The shots are Ind
   It also refuses a request whose `Host` is not one of its own names (a page the developer
   visits can point its hostname at 127.0.0.1; the rebound request still says so in `Host`).
   Bound to loopback those names are the loopback ones; bound off it (`--host=`, `--https`)
-  they include every interface address, because a phone types one of those, and
-  `ALLOWED_HOST` adds one more. No `Host` at all is answered: a browser always sends one.
+  they are this machine's own names, because that is what a phone types: the bound address,
+  every interface address in both spellings, the hostname, `<hostname>.local`, and any other
+  name under `.local`, which is mDNS and cannot be pointed at 127.0.0.1 from the internet.
+  A miss re-reads `os.networkInterfaces()` (throttled) before refusing, so the Wi-Fi joined
+  after the server started is answered, and a refusal is logged once per name with the
+  `ALLOWED_HOST=` that would allow it — that variable is a comma-separated list, for the
+  forwarder or tunnel this process cannot see. No `Host` at all is answered: a browser always
+  sends one. `hostGate` in `server.js` is abientnoiser's `scripts/hosts.js`, form for form;
+  change one and change the other.
 
 ## Conventions
 

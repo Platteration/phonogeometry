@@ -89,12 +89,24 @@ class FakeElement {
   toDataURL() { return 'data:,'; }
 }
 
+/** The Storage interface, on a Map, so the preferences app.js writes can be read back. */
+function fakeStorage() {
+  const map = new Map();
+  return {
+    map,
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => { map.set(k, String(v)); },
+    removeItem: (k) => { map.delete(k); },
+  };
+}
+
 /**
  * Install a document, a window and the handful of globals app.js reaches for. Selectors are
  * answered by the same node every time, created on first ask, so a test can read what the app
- * wrote to `#camera-status` without having to build a page first.
+ * wrote to `#camera-status` without having to build a page first. `localStorage` is here too,
+ * because the preferences are read at start-up and written on every change, and node has none.
  */
-export function installFakeDom() {
+export function installFakeDom({ stored = {} } = {}) {
   const bySelector = new Map();
   const documentListeners = new Map();
 
@@ -128,19 +140,24 @@ export function installFakeDom() {
     dispatch(type, event = {}) { for (const fn of windowListeners.get(type) || []) fn({ type, ...event }); },
   };
 
+  const localStorage = fakeStorage();
+  for (const [key, value] of Object.entries(stored)) localStorage.setItem(key, value);
+
   globalThis.document = document;
   globalThis.window = window;
+  globalThis.localStorage = localStorage;
   globalThis.Option = class Option {
     constructor(label, value) { this.label = label; this.value = value; this.selected = false; this.textContent = label; }
   };
   globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 2);
 
-  return { document, window, $: (selector) => document.querySelector(selector), FakeElement };
+  return { document, window, localStorage, $: (selector) => document.querySelector(selector), FakeElement };
 }
 
 export function uninstallFakeDom() {
   delete globalThis.document;
   delete globalThis.window;
+  delete globalThis.localStorage;
   delete globalThis.Option;
   delete globalThis.requestAnimationFrame;
 }

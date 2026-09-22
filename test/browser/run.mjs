@@ -321,8 +321,9 @@ async function main() {
       check('a changed preference survives a reload', kept === '1920', `capture resolution came back as ${kept}`);
       // The About block is filled from the version module, not typed into the markup.
       await page.click('#btn-settings');
-      const about = (await page.textContent('#about-version')).trim();
-      check('the About block shows the package version', about === `v${pkgVersion}`, `shows "${about}", package.json says ${pkgVersion}`);
+      // The whole line, not just the span: "Version <n>" is the form the sibling apps show.
+      const about = (await page.$eval('#about-version', (el) => el.parentElement.textContent.replace(/\s+/g, ' ').trim()));
+      check('the About block shows the package version', about === `Version ${pkgVersion}`, `shows "${about}", package.json says ${pkgVersion}`);
       await page.selectOption('#capture-res', '1280');   // back to the default for the sections after this one
       await page.keyboard.press('Escape');
       check('no page errors during a good scan', errors.length === 0, errors.slice(0, 2).join(' | '));

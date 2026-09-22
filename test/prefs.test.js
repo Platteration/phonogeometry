@@ -13,10 +13,12 @@ import { LENS_TYPES, HFOV_RANGE, cleanLensOverrides, loadLensOverrides, saveLens
 /** The Storage interface, on a Map. `failWrites` makes setItem throw the way a full quota does. */
 function fakeStorage(entries = {}, { failWrites = false } = {}) {
   const map = new Map(Object.entries(entries));
+  let refusing = failWrites;
   return {
     map,
+    allowWrites() { refusing = false; },   // whatever filled the quota has gone
     getItem: (k) => (map.has(k) ? map.get(k) : null),
-    setItem(k, v) { if (failWrites) throw new DOMException('QuotaExceededError', 'QuotaExceededError'); map.set(k, String(v)); },
+    setItem(k, v) { if (refusing) throw new DOMException('QuotaExceededError', 'QuotaExceededError'); map.set(k, String(v)); },
     removeItem: (k) => { map.delete(k); },
   };
 }
@@ -103,14 +105,33 @@ test('both present: the new record wins and the old one goes', () => {
   assert.equal(s.map.has(OLD), false);
 });
 
-test('a write that fails leaves the old record where it was, for the next launch', () => {
+test('a write that fails leaves the old record where it was, and the session still sees it', () => {
+  // The storage side of this was always right; the session's was not. This used to assert
+  // that the read came back empty, which is the bug rather than the rule: the record is
+  // intact under OLD, and a user whose origin is out of quota would have spent the whole
+  // session with every camera back on its guessed lens and nothing said. Worse, the next
+  // saveLensOverride would have written NEW holding that one camera, and the launch after
+  // that — NEW wins, OLD goes — would have taken the rest with it.
   const s = fakeStorage({ [OLD]: record }, { failWrites: true });
   const loaded = loadLensOverrides(s);
   assert.equal(s.map.get(OLD), record, 'OLD must survive a failed copy');
-  assert.equal(s.map.has(NEW), false);
-  // The read still fell through to nothing rather than throwing, and the copy is reported as not done.
-  assert.equal(Object.keys(loaded).length, 0);
-  assert.equal(migrateKey(s, OLD, NEW), false);
+  assert.equal(s.map.has(NEW), false, 'and NEW is not written, so the copy is retried next launch');
+  assert.deepEqual(loaded['camera2 0, facing back'], { lens: 'telephoto', hfov: 40 }, 'the choices are applied all the same');
+  assert.equal(migrateKey(s, OLD, NEW), false, 'the copy is still reported as not done');
+});
+
+test('a storage that takes writes again keeps every camera the old record held', () => {
+  // The same storage, once whatever refused the write has gone: saving one camera must carry
+  // the others, because the record it merges into is the one this session actually read.
+  const two = JSON.stringify({ back: { lens: 'telephoto', hfov: 40 }, front: { lens: 'front', hfov: 76 } });
+  const s = fakeStorage({ [OLD]: two }, { failWrites: true });
+  loadLensOverrides(s);                      // the launch where the copy could not be written
+  s.allowWrites();
+  assert.equal(saveLensOverride('back', 'wide', 69, s), true);
+  assert.deepEqual(JSON.parse(s.map.get(NEW)), {
+    back: { lens: 'wide', hfov: 69 },
+    front: { lens: 'front', hfov: 76 },
+  });
 });
 
 test('running the migration twice is the same as once, and it copies bytes it cannot parse', () => {

@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { resolveRequest, startServer, hostName, allowedHosts } from '../server.js';
+import { resolveRequest, startServer, hostName, allowedHosts, hostGate, MAX_LOGGED, MAX_NAME, RESCAN_MS } from '../server.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -87,13 +87,123 @@ test('bound off loopback, the server answers to this machine\'s addresses, with 
     assert.equal(resolveRequest('/index.html', 'evil.example', lan).status, 403, `${bind} still refuses a foreign name`);
     assert.equal(resolveRequest('/index.html', '192.168.1.99', lan).status, 403, `${bind} answers this machine, not the subnet`);
   }
-  assert.equal(allowedHosts('0.0.0.0', machine).has('0.0.0.0'), false, 'a wildcard bind is not a name');
+  // The bound address is a name of this server, whatever it is. `0.0.0.0` used to be struck
+  // out here as "not a name"; it is answered now because abientnoiser's gate answers it and
+  // the two servers are one rule, and because it is not a way in: a rebound page carries the
+  // attacker's *name* in Host, which is still refused, and a browser will not navigate to
+  // 0.0.0.0 at all. This assertion is the rule, in place of the exception.
+  assert.equal(allowedHosts('0.0.0.0', machine).has('0.0.0.0'), true, 'the bound address is a name');
   assert.equal(allowedHosts('192.168.1.23', machine).has('192.168.1.23'), true);
+  // Both spellings of every address, and this machine's names, which is what a phone types:
+  // none of `laptop.local`, `laptop` or a port-forwarder's address is in os.networkInterfaces().
+  const named = allowedHosts('0.0.0.0', machine, 'Laptop');
+  for (const host of ['[192.168.1.23]:8443', 'fe80::1a2b', 'laptop', 'Laptop:8443', 'laptop.local', 'LAPTOP.local:8443', 'anything.local']) {
+    assert.equal(resolveRequest('/index.html', host, named).status, 200, host);
+  }
+  for (const host of ['local', 'laptop.lan', 'evil.local.example', 'laptop.localdomain']) {
+    assert.equal(resolveRequest('/index.html', host, named).status, 403, host);
+  }
+  assert.equal(resolveRequest('/index.html', 'laptop.local', allowedHosts('127.0.0.1', machine, 'Laptop')).status, 403, 'and none of that on a loopback bind');
   // The real machine: whatever it has, the running server would answer to it.
   const real = allowedHosts('0.0.0.0');
   for (const list of Object.values(os.networkInterfaces())) for (const i of list || []) {
     assert.equal(real.has(hostName(i.family === 'IPv6' || i.family === 6 ? `[${i.address}]:8443` : `${i.address}:8443`)), true, i.address);
   }
+});
+
+/** `hostGate` with the operating system stood in for: the interface list can change between
+ *  reads, the clock is ours, and the log is collected. */
+function gate({ host = '0.0.0.0', interfaces = [['10.0.0.5']], hostname = 'Laptop' } = {}) {
+  let reads = 0, t = 0;
+  const logged = [];
+  const allowed = hostGate({
+    host,
+    interfaces: () => {
+      const list = interfaces[Math.min(reads, interfaces.length - 1)];
+      reads++;
+      return { eth0: list.map((address) => ({ address, family: address.includes(':') ? 'IPv6' : 'IPv4', internal: false })) };
+    },
+    hostname: () => hostname,
+    log: (line) => logged.push(line),
+    now: () => t,
+  });
+  return { allowed, logged, reads: () => reads, tick: (ms) => { t += ms; } };
+}
+
+/** Run `fn` with ALLOWED_HOST set, and put the environment back whatever it does. */
+function withAllowedHost(value, fn) {
+  const had = Object.prototype.hasOwnProperty.call(process.env, 'ALLOWED_HOST');
+  const before = process.env.ALLOWED_HOST;
+  process.env.ALLOWED_HOST = value;
+  try { return fn(); } finally { if (had) process.env.ALLOWED_HOST = before; else delete process.env.ALLOWED_HOST; }
+}
+
+// ALLOWED_HOST is the documented way to reach this server through something it cannot see —
+// a port forwarded by Docker, WSL2, a VM or a tunnel, none of which is an address in
+// os.networkInterfaces(). Untested, the one documented way round a 403 can silently stop
+// working: deleting the line that reads it left the suite green.
+test('ALLOWED_HOST adds names, as a comma-separated list, on any bind', () => {
+  withAllowedHost('dev.example.com:8080, tunnel.example , ', () => {
+    for (const bind of ['127.0.0.1', '0.0.0.0']) {
+      const hosts = allowedHosts(bind, {}, 'laptop');
+      for (const host of ['dev.example.com', 'dev.example.com:8443', 'TUNNEL.example:1234']) {
+        assert.equal(resolveRequest('/index.html', host, hosts).status, 200, `${bind} <- ${host}`);
+      }
+      assert.equal(resolveRequest('/index.html', 'other.example', hosts).status, 403, 'and nothing else');
+      assert.equal(hosts.has(''), false, 'an empty entry is not a name that matches a missing Host');
+    }
+  });
+  assert.equal(allowedHosts('127.0.0.1', {}, 'laptop').has('dev.example.com'), false, 'gone with the variable');
+});
+
+// The Wi-Fi a phone is on may come up after the server did — a hotspot switched on so the
+// phone can reach the laptop, a network joined later — and its address is one the phone will
+// type. A set snapshotted at start-up refuses it until the server is restarted.
+test('a miss re-reads the interfaces, at most once a second', () => {
+  const { allowed, reads, tick } = gate({ interfaces: [['10.0.0.5'], ['10.0.0.5', '10.0.0.9'], ['10.0.0.5', '10.0.0.9', '10.0.0.13']] });
+  assert.equal(reads(), 1, 'read once at the start');
+  assert.equal(allowed('10.0.0.5:8443'), true);
+  assert.equal(reads(), 1, 'a hit reads nothing');
+  tick(RESCAN_MS);
+  assert.equal(allowed('10.0.0.9:8443'), true, 'an address that came up since the start is answered');
+  assert.equal(reads(), 2);
+  assert.equal(allowed('10.0.0.13:8443'), false, 'but the next miss within the throttle does not read again');
+  assert.equal(reads(), 2);
+  tick(RESCAN_MS);
+  assert.equal(allowed('10.0.0.13:8443'), true);
+  assert.equal(reads(), 3);
+  assert.equal(allowed('evil.example'), false, 'and a name no interface has stays refused');
+});
+
+test('on loopback a miss never reads the interfaces: their addresses are not answered there', () => {
+  const { allowed, reads, tick } = gate({ host: '127.0.0.1', interfaces: [['10.0.0.5'], ['10.0.0.5', '10.0.0.9']] });
+  assert.equal(reads(), 0);
+  tick(RESCAN_MS);
+  assert.equal(allowed('10.0.0.9:8443'), false);
+  assert.equal(allowed('laptop.local'), false, 'nor is an mDNS name');
+  assert.equal(reads(), 0);
+});
+
+// A bare `Forbidden` on the phone, with nothing on the console, is how the developer who has
+// been typing `laptop.local:8443` finds out nothing at all.
+test('a refused name is logged once, with the way to allow it, and no more than a bounded number', () => {
+  const { allowed, logged } = gate({ host: '127.0.0.1' });
+  allowed('evil.example'); allowed('evil.example:8443'); allowed('EVIL.example');
+  assert.equal(logged.length, 1, 'one line for one name, whatever its port or case');
+  assert.match(logged[0], /refused Host "evil\.example"/);
+  assert.match(logged[0], /ALLOWED_HOST=evil\.example/, 'the refusal says how to allow the name');
+  assert.match(logged[0], /--host=0\.0\.0\.0/, 'and, on loopback, how to answer to this machine\'s own names');
+  allowed('other.example');
+  assert.equal(logged.length, 2);
+  // A name is whatever the client typed, so it is printed cut and without the hint, which
+  // would otherwise be a cut name that does not work when it is pasted.
+  allowed(`${'x'.repeat(5000)}.example`);
+  assert.equal(logged.length, 3);
+  assert.ok(logged[2].length < MAX_NAME + 200, `a long name is cut, not printed whole: ${logged[2].length} chars`);
+  assert.doesNotMatch(logged[2], /ALLOWED_HOST=/, 'and a name too long to be one is not offered as one');
+  for (let i = 0; i < MAX_LOGGED + 50; i++) allowed(`n${i}.example`);
+  assert.equal(logged.length, MAX_LOGGED, 'a client minting names cannot fill the terminal');
+  assert.equal(allowed('localhost:8443'), true, 'and the server is still serving its own names');
 });
 
 test('hidden files and directories are never served', () => {
@@ -118,9 +228,9 @@ test('ordinary files inside the project resolve to themselves', () => {
  * never exited. A client-side deadline turns that silence into a failed assertion, which is
  * what a test is for.
  */
-function request(port, urlPath, method = 'GET', deadlineMs = 5000, headers = {}) {
+function request(port, urlPath, method = 'GET', deadlineMs = 5000, headers = {}, address = '127.0.0.1') {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method, headers }, (res) => {
+    const req = http.request({ host: address, port, path: urlPath, method, headers }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { body += c; });
@@ -235,6 +345,37 @@ test('the server binds loopback only unless told otherwise', async (t) => {
   const server = await startServer({ port: 0 });
   t.after(() => new Promise((r) => server.close(r)));
   assert.equal(server.address().address, '127.0.0.1');
+});
+
+// The bind and the set it derives are wired together in startServer, and only a listening
+// server proves it: replacing `hostGate({ host })` there with the loopback default leaves every
+// unit test above green (they call allowedHosts with a machine of their own) while every phone
+// gets 403 in the LAN modes. 127.0.0.2 is off loopback as far as the rule is concerned — it is
+// none of the four loopback names — while staying on this machine; a real interface address is
+// the fallback where it cannot be bound.
+test('bound off loopback, the running server answers to this machine and refuses a foreign name', { timeout: 15000 }, async (t) => {
+  const own = [];
+  for (const list of Object.values(os.networkInterfaces())) for (const i of list || []) if (i.family === 'IPv4' && !i.internal) own.push(i.address);
+  let server, bound;
+  for (const address of ['127.0.0.2', ...own]) {
+    try { server = await startServer({ port: 0, host: address }); bound = address; break; } catch { /* not an address this machine can bind */ }
+  }
+  if (!server) return t.skip('no address to bind off loopback on this machine');
+  t.after(() => new Promise((r) => server.close(r)));
+  const port = server.address().port;
+  const ask = (host) => request(port, '/index.html', 'GET', 5000, { Host: host }, bound);
+
+  assert.equal((await ask(`${bound}:${port}`)).status, 200, 'the address it is bound to');
+  assert.equal((await ask(`${os.hostname()}:${port}`)).status, 200, 'this machine\'s hostname');
+  assert.equal((await ask(`${os.hostname()}.local:${port}`)).status, 200, 'and that name under mDNS, which is what a phone offers');
+  assert.equal((await ask(`phone-typed-this.local:${port}`)).status, 200, 'as is any other .local name: no internet DNS can point one at 127.0.0.1');
+  assert.equal((await ask(`localhost:${port}`)).status, 200, 'loopback names are answered on any bind');
+  for (const address of own) assert.equal((await ask(`${address}:${port}`)).status, 200, `the interface address ${address}`);
+  assert.equal((await ask('evil.example')).status, 403, 'and a foreign name is still refused');
+  assert.equal((await ask('evil.example.com:8443')).status, 403);
+  // The refusal is first, and the server is still serving afterwards.
+  assert.equal((await request(port, '/%', 'GET', 5000, { Host: 'evil.example' }, bound)).status, 403);
+  assert.equal((await request(port, '/index.html', 'GET', 5000, {}, bound)).status, 200);
 });
 
 test('a sibling directory sharing this one\'s name prefix stays out of reach', async (t) => {

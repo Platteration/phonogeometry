@@ -75,8 +75,8 @@ function installFakePhone(lenses) {
 
 let instance = 0;
 /** Start the app against a fresh document, database and phone. */
-async function launchApp({ lenses = {}, records = [] } = {}) {
-  const dom = installFakeDom();
+async function launchApp({ lenses = {}, records = [], stored = {} } = {}) {
+  const dom = installFakeDom({ stored });
   const database = installFakeIndexedDb(records);
   const phone = installFakePhone(lenses);
   const createElement = dom.document.createElement.bind(dom.document);
@@ -196,4 +196,34 @@ test('a lens that comes up after the capture screen has gone is closed, not left
   assert.ok(late, 'the lens did come up, after the screen had gone');
   assert.equal(late.deviceId, 'back-2');
   assert.equal(late.track.stopped, true, 'and it must be closed rather than left streaming');
+});
+
+// The settings dialog's four controls are the whole of `phonogeometry.prefs.v1`: read once at
+// start-up and written whenever one of them changes. Only #capture-res was driven end to end,
+// so unwiring the three checkboxes — the exact defect 02f4374 fixed — left every suite green.
+test('every settings control is applied at start-up and written back when it changes', async () => {
+  const PREFS = 'phonogeometry.prefs.v1';
+  const { $, localStorage } = await launchApp({
+    stored: { [PREFS]: JSON.stringify({ captureRes: '1920', sequential: false, gpu: false, rig: true }) },
+  });
+  const stored = () => JSON.parse(localStorage.getItem(PREFS));
+
+  // What was stored reaches the controls, rather than the markup's own defaults standing.
+  assert.equal($('#capture-res').value, '1920');
+  assert.equal($('#chk-sequential').checked, false);
+  assert.equal($('#chk-gpu').checked, false);
+  assert.equal($('#chk-rig').checked, true);
+
+  // And each control, changed, is what the record then holds. One at a time, so an unwired
+  // control cannot be carried by another control's write.
+  for (const [selector, field] of [['#chk-sequential', 'sequential'], ['#chk-gpu', 'gpu'], ['#chk-rig', 'rig']]) {
+    const node = $(selector);
+    node.checked = !node.checked;
+    node.dispatch('change');
+    assert.equal(stored()[field], node.checked, `${selector} is written back`);
+  }
+  $('#capture-res').value = '960';
+  $('#capture-res').dispatch('change');
+  assert.equal(stored().captureRes, '960');
+  assert.deepEqual(stored(), { captureRes: '960', sequential: true, gpu: true, rig: false }, 'every field, from the controls');
 });
