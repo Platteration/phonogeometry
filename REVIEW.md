@@ -414,6 +414,12 @@ record of what was found, and this block is a record of what was done about it.
    one with its first code).
 4. Open, by decision: no `npm audit` step. Unactioned advisories only turn CI red;
    Dependabot's security updates are the channel. Reconsider if those go unmerged.
+   Reversed (2026-09-23) for every repository with a lockfile: Dependabot's security
+   updates open against the default branch (`claude/multi-camera-3d-mesh-qhtjqq`), which
+   is not this one, and `CONVENTIONS.md` now gives such a repository an `audit` job of its
+   own. This one keeps no lockfile (item 6) and has no dependency for an audit to read,
+   so it has no `audit` job; the conventions test fails on a lockfile without the job and
+   on the job without a lockfile.
 5. Done: `npm ci || npm install` appears nowhere.
 6. Half: abientnoiser and simplacad have lockfiles and `npm ci`; selfreportle and
    phonogeometry deliberately keep none and install Playwright at a pinned version with

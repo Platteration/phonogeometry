@@ -52,8 +52,9 @@ attributed to one step. Repository-specific scripts keep their names.
     `target-version = "py310"`.
 - tsconfig: Expo apps extend `expo/tsconfig.base` with `strict: true` and `types` for the
   test runner where it needs them; hand-written configs use `strict`, `target: ES2022`,
-  `skipLibCheck`, `esModuleInterop`, `noEmit`. `noUncheckedIndexedAccess` is opt-in per
-  repository.
+  `skipLibCheck`, `esModuleInterop`, `noEmit`. `noUncheckedIndexedAccess` is on in every
+  TypeScript project, workspaces included: an index that can miss is handled as one, and a
+  non-null assertion is kept for an index the code beside it has already bounded.
 
 ## CI
 
@@ -81,8 +82,18 @@ One job, `check`, `timeout-minutes: 20`, steps in this order, each a bare `run:`
 
 Actions are pinned to a commit SHA with the tag in a comment. `npm test` is invoked
 plainly: GitHub sets `CI=true`, which Jest and the Expo CLI both read. A repository
-without a lockfile has no install step and no cache. A second job only when it needs
-a different toolchain (Docker, packaging, a network-bound vendor check).
+without a lockfile has no install step and no cache.
+
+A repository with a lockfile has a second job, `audit`: checkout, setup-node from
+`.nvmrc`, then `npm audit --omit=dev --audit-level=high`, with no install step, since
+the audit reads the lockfile. It is a job of its own so that an advisory published
+against an unchanged tree turns `audit` red and leaves `check` meaning what it always
+meant. `--omit=dev` because the gate is for what the app is built from, not for its
+test runner; `high` because a moderate advisory whose only fix npm can offer is a major
+downgrade of `expo` would otherwise hold every Expo repository red with nothing to do.
+The Python repository's `audit` job runs a pinned `pip-audit` over the project's
+declared dependencies. Other jobs only when they need a different toolchain (Docker,
+packaging, a network-bound vendor check).
 
 A GitHub Pages deploy is a separate `pages.yml`: `push` on `main` plus
 `workflow_dispatch`; workflow-level `permissions: contents: read`; a `build` job

@@ -3,8 +3,10 @@
 // and deliberately named so no other runner's glob picks it up.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,7 +17,7 @@ const sha = (p) => createHash('sha256').update(readFileSync(join(root, p))).dige
 
 // Update these when the shared file changes — in every repository, in one pass.
 const EDITORCONFIG_SHA = '85bccbd23a9070becfe1dc0dbb9ad7305fb2bb98f92f54cb9856d7d6eca4ebfe';
-const CONVENTIONS_SHA = 'b419b56e1b4a9f0b2fcfc9e957f1798b464918b89141b84fc9cdeac957f1c123';
+const CONVENTIONS_SHA = '71699d9ea9d3aa3fa81b91906cd439cb74f1355aba79b33e9652f2906b1a3023';
 
 const pkg = JSON.parse(read('package.json'));
 const scripts = pkg.scripts ?? {};
@@ -58,6 +60,22 @@ test('the CI workflow shape', () => {
   assert.ok(!/uses: [^@\n]+@v\d/.test(ci), 'actions are pinned to a commit SHA, not a tag');
   assert.match(ci, /npm run test:conventions/);
   for (const s of ['lint', 'typecheck']) if (scripts[s]) assert.match(ci, new RegExp(`npm run ${s}\\b`), `CI runs ${s}`);
+  assert.equal(/npm audit --omit=dev --audit-level=high/.test(ci), lockfile, 'the audit runs exactly when there is a lockfile');
+  if (lockfile) assert.match(ci, /^ {2}audit:$/m, 'the audit is a job of its own');
+});
+
+// Every tsconfig.json the repository tracks, resolved the way tsc resolves it (extends,
+// comments and all), so a flag set in a base file counts and one set nowhere does not.
+test('noUncheckedIndexedAccess in every TypeScript project', () => {
+  const configs = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
+    .split('\0')
+    .filter((f) => f === 'tsconfig.json' || f.endsWith('/tsconfig.json'));
+  if (configs.length === 0) return;
+  const tsc = createRequire(join(root, 'package.json')).resolve('typescript/bin/tsc');
+  for (const f of configs) {
+    const shown = JSON.parse(execFileSync(process.execPath, [tsc, '--showConfig', '-p', f], { cwd: root, encoding: 'utf8' }));
+    assert.equal(shown.compilerOptions?.noUncheckedIndexedAccess, true, `${f} sets noUncheckedIndexedAccess`);
+  }
 });
 
 test('the documents', () => {
