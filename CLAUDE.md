@@ -29,7 +29,10 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
   stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence), no
   build step. `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `sw.js`
-  and the licence, so a module added to one and not the other fails `npm test`. `sw.js` goes
+  and the licence, so a module added to one and not the other fails `npm test`, and pins the
+  workflow line for line: the build job is checkout (no persisted credentials), Node, the
+  tests, the assembly and the upload, and only the deploy job holds `pages: write` and
+  `id-token: write`, so a step, scope or trigger added to it fails there first. `sw.js` goes
   out as committed, not re-stamped per deploy: its `VERSION` is a hash of the shell files'
   contents, which `test/sw.test.js` recomputes (printing the value to paste in), so a deploy
   that changes a shell file reaches an installed copy as a new worker that caches the whole

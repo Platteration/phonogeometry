@@ -73,6 +73,66 @@ test('the site the deploy publishes is the service worker\'s shell, the worker a
   );
 });
 
+// pages.yml line for line, comments and blank lines aside. The build job runs the test suite,
+// so everything it may do is spelled out: check out without leaving the token in .git/config,
+// set up Node, test, assemble, upload. Nothing else touches the directory between the
+// assembly and the upload, which is what makes the test above a check of what is published.
+// Only the deploy job holds pages: write and id-token: write, the scopes that publish the
+// public site and mint an OIDC identity for the repository, and it runs nothing but the
+// deploy action. A step, a scope or a trigger added anywhere fails here until this list is
+// changed with it.
+const SHAPE = [
+  /^name: Deploy to GitHub Pages$/,
+  /^on:$/,
+  /^ {2}push:$/,
+  /^ {4}branches: \[main\]$/,
+  /^ {2}workflow_dispatch:$/,
+  /^permissions:$/,
+  /^ {2}contents: read$/,
+  /^concurrency:$/,
+  /^ {2}group: pages$/,
+  /^ {2}cancel-in-progress: true$/,
+  /^jobs:$/,
+  /^ {2}build:$/,
+  /^ {4}runs-on: ubuntu-latest$/,
+  /^ {4}timeout-minutes: [1-9]\d*$/,
+  /^ {4}steps:$/,
+  /^ {6}- uses: actions\/checkout@[0-9a-f]{40} # v\d+$/,
+  /^ {8}with:$/,
+  /^ {10}persist-credentials: false$/,
+  /^ {6}- uses: actions\/setup-node@[0-9a-f]{40} # v\d+$/,
+  /^ {8}with:$/,
+  /^ {10}node-version-file: \.nvmrc$/,
+  /^ {6}- run: npm test$/,
+  /^ {6}- name: Assemble the site$/,
+  /^ {8}run: mkdir dist && git archive HEAD [\w./ -]+ \| tar -x -C dist$/,
+  /^ {6}- uses: actions\/upload-pages-artifact@[0-9a-f]{40} # v\d+$/,
+  /^ {8}with:$/,
+  /^ {10}path: dist$/,
+  /^ {2}deploy:$/,
+  /^ {4}needs: build$/,
+  /^ {4}runs-on: ubuntu-latest$/,
+  /^ {4}timeout-minutes: [1-9]\d*$/,
+  /^ {4}permissions:$/,
+  /^ {6}pages: write$/,
+  /^ {6}id-token: write$/,
+  /^ {4}environment:$/,
+  /^ {6}name: github-pages$/,
+  /^ {6}url: \$\{\{ steps\.deployment\.outputs\.page_url \}\}$/,
+  /^ {4}steps:$/,
+  /^ {6}- id: deployment$/,
+  /^ {8}uses: actions\/deploy-pages@[0-9a-f]{40} # v\d+$/,
+];
+
+test('the deploy is checkout, Node, the tests, the assembly and the upload, and only its last job can publish', () => {
+  const lines = workflow.split('\n').filter((line) => !/^\s*(#|$)/.test(line));
+  const wrong = lines.findIndex((line, i) => !SHAPE[i]?.test(line));
+  assert.ok(wrong < 0 && lines.length === SHAPE.length,
+    wrong < 0
+      ? `pages.yml has ${lines.length} lines where ${SHAPE.length} are expected`
+      : `pages.yml line ${wrong + 1} (comments and blank lines aside) is ${JSON.stringify(lines[wrong])}, expected ${SHAPE[wrong] ?? 'no more lines'}`);
+});
+
 test('the deploy uploads the directory it assembled', () => {
   const { dir } = assembly();
   const m = workflow.match(/uses: actions\/upload-pages-artifact@[0-9a-f]{40}[^\n]*\n\s+with:\n\s+path: (\S+)\n/);
