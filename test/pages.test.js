@@ -10,6 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +31,29 @@ function assembly() {
   const m = lines[0].match(/git archive HEAD ((?:[\w./-]+ )*[\w./-]+) \| tar -x -C (\S+)$/);
   assert.ok(m, `not the expected form \`git archive HEAD <paths> | tar -x -C <dir>\`: ${lines[0].trim()}`);
   return { paths: m[1].split(' '), dir: m[2] };
+}
+
+/**
+ * The files `git archive HEAD` reads: git's tracked list where a work tree is rooted at `dir`.
+ * Otherwise every file on disk but node_modules and .git, since a `git archive` extract or a
+ * downloaded ZIP has no work tree and is that same list, and a copy unpacked inside some other
+ * work tree would get that tree's answer, which names nothing here. (test/conventions.mjs
+ * reads the repository the same way.)
+ */
+function repositoryFiles(dir) {
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    if (git('rev-parse', '--show-prefix').trim() === '') return git('ls-files', '-z').split('\0').filter(Boolean);
+  } catch {
+    // Not a work tree, or no git: read the disk.
+  }
+  const walk = (prefix) =>
+    fs.readdirSync(path.join(dir, prefix), { withFileTypes: true }).flatMap((entry) => {
+      const file = prefix + entry.name;
+      if (!entry.isDirectory()) return [file];
+      return entry.name === 'node_modules' || entry.name === '.git' ? [] : walk(`${file}/`);
+    });
+  return walk('');
 }
 
 /** What the worker caches on install, as paths under the site, taken from the worker itself. */
@@ -59,8 +83,8 @@ async function shell() {
 
 test('the site the deploy publishes is the service worker\'s shell, the worker and the three.js licence', async () => {
   const { paths } = assembly();
-  const tracked = (spec) => execFileSync('git', ['ls-files', '-z', '--', ...spec], { cwd: root, encoding: 'utf8' })
-    .split('\0').filter(Boolean);
+  const files = repositoryFiles(root);
+  const tracked = (spec) => files.filter((f) => spec.some((p) => f === p || f.startsWith(`${p.replace(/\/$/, '')}/`)));
   // `git archive` refuses a path that matches nothing, which would fail the deploy outright.
   for (const p of paths) assert.ok(tracked([p]).length > 0, `pages.yml publishes ${p}, which is not in the repository`);
 
@@ -71,6 +95,31 @@ test('the site the deploy publishes is the service worker\'s shell, the worker a
     'The files pages.yml publishes and the files sw.js caches (plus sw.js and vendor/three/LICENSE) must be the same set.\n'
     + 'A file the app loads belongs in both: in SHELL so it works offline, in the `git archive` line so it is on the site.',
   );
+});
+
+// A copy that is not a checkout: a directory no work tree is rooted in, once on its own and once
+// inside another work tree. Without git there is no other work tree to sit in, so only the
+// first copy exists.
+test('the published files are read off the disk where no work tree is rooted here', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'pages-'));
+  try {
+    const copies = [path.join(outer, 'archive')];
+    try {
+      execFileSync('git', ['init', '-q', path.join(outer, 'repo')], { stdio: 'ignore' });
+      copies.push(path.join(outer, 'repo', 'unpacked'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    for (const copy of copies) {
+      for (const f of ['index.html', 'src/app.js', 'node_modules/pkg/index.js', '.git/HEAD']) {
+        fs.mkdirSync(path.dirname(path.join(copy, f)), { recursive: true });
+        fs.writeFileSync(path.join(copy, f), '\n');
+      }
+      assert.deepEqual(repositoryFiles(copy).sort(), ['index.html', 'src/app.js'], copy);
+    }
+  } finally {
+    fs.rmSync(outer, { recursive: true, force: true });
+  }
 });
 
 // pages.yml line for line, comments and blank lines aside. The build job runs the test suite,

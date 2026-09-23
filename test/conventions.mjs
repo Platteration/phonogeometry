@@ -1,12 +1,18 @@
 // The conventions shared by every platteration repository (see CONVENTIONS.md), pinned
-// so that a session cannot quietly re-decide them. Zero dependencies, node:test only,
-// and deliberately named so no other runner's glob picks it up.
+// so that a session cannot quietly re-decide them. node:test only, and deliberately named
+// so no other runner's glob picks it up. It imports nothing outside Node, but the
+// TypeScript test needs the installed tree: typescript from node_modules, and expo for a
+// config that extends expo/tsconfig.base. Without them that test fails rather than skips,
+// since a skipped check reads as a passed one: run `npm ci` first. It lists the files git
+// tracks, and reads them off the disk where no work tree is rooted here (an archive or a
+// downloaded ZIP).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -61,20 +67,112 @@ test('the CI workflow shape', () => {
   assert.match(ci, /npm run test:conventions/);
   for (const s of ['lint', 'typecheck']) if (scripts[s]) assert.match(ci, new RegExp(`npm run ${s}\\b`), `CI runs ${s}`);
   assert.equal(/npm audit --omit=dev --audit-level=high/.test(ci), lockfile, 'the audit runs exactly when there is a lockfile');
-  if (lockfile) assert.match(ci, /^ {2}audit:$/m, 'the audit is a job of its own');
+  if (lockfile) {
+    assert.match(ci, /^ {2}audit:$/m, 'the audit is a job of its own');
+    // The job line for line, so that it can fail: a line anywhere else in the file cannot
+    // stand in for one missing here, and `|| true`, `continue-on-error`, `if:`, an install
+    // step or a commented-out audit is a line the job does not have.
+    const job = jobLines(ci, 'audit');
+    const shape = [
+      /^ {4}runs-on: \S+$/,
+      /^ {4}timeout-minutes: [1-9]\d*$/,
+      /^ {4}steps:$/,
+      /^ {6}- uses: actions\/checkout@[0-9a-f]{40} # v\d+$/,
+      /^ {6}- uses: actions\/setup-node@[0-9a-f]{40} # v\d+$/,
+      /^ {8}with:$/,
+      /^ {10}node-version-file: \.nvmrc$/,
+      /^ {6}- run: npm audit --omit=dev --audit-level=high$/,
+    ];
+    const wrong = job.findIndex((line, i) => !shape[i]?.test(line));
+    assert.ok(wrong < 0 && job.length === shape.length, `the audit job is runs-on, a timeout, checkout, setup-node from .nvmrc and the audit, and nothing else; ${wrong < 0 ? `it has ${job.length} lines of ${shape.length}` : `line ${wrong + 1} is ${JSON.stringify(job[wrong])}`}`);
+    const runs = ci.split('\n').filter((line) => /\bnpm audit\b/.test(line) && !/^\s*#/.test(line));
+    assert.equal(runs.length, 1, 'npm audit runs in the audit job and nowhere else, so check means what it always meant');
+  }
 });
 
-// Every tsconfig.json the repository tracks, resolved the way tsc resolves it (extends,
-// comments and all), so a flag set in a base file counts and one set nowhere does not.
+// The lines of one job under `jobs:`, without blank lines and comments: from its `  name:`
+// line to the next key at two spaces or less. A comment at any indent does not end it,
+// since YAML reads the keys after one as the same job's.
+function jobLines(ci, name) {
+  const lines = ci.split('\n');
+  const start = lines.indexOf(`  ${name}:`);
+  const out = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*(#|$)/.test(line)) continue;
+    if (/^ {0,2}\S/.test(line)) break;
+    out.push(line);
+  }
+  return out;
+}
+
+// Every tsconfig.json in the repository (`repositoryFiles`), resolved the way tsc resolves
+// it (extends, comments and all), so a flag set in a base file counts and one set nowhere
+// does not.
 test('noUncheckedIndexedAccess in every TypeScript project', () => {
-  const configs = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
-    .split('\0')
-    .filter((f) => f === 'tsconfig.json' || f.endsWith('/tsconfig.json'));
+  const configs = repositoryFiles(root).filter((f) => f === 'tsconfig.json' || f.endsWith('/tsconfig.json'));
   if (configs.length === 0) return;
-  const tsc = createRequire(join(root, 'package.json')).resolve('typescript/bin/tsc');
+  const tsc = typescriptCompiler(root);
   for (const f of configs) {
     const shown = JSON.parse(execFileSync(process.execPath, [tsc, '--showConfig', '-p', f], { cwd: root, encoding: 'utf8' }));
     assert.equal(shown.compilerOptions?.noUncheckedIndexedAccess, true, `${f} sets noUncheckedIndexedAccess`);
+  }
+});
+
+// The files git tracks when a work tree is rooted at `dir`. Otherwise every file on disk
+// but node_modules and .git: a `git archive` or a downloaded ZIP has no work tree at all,
+// and a copy unpacked inside some other work tree would get that tree's answer, which
+// lists nothing here and would pass the test above without reading a tsconfig.
+function repositoryFiles(dir) {
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    if (git('rev-parse', '--show-prefix').trim() === '') return git('ls-files', '-z').split('\0').filter(Boolean);
+  } catch {
+    // Not a work tree, or no git: read the disk.
+  }
+  const walk = (prefix) =>
+    readdirSync(join(dir, prefix), { withFileTypes: true }).flatMap((entry) => {
+      const path = prefix + entry.name;
+      if (!entry.isDirectory()) return [path];
+      return entry.name === 'node_modules' || entry.name === '.git' ? [] : walk(`${path}/`);
+    });
+  return walk('');
+}
+
+// The TypeScript compiler the repository installed; a copy nothing was installed into
+// fails saying what to run, not only that a module is missing.
+function typescriptCompiler(dir) {
+  try {
+    return createRequire(join(dir, 'package.json')).resolve('typescript/bin/tsc');
+  } catch (error) {
+    throw new Error(`TypeScript is not installed here: run \`npm ci\` first (${error.message.split('\n')[0]})`);
+  }
+}
+
+// The two helpers on a copy that is not a checkout: a directory no work tree is rooted in,
+// once on its own and once inside another work tree, with nothing installed. Without git
+// there is no other work tree to sit in, so only the first copy exists.
+test('the TypeScript test reads a copy that is not a checkout', () => {
+  const outer = mkdtempSync(join(tmpdir(), 'conventions-'));
+  try {
+    const copies = [join(outer, 'archive')];
+    try {
+      execFileSync('git', ['init', '-q', join(outer, 'repo')], { stdio: 'ignore' });
+      copies.push(join(outer, 'repo', 'unpacked'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    for (const copy of copies) {
+      for (const f of ['tsconfig.json', 'app/tsconfig.json', 'node_modules/pkg/tsconfig.json', '.git/tsconfig.json']) {
+        mkdirSync(dirname(join(copy, f)), { recursive: true });
+        writeFileSync(join(copy, f), '{}\n');
+      }
+    }
+    for (const copy of copies) {
+      assert.deepEqual(repositoryFiles(copy).sort(), ['app/tsconfig.json', 'tsconfig.json'], copy);
+      assert.throws(() => typescriptCompiler(copy), /^Error: TypeScript is not installed here: run `npm ci` first/);
+    }
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
   }
 });
 
