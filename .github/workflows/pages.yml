@@ -1,5 +1,8 @@
 # Publishes the app to GitHub Pages, at <user>.github.io/<repository>/. Enable Pages for the
-# repository (Settings → Pages → Source: GitHub Actions) once.
+# repository (Settings → Pages → Source: GitHub Actions) once. It runs on a push to main, so a
+# main branch has to exist and the github-pages environment has to accept deployments from it
+# (by default that environment admits the default branch); GitHub offers the manual run
+# (workflow_dispatch) only for a workflow file on the default branch.
 name: Deploy to GitHub Pages
 
 on:
@@ -24,9 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # The only git command after the checkout is the local `git archive` below;
-          # without this the job's token is left in .git/config for every later step
-          # to read.
+          # The only git commands after the checkout are local ones (npm test lists the
+          # tracked files, and the `git archive` below reads them); without this the
+          # job's token is left in .git/config for every later step to read.
           persist-credentials: false
       # No cache and no install: the app has no dependencies and no lockfile.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
