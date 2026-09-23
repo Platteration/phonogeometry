@@ -41,12 +41,14 @@ jobs:
       # tests, tools, docs, dev server or dotfiles. test/pages.test.js holds this list to the
       # service worker's SHELL.
       #
-      # sw.js is published as committed, not re-stamped per commit. The worker is network
-      # first and rewrites each shell file it fetches into its cache, so a deploy reaches a
-      # returning visitor without a new cache name; VERSION is bumped by hand when the shell
-      # changes, which is when the whole shell should be fetched again. A per-commit stamp
-      # would make every push to main, a README edit included, re-download the shell,
-      # three.js and all, for every installed copy.
+      # sw.js is published as committed, not re-stamped per commit. Its VERSION is a hash of
+      # the shell files' contents, and the npm test above fails when it does not match them,
+      # so a deploy that changes any shell file publishes a new worker: an installed copy
+      # fetches the whole shell into a new cache and drops the old one. The worker's own
+      # refresh of what a visit happens to fetch cannot stand in for that, since offline it
+      # would leave the files the visit did not load at the old version. A deploy that
+      # changes no shell file (a README edit) keeps the name, where a per-commit stamp would
+      # make every installed copy download the shell, three.js and all, again.
       - name: Assemble the site
         run: mkdir dist && git archive HEAD index.html styles.css manifest.webmanifest sw.js icons src vendor/three | tar -x -C dist
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3

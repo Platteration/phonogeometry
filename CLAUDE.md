@@ -30,9 +30,14 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence), no
   build step. `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `sw.js`
   and the licence, so a module added to one and not the other fails `npm test`. `sw.js` goes
-  out as committed, not re-stamped per deploy: the worker is network first and rewrites each
-  shell file it fetches, so a deploy reaches returning visitors without a new cache name, and
-  `VERSION` stays the generation bumped by hand when the shell changes.
+  out as committed, not re-stamped per deploy: its `VERSION` is a hash of the shell files'
+  contents, which `test/sw.test.js` recomputes (printing the value to paste in), so a deploy
+  that changes a shell file reaches an installed copy as a new worker that caches the whole
+  shell afresh, and one that changes none (a README edit) makes nobody download it again. The
+  worker is network first and writes each shell file it fetches back into its own cache,
+  cloning the response before the page reads it (a clone taken after throws, and for a long
+  time nothing was written); that refresh covers only what a visit loads, so it is not how a
+  deploy arrives.
 
 ## Layout
 
@@ -109,7 +114,7 @@ through a validator, `has` is an own-property lookup, and `test/prefs.test.js` w
 app has one dark palette (`color-scheme: dark`) and no theme preference. There is no Reset:
 four controls, each one click from its default. The About block's version is `APP_VERSION` in
 `src/version.js`, pinned to `package.json`; the `VERSION` in `sw.js` is the service worker's
-cache generation, bumped on every shell edit, and is not that. The shots are IndexedDB
+cache name, a hash of the shell files, and is not that. The shots are IndexedDB
 (`src/storage.js`), not a preference, and none of this touches them.
 
 ## Code conventions

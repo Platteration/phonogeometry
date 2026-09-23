@@ -132,7 +132,7 @@ Some phones refuse to stream several rear cameras at the same time. Cameras that
 
 ### Deploy
 
-`.github/workflows/pages.yml` publishes the app to GitHub Pages once Pages is enabled for the repository (Settings → Pages → Source: GitHub Actions): every push to `main` runs `npm test` and uploads the files the app serves, as committed. Nothing is built, and the tests, tools and docs stay behind. The app runs from the project's sub-path (`<user>.github.io/<repository>/`), installs, and works offline there.
+`.github/workflows/pages.yml` publishes the app to GitHub Pages once Pages is enabled for the repository (Settings → Pages → Source: GitHub Actions): every push to `main` runs `npm test` and uploads the files the app serves, as committed. Nothing is built, and the tests, tools and docs stay behind. The app runs from the project's sub-path (`<user>.github.io/<repository>/`), installs, and works offline there. Online it always loads the newest files. An installed copy takes a deploy offline as a whole: the service worker's cache name (`VERSION` in `sw.js`) is a hash of the files it caches, so a deploy that changes any of them is a new worker, which downloads them all again and drops the old copy; `npm test` fails, printing the value to use, until `VERSION` matches the files.
 
 ## Development
 

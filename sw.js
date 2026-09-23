@@ -2,8 +2,15 @@
 // Cache Storage is partitioned by origin, not by worker scope, so on a shared static host
 // (GitHub Pages puts every project of an account on one origin) this worker sees the caches
 // of every other app there. The prefix is what tells its own caches from theirs.
+//
+// VERSION is derived, not typed: it is a hash of the SHELL files' contents, and
+// test/sw.test.js recomputes it and fails, printing the value to paste in, when a shell file
+// changes without it. A byte-identical sw.js is never reinstalled, so this name is what takes
+// a deploy to an installed copy as a whole: the new worker caches every shell file afresh and
+// the old cache goes on activate. A deploy that touches no shell file leaves it alone, and
+// nobody downloads three.js again for a README edit.
 const PREFIX = 'phonogeometry-';
-const VERSION = `${PREFIX}v22`;
+const VERSION = `${PREFIX}e0ac7b4bb87b`;
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'src/app.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/install.js', 'src/camera/cameraManager.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
@@ -37,7 +44,12 @@ self.addEventListener('fetch', (e) => {
       // cache there, so offline it could answer with a file another app cached under this URL.
       caches.open(VERSION).then((c) => c.match(e.request)).then((cached) => {
         const fetched = fetch(e.request).then((res) => {
-          if (res && res.ok && isShell(url)) caches.open(VERSION).then((c) => c.put(e.request, res.clone()));
+          if (res && res.ok && isShell(url)) {
+            // Copy the body before the response goes to the page, which reads it: a clone taken
+            // after that throws, so one taken inside the cache open below never reached the cache.
+            const copy = res.clone();
+            e.waitUntil(caches.open(VERSION).then((c) => c.put(e.request, copy)).catch(() => { /* the response still stands */ }));
+          }
           return res;
         }).catch(() => null);
         // Network first so updates land quickly, falling back to the cache when offline —

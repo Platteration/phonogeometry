@@ -4,6 +4,12 @@
 // puts every project of an account on one — so the caches of other apps are here too.
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const ORIGIN = 'https://example.test';
 const FOREIGN = 'ambient-noiser-9f2c41';   // another app's cache, on the same origin
@@ -12,6 +18,8 @@ const store = new Map();   // cache name -> Map(url -> Response), standing in fo
 let opened;         // the cache names the worker asked to open, in order
 let cache;          // this app's own cache, whatever it calls it
 let networkAnswer;  // (url) -> Response | Promise rejection
+let installed;      // the list the install handler hands cache.addAll
+let extended = [];  // every promise the worker hands an event's waitUntil
 
 globalThis.self = {
   addEventListener: (type, fn) => { listeners[type] = fn; },
@@ -23,12 +31,16 @@ globalThis.location = { origin: ORIGIN, href: `${ORIGIN}/sw.js` };
 globalThis.caches = {
   keys: async () => [...store.keys()],
   delete: async (name) => store.delete(name),
+  // A real Cache Storage answers on a later task, after the page has started reading the
+  // response it was handed. A stub that answered in a microtask let a clone taken inside
+  // the open pass here while Chromium threw ('body is already used') and cached nothing.
   open: async (name) => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
     opened.push(name);
     if (!store.has(name)) store.set(name, new Map());
     const entries = store.get(name);
     return {
-      addAll: async () => {},
+      addAll: async (list) => { installed = list; },
       match: async (req) => entries.get(new URL(req.url).href),
       put: async (req, res) => { entries.set(new URL(req.url).href, res); },
     };
@@ -56,9 +68,23 @@ async function activated() {
 }
 
 function get(url) {
-  const event = { request: { method: 'GET', url }, responded: null, respondWith(p) { this.responded = p; } };
+  const event = {
+    request: { method: 'GET', url },
+    responded: null,
+    respondWith(p) { this.responded = p; },
+    waitUntil(p) { extended.push(p); },
+  };
   listeners.fetch(event);
   return event.responded;
+}
+
+/** Until everything the worker asked to be kept alive for has finished, and two tasks more
+ *  so that a write it left floating outside waitUntil is seen as well. */
+async function settled() {
+  do {
+    await Promise.all(extended.splice(0));
+    for (let i = 0; i < 2; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  } while (extended.length > 0);
 }
 
 beforeEach(() => {
@@ -66,6 +92,7 @@ beforeEach(() => {
   store.set(OWN, new Map());
   cache = store.get(OWN);
   opened = [];
+  extended = [];
   networkAnswer = () => { throw new Error('no network expected'); };
 });
 
@@ -110,8 +137,8 @@ test('a good response is preferred over the cache and refreshes it', async () =>
   cache.set(`${ORIGIN}/styles.css`, new Response('old', { status: 200 }));
   networkAnswer = async () => new Response('new', { status: 200 });
   const res = await get(`${ORIGIN}/styles.css`);
-  assert.equal(await res.text(), 'new');
-  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(await res.text(), 'new');   // the page reads the body first, as a browser does
+  await settled();
   assert.equal(await cache.get(`${ORIGIN}/styles.css`).text(), 'new');
 });
 
@@ -124,12 +151,12 @@ test('a bad status with nothing cached is passed through, not swallowed', async 
 test('only shell files are written to the cache at runtime', async () => {
   networkAnswer = async () => new Response('something else on this origin', { status: 200 });
   await get(`${ORIGIN}/some/other/thing.json`);
-  await new Promise((r) => setTimeout(r, 0));
+  await settled();
   assert.equal(cache.size, 0);
 
   networkAnswer = async () => new Response('shell', { status: 200 });
   await get(`${ORIGIN}/src/vision/sfm.js`);
-  await new Promise((r) => setTimeout(r, 0));
+  await settled();
   assert.equal(cache.size, 1);
 });
 
@@ -137,6 +164,22 @@ test('the page itself counts as shell, with or without index.html', async () => 
   networkAnswer = async () => new Response('page', { status: 200 });
   await get(`${ORIGIN}/`);
   await get(`${ORIGIN}/index.html`);
-  await new Promise((r) => setTimeout(r, 0));
+  await settled();
   assert.equal(cache.size, 2);
+});
+
+// The runtime refresh above only rewrites what a visitor happens to fetch, so on its own a
+// deploy would leave an installed copy half old and half new offline. What moves the whole
+// shell is a new cache name, and a name typed by hand was left alone by three commits that
+// changed shell files. So the name is a hash of the shell's bytes, and this recomputes it.
+test('the cache name is derived from the shell files, so a deploy that changes one replaces the whole cache', () => {
+  assert.ok(Array.isArray(installed) && installed.length > 0, 'the worker caches its shell on install');
+  const hash = createHash('sha256');
+  for (const entry of installed) {
+    const file = new URL(entry, `${ORIGIN}/sw.js`).pathname.slice(1) || 'index.html';
+    hash.update(`${entry}\0`).update(fs.readFileSync(path.join(root, file)));
+  }
+  const digest = hash.digest('hex').slice(0, 12);
+  assert.equal(OWN, `phonogeometry-${digest}`,
+    `sw.js VERSION does not match the shell: installed copies would keep the old files offline. Set it to \`\${PREFIX}${digest}\`.`);
 });
