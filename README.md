@@ -130,6 +130,10 @@ Browsers do not report focal lengths. Each camera is mapped to a lens type (wide
 
 Some phones refuse to stream several rear cameras at the same time. Cameras that cannot be opened concurrently are captured sequentially right after the simultaneous ones (this is on by default and can be disabled in Settings); hold still for that half second.
 
+### Deploy
+
+`.github/workflows/pages.yml` publishes the app to GitHub Pages once Pages is enabled for the repository (Settings → Pages → Source: GitHub Actions): every push to `main` runs `npm test` and uploads the files the app serves, as committed. Nothing is built, and the tests, tools and docs stay behind. The app runs from the project's sub-path (`<user>.github.io/<repository>/`), installs, and works offline there.
+
 ## Development
 
 ```bash

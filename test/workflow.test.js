@@ -1,8 +1,10 @@
-// The CI workflow is the only place this repository installs anything from the registry, and
-// how it installs it is a decision rather than a detail: an install script runs arbitrary code
+// The workflows are the only place this repository installs anything from the registry, and
+// how they install it is a decision rather than a detail: an install script runs arbitrary code
 // from a package's whole dependency tree, on a runner holding this repository's token. The
 // audit records that finding as fixed "with a regression test"; this is that test. Without it
-// the flag is one careless edit away from coming back off, with nothing to notice.
+// the flag is one careless edit away from coming back off, with nothing to notice. It reads
+// every workflow, not only ci.yml: the Pages build installs nothing today, but a script run
+// there could rewrite the site before the deploy job publishes it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,7 +12,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
+const dir = path.join(root, '.github', 'workflows');
+const workflow = fs.readdirSync(dir).filter((f) => /\.ya?ml$/.test(f)).sort()
+  .map((f) => fs.readFileSync(path.join(dir, f), 'utf8')).join('\n');
 
 test('nothing is installed in CI with its install scripts allowed to run', () => {
   const installs = workflow.split('\n').filter((line) => /\bnpm (install|ci)\b/.test(line));

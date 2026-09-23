@@ -1,0 +1,67 @@
+# Publishes the app to GitHub Pages, at <user>.github.io/<repository>/. Enable Pages for the
+# repository (Settings → Pages → Source: GitHub Actions) once.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The build job runs the test suite, so it gets no more than read: anything that suite
+# executes would otherwise hold a token that can publish the public site and mint an OIDC
+# identity for this repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The only git command after the checkout is the local `git archive` below;
+          # without this the job's token is left in .git/config for every later step
+          # to read.
+          persist-credentials: false
+      # No cache and no install: the app has no dependencies and no lockfile.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm test
+      # There is no build step: the site is the files the app serves, as committed (the
+      # tracked tree, not the working directory). That is the page, its stylesheet, manifest
+      # and icons, the service worker, every module under src/, and the vendored three.js
+      # with its licence, whose permission notice has to travel with the copy: the minified
+      # file carries only a copyright and SPDX line, and OrbitControls.js neither. Not the
+      # tests, tools, docs, dev server or dotfiles. test/pages.test.js holds this list to the
+      # service worker's SHELL.
+      #
+      # sw.js is published as committed, not re-stamped per commit. The worker is network
+      # first and rewrites each shell file it fetches into its cache, so a deploy reaches a
+      # returning visitor without a new cache name; VERSION is bumped by hand when the shell
+      # changes, which is when the whole shell should be fetched again. A per-commit stamp
+      # would make every push to main, a README edit included, re-download the shell,
+      # three.js and all, for every installed copy.
+      - name: Assemble the site
+        run: mkdir dist && git archive HEAD index.html styles.css manifest.webmanifest sw.js icons src vendor/three | tar -x -C dist
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: dist
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

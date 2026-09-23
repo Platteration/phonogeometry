@@ -25,6 +25,14 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   a secure context: a self-signed certificate blocks service worker registration outright, so
   the HTTPS dev server cannot exercise it. Headless Chromium via Playwright works with fake camera devices
   (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`).
+- `.github/workflows/pages.yml` publishes to GitHub Pages on a push to `main` or by hand:
+  `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
+  stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence), no
+  build step. `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `sw.js`
+  and the licence, so a module added to one and not the other fails `npm test`. `sw.js` goes
+  out as committed, not re-stamped per deploy: the worker is network first and rewrites each
+  shell file it fetches, so a deploy reaches returning visitors without a new cache name, and
+  `VERSION` stays the generation bumped by hand when the shell changes.
 
 ## Layout
 
