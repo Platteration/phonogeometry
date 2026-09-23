@@ -8,6 +8,7 @@
 // suite skips itself, which is what makes it safe to run anywhere — set REQUIRE_BROWSER=1
 // (as CI does) to make a missing browser a failure instead of a silent pass.
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -43,6 +44,64 @@ function findChromium(chromium) {
   const own = (() => { try { return chromium.executablePath(); } catch { return null; } })();
   const candidates = [process.env.CHROMIUM_PATH, own, '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].filter(Boolean);
   return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || null;
+}
+
+// GitHub Pages serves the app from <user>.github.io/<repository>/, not from the root.
+const SUB_PATH = '/phonogeometry/';
+const TYPES = {
+  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
+  '.webmanifest': 'application/manifest+json', '.png': 'image/png',
+};
+
+/** A copy of what .github/workflows/pages.yml publishes, taken from the working tree. */
+function assembleSite(into) {
+  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'pages.yml'), 'utf8');
+  const m = workflow.match(/git archive HEAD ((?:[\w./-]+ )*[\w./-]+) \| tar -x -C \S+$/m);
+  if (!m) throw new Error('pages.yml has no `git archive HEAD <paths> | tar -x -C <dir>` line to take the site from');
+  for (const p of m[1].split(' ')) fs.cpSync(path.join(root, p), path.join(into, p), { recursive: true });
+  return into;
+}
+
+/**
+ * Serves `dir` under SUB_PATH the way a static host does, and nothing outside it, recording
+ * every request so a URL that escapes the sub-path or names a missing file is seen. `stop`
+ * closes it for real: Playwright's offline mode does not reach a service worker's own fetches
+ * (measured: a reload after setOffline(true) still sent 26 requests to the host), so a worker
+ * that answered from the network rather than its cache would pass with the host still up.
+ * no-store keeps the browser's HTTP cache out of what the worker is shown.
+ */
+async function serveSite(dir) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const { pathname } = new URL(req.url, 'http://localhost');
+    let file = null;
+    if (pathname.startsWith(SUB_PATH)) {
+      let rel = null;
+      try { rel = decodeURIComponent(pathname.slice(SUB_PATH.length)); } catch { /* a malformed escape is a 404 */ }
+      const candidate = rel === null ? null : path.join(dir, rel === '' || rel.endsWith('/') ? `${rel}index.html` : rel);
+      if (candidate?.startsWith(dir + path.sep) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) file = candidate;
+    }
+    requests.push({ path: pathname, status: file ? 200 : 404 });
+    res.writeHead(file ? 200 : 404, { 'content-type': file ? (TYPES[path.extname(file)] ?? 'application/octet-stream') : 'text/plain', 'cache-control': 'no-store' });
+    res.end(file ? fs.readFileSync(file) : 'not found');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://localhost:${server.address().port}${SUB_PATH}`,
+    requests,
+    stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
+  };
+}
+
+/** The text of `file` in this app's own cache (whatever its generation), or null. */
+function cachedText(page, file) {
+  return page.evaluate(async (f) => {
+    for (const name of (await caches.keys()).filter((k) => k.startsWith('phonogeometry-'))) {
+      const hit = await (await caches.open(name)).match(f);
+      if (hit) return hit.text();
+    }
+    return null;
+  }, file);
 }
 
 const results = [];
@@ -518,15 +577,43 @@ async function main() {
       await page.close();
     }
 
-    // ---- 4. Offline ----
+    // ---- 4. Offline, from the sub-path the deploy publishes to ----
+    // What pages.yml publishes, served from SUB_PATH on a server of this step's own. Every other
+    // step uses the dev server at the root, where a root-relative URL (`/sw.js`, `/styles.css`)
+    // works and the published site would break.
     {
+      const site = await serveSite(assembleSite(path.join(fixtures, 'site')));
       const ctx = await browser.newContext({ viewport: { width: 420, height: 860 } });
       const page = await ctx.newPage();
-      await page.goto(BASE, { waitUntil: 'load' });
-      await page.waitForTimeout(4000);              // let the service worker cache the shell
+      await page.goto(site.url, { waitUntil: 'load' });
+      const scope = await page.evaluate(() => Promise.race([
+        navigator.serviceWorker.ready.then((r) => r.scope),       // active: the shell is cached
+        new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
+      ]));
       await page.reload({ waitUntil: 'load' });     // and take control
       await page.waitForTimeout(1500);
       const controlled = await page.evaluate(() => !!navigator.serviceWorker.controller);
+      check('the service worker takes the sub-path as its scope', scope === site.url, `scope ${scope}, site ${site.url}`);
+
+      // A deploy changes a file on the host. Loaded online, it has to reach the worker's
+      // cache as well as the page: a clone taken after the page had read the body threw
+      // here, and the cache kept the old file while the unit test's stub said otherwise.
+      const marker = '/* published after the install */';
+      fs.appendFileSync(path.join(fixtures, 'site', 'styles.css'), `\n${marker}\n`);
+      await page.reload({ waitUntil: 'load' });
+      let refreshed = false;
+      for (let i = 0; i < 40 && !refreshed; i++) {
+        refreshed = ((await cachedText(page, 'styles.css')) ?? '').includes(marker);
+        if (!refreshed) await page.waitForTimeout(250);
+      }
+      check('a shell file fetched online is written back into the worker\'s cache', refreshed);
+
+      const outside = site.requests.filter((r) => !r.path.startsWith(SUB_PATH));
+      const missing = site.requests.filter((r) => r.status !== 200);
+      check('nothing the app loads leaves its sub-path or is missing there', outside.length === 0 && missing.length === 0,
+        `${site.requests.length} requests, ${outside.length} outside ${SUB_PATH}, ${missing.length} not found: ${[...outside, ...missing].map((r) => r.path).slice(0, 4).join(' ')}`);
+
+      await site.stop();
       await ctx.setOffline(true);
       const reloaded = await page.reload({ waitUntil: 'load', timeout: 25000 }).then(() => true).catch(() => false);
       await page.waitForTimeout(1500);

@@ -153,7 +153,9 @@ browser's fake camera, imports rendered photographs, checks that a blurred one i
 sharp ones are not, reconstructs a scan and confirms every photo was used, times the camera
 preview against the finished mesh, downloads all three exports, reloads to confirm shots
 survive, feeds it a scan that cannot work and checks the reason reaches whichever screen the
-user is on, and finally cuts the network and runs a whole scan offline. It skips itself with
+user is on, and finally serves what the Pages workflow publishes from a sub-path, as GitHub
+Pages does, checks that nothing the app loads leaves it and that a file changed on the host
+reaches the offline copy, then shuts that server down and runs a whole scan offline. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
 CI runs `npm test`, `npm run test:conventions` and the browser suite, and a separate job

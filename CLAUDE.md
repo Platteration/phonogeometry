@@ -12,7 +12,12 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
 - `npm run test:e2e` runs the application end to end in Chromium (multi-camera capture, a
-  good scan, a hopeless one, exports, reload, offline). `test/browser/fakeCameras.mjs` stands
+  good scan, a hopeless one, exports, reload, offline). The offline step serves what
+  `pages.yml` publishes from `/phonogeometry/` on a server of its own, as GitHub Pages serves a
+  project site, fails on any request outside that sub-path or for a missing file, checks that a
+  file changed on the host reaches the worker's cache, and then closes that server: Playwright's
+  `setOffline` does not reach a service worker's own fetches, so a worker answering from the
+  network would pass with the host still up. `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
   camera. It starts its own server and renders its own
