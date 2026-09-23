@@ -47,7 +47,14 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   worker is network first and writes each shell file it fetches back into its own cache,
   cloning the response before the page reads it (a clone taken after throws, and for a long
   time nothing was written); that refresh covers only what a visit loads, so it is not how a
-  deploy arrives.
+  deploy arrives. A cache that will not open counts as a miss, not as a failure: `lookup`
+  heads the fetch handler's chain, and `caches.open` can reject where a match cannot (an
+  evicted quota, a broken backend), so an uncaught rejection there is a network error for
+  every request the worker intercepts, the page itself included, online or offline.
+  `test/sw.test.js` stubs the worker's globals and drives the real fetch handler against a
+  cache that refuses to open, which no browser stages on demand. `sw.js` is not one of the
+  hashed shell files, so a change to the worker alone leaves `VERSION` where it is: the new
+  bytes are what reinstall it.
 
 ## Layout
 

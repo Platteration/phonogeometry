@@ -35,14 +35,23 @@ function isShell(url) {
   return SHELL_URLS.has(bare) || SHELL_URLS.has(bare.replace(/index\.html$/, ''));
 }
 
+// Read from this app's own cache, not the origin's: the bare caches.match searches every
+// cache there, so offline it could answer with a file another app cached under this URL.
+// Opening a cache can fail where matching one cannot (it creates the cache when it is absent,
+// so an evicted quota or a broken backend rejects), and this heads the fetch handler's chain:
+// a rejection here would be a network error for every request the worker intercepts, the page
+// itself included, online or offline. A lookup that cannot answer is a miss, and the network
+// still gets its turn.
+function lookup(req) {
+  return caches.open(VERSION).then((c) => c.match(req)).catch(() => undefined);
+}
+
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET') return;
   if (url.origin === location.origin) {
     e.respondWith(
-      // Read from this app's own cache, not the origin's: the bare caches.match searches every
-      // cache there, so offline it could answer with a file another app cached under this URL.
-      caches.open(VERSION).then((c) => c.match(e.request)).then((cached) => {
+      lookup(e.request).then((cached) => {
         const fetched = fetch(e.request).then((res) => {
           if (res && res.ok && isShell(url)) {
             // Copy the body before the response goes to the page, which reads it: a clone taken

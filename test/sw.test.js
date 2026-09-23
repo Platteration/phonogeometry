@@ -19,6 +19,7 @@ let opened;         // the cache names the worker asked to open, in order
 let cache;          // this app's own cache, whatever it calls it
 let networkAnswer;  // (url) -> Response | Promise rejection
 let installed;      // the list the install handler hands cache.addAll
+let openFails;      // when set, caches.open rejects, as it does on an evicted quota or a broken backend
 let extended = [];  // every promise the worker hands an event's waitUntil
 
 globalThis.self = {
@@ -37,6 +38,7 @@ globalThis.caches = {
   open: async (name) => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     opened.push(name);
+    if (openFails) throw new DOMException('The cache could not be opened', 'QuotaExceededError');
     if (!store.has(name)) store.set(name, new Map());
     const entries = store.get(name);
     return {
@@ -93,6 +95,7 @@ beforeEach(() => {
   cache = store.get(OWN);
   opened = [];
   extended = [];
+  openFails = false;
   networkAnswer = () => { throw new Error('no network expected'); };
 });
 
@@ -140,6 +143,31 @@ test('a good response is preferred over the cache and refreshes it', async () =>
   assert.equal(await res.text(), 'new');   // the page reads the body first, as a browser does
   await settled();
   assert.equal(await cache.get(`${ORIGIN}/styles.css`).text(), 'new');
+});
+
+// caches.open creates the cache when it is absent, so it can fail where a match cannot: an
+// evicted quota, a corrupt backend. It heads the fetch handler's chain, so a rejection there
+// is not a cache miss but a network error for every request the worker intercepts, the page
+// itself included, online or offline, with no way to reach the page that would unregister the
+// worker. A lookup that cannot answer is a miss, and the network still gets its turn.
+test('a cache that will not open is a miss, not a dead page', async () => {
+  openFails = true;
+  networkAnswer = async (url) => new Response(`network ${url}`, { status: 200 });
+  for (const url of [`${ORIGIN}/`, `${ORIGIN}/index.html`, `${ORIGIN}/src/app.js`, `${ORIGIN}/some/other/thing.json`]) {
+    const res = await get(url);
+    assert.equal(res.status, 200, url);
+    assert.equal(await res.text(), `network ${url}`, `${url} is answered from the network`);
+  }
+  await settled();   // the write-back fails as well, and is dropped rather than left rejected
+  assert.ok(opened.length > 0 && opened.every((name) => name === OWN), `only this app's cache is asked for: ${opened.join(', ')}`);
+
+  // The network answering badly with no cache to fall back on is passed through, as before.
+  networkAnswer = async () => new Response('the host is unwell', { status: 502 });
+  assert.equal((await get(`${ORIGIN}/src/app.js`)).status, 502);
+
+  // No cache and no network: a network error the page can see as one, not a rejection.
+  networkAnswer = async () => { throw new TypeError('Failed to fetch'); };
+  assert.equal((await get(`${ORIGIN}/`)).type, 'error');
 });
 
 test('a bad status with nothing cached is passed through, not swallowed', async () => {
