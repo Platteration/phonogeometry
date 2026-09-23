@@ -38,7 +38,8 @@ function assembly() {
  * Otherwise every file on disk but node_modules and .git, since a `git archive` extract or a
  * downloaded ZIP has no work tree and is that same list, and a copy unpacked inside some other
  * work tree would get that tree's answer, which names nothing here. (test/conventions.mjs
- * reads the repository the same way.)
+ * reads the repository the same way, except that it also leaves out every dot-directory,
+ * where it has nothing to read.)
  */
 function repositoryFiles(dir) {
   const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });

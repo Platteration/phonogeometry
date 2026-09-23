@@ -1,30 +1,57 @@
 # Conventions shared by the platteration repositories
 
-This file is identical in every platteration repository and is pinned by the
-conventions test (`test/conventions.mjs`, or `tests/test_conventions.py` in a Python
-repository), which fails when the file, `.editorconfig` or the repository's shape drifts.
-To change a convention: change it in every repository in one pass, then update the
-hashes in the test. One convention per concern; where two answers were equally
-defensible, the one most repositories already used was chosen.
+This file is identical in every platteration repository. In every repository with code it
+is pinned by the conventions test, which fails when this file, `.editorconfig`, the shared
+status block in `REVIEW.md` or the repository's shape drifts; tradetrade, which has no code
+yet, carries this file and the documents, and gets its CI, its Dependabot configuration
+and the test with its first code. The test is one file, identical in every repository
+that runs it: `test/conventions.mjs` in every npm repository, and its counterpart
+`tests/test_conventions.py` in the Python repository, which carries the same hashes and
+reads the workflows the same way. To change a convention: change it in every repository in
+one pass, then update the hashes in the test. A check that only one repository needs goes
+in that repository's own tests, never into its copy of the shared test; the one exception
+is the Python test's pin of the Python repository's own `audit` steps, which stays there
+until a second Python repository gives that job a shared form. One convention per concern;
+where two answers were equally defensible, the one most repositories already used was
+chosen.
+
+The npm test uses `node:test` and Node's built-in modules, and nothing it has to install
+for itself. What it reads with TypeScript's own parser, it reads through the `typescript`
+package the repository installed (and `expo`, for a config that extends
+`expo/tsconfig.base`): in a repository with a TypeScript config it fails until they are
+installed, and says what to do, rather than skip, since a skipped check reads as a passed
+one. A repository with no TypeScript config needs neither. It lists the repository's files
+through git where a work tree is rooted at the repository, and reads them off the disk
+otherwise (a `git archive` extract, a downloaded ZIP), leaving out `node_modules` and
+dot-directories. Both tests read a workflow as the block YAML these files are written in,
+and refuse every other spelling YAML allows (a flow mapping `{ ... }`, a quoted or complex
+key, an anchor, alias or tag, a list at its key's own indent, a plain value carried onto a
+second line), because a check that reads one spelling is blind to another that GitHub runs
+the same.
 
 ## Scripts (`package.json`)
 
 | Script | Definition | Where |
 | --- | --- | --- |
 | `test` | the unit suite: no browser, no network; the runner stays per repository | all |
-| `typecheck` | `tsc --noEmit` (Next.js: `next typegen && tsc --noEmit`) | every TypeScript repository |
-| `lint` | `eslint .` | every repository with an ESLint config |
+| `typecheck` | `tsc --noEmit` (Next.js: `next typegen && tsc --noEmit`; a workspace root: `npm run typecheck --workspaces`) | every TypeScript repository |
+| `lint` | `eslint .` (a workspace root without a config of its own: `npm run lint --workspaces`) | every repository with an ESLint config |
 | `test:conventions` | `node --test test/conventions.mjs` | all |
 | `check` | `lint && typecheck && test && test:conventions`, omitting what the repository lacks — the local gate before a push (a Python repository's gate is `ruff check .` then `pytest -q`) | all |
-| `test:e2e` | the browser suite, self-contained: it builds and serves what it needs | every repository with one |
+| `test:e2e` | the end-to-end suite, self-contained: it builds, serves and drives what it needs (a browser suite everywhere but notenote, whose suite walks the built server over HTTP) | every repository with one |
 | `test:all` | `test && test:e2e` plus any other suites the repository has | every repository with `test:e2e` |
 | `start` | the dev server (Expo: `expo start`; static apps: the serve script) | Expo, static |
 | `dev` / `build` / `start` | `next dev` / `next build` / `next start` | Next.js |
-| `android` / `ios` / `web` | `expo start --android` / `--ios` / `--web` | Expo |
+| `android` / `ios` / `web` | `expo start --android` / `--ios` / `--web` (tvsham's app: `expo run:android` / `expo run:ios`, and no web) | Expo |
 
-An old script name is kept as a one-line alias (`"e2e": "npm run test:e2e"`) so nothing
-that names it breaks. CI runs the individual scripts, never `check`, so a failure is
-attributed to one step. Repository-specific scripts keep their names.
+`check` is exactly the scripts of the set the repository has, as `npm run lint`,
+`npm run typecheck`, `npm test` and `npm run test:conventions` joined by `&&`, so the first
+failure stops it. No script in the set ends a failure as a success (`|| true`, `|| exit 0`,
+a trailing `; true`). npm runs with its own defaults: there is no tracked `.npmrc`, where
+`script-shell` or `offline` would make every script, or the audit, pass. An old script
+name is kept as a one-line alias (`"e2e": "npm run test:e2e"`) so nothing that names it
+breaks. CI runs the individual scripts, never `check`, so a failure is attributed to one
+step. Repository-specific scripts keep their names.
 
 ## Runtime pinning
 
@@ -49,19 +76,71 @@ attributed to one step. Repository-specific scripts keep their names.
   - Static apps and the extension: no ESLint; their notes forbid tooling.
   - Python: `ruff check .` with `select = ["E4", "E7", "E9", "F"]` spelled out in
     `pyproject.toml` (ruff's own default set, pinned so CI and laptops agree) and
-    `target-version = "py310"`.
+    `target-version = "py310"`, and nothing that narrows what it checks: no `exclude`,
+    `include`, `ignore` or `extend`, per-file ignores only of whole rule codes in named
+    files, and no `ruff.toml`. pytest's configuration is `testpaths = ["tests"]` in the
+    same file and nothing else, and there is no `pytest.ini`, `tox.ini` or `setup.cfg`.
 - tsconfig: Expo apps extend `expo/tsconfig.base` with `strict: true` and `types` for the
   test runner where it needs them; hand-written configs use `strict`, `target: ES2022`,
-  `skipLibCheck`, `esModuleInterop`, `noEmit`. `noUncheckedIndexedAccess` is on in every
-  TypeScript project, workspaces included: an index that can miss is handled as one, and a
-  non-null assertion is kept for an index the code beside it has already bounded.
+  `skipLibCheck`, `esModuleInterop` and `noEmit`, with one exception: a config that a
+  `build` script compiles with (`tsc -p`, a Node server building `dist`) emits, so it
+  leaves `noEmit` off, and the `typecheck` script runs a `noEmit` config that extends it.
+  `noUncheckedIndexedAccess` is on in every TypeScript project, workspaces included: every
+  `tsconfig.json` and `tsconfig.<name>.json`, every config a `typecheck` script names, and
+  every config those reference, each read the way `tsc` reads it (`extends` and all). An
+  index that can miss is handled as one, and a non-null assertion is kept for an index the
+  code beside it has already bounded. A flag reaches only the files its project includes,
+  so every tracked TypeScript file is a root file of a project that `npm run typecheck`
+  runs `tsc` over, and every typecheck script is one the test can follow: `tsc --noEmit`
+  with at most one `-p` and no other option (an option on the command line overrides the
+  config), `next typegen`, or at a workspace root `npm run typecheck` over `--workspaces`
+  or named `--workspace` directories, joined by `&&`. Plain `tsc` does not build the
+  projects a solution-style config (`files: []` with `references`) references, so a file
+  reached only through one is type-checked by nothing.
 
 ## CI
 
-One workflow, `.github/workflows/ci.yml`, `name: CI`; other workflows only for deploys.
-Triggers: `push` on every branch, `pull_request`, `workflow_dispatch`. A `concurrency`
-group per ref cancels superseded runs. `permissions: contents: read` at the top.
-One job, `check`, `timeout-minutes: 20`, steps in this order, each a bare `run:`:
+At most two workflow files: `.github/workflows/ci.yml`, `name: CI`, and `pages.yml` where
+the repository deploys to GitHub Pages; no other. Triggers: `push` on every branch,
+`pull_request`, `workflow_dispatch`, and a weekly `schedule` with one cron,
+`"17 6 * * 1"` (Mondays, 06:17 UTC). A `concurrency` group per ref
+(`ci-${{ github.ref }}`, `cancel-in-progress: true`) cancels superseded runs; on the
+default branch the weekly run shares that group with pushes, and whichever of the two is
+cancelled, the other tests the branch's newest commit. In `ci.yml`, `permissions: contents:
+read` at the top and nowhere else, so no job holds a write permission. Every action is
+pinned to a commit SHA with its tag in a comment, and every job in `ci.yml` states its
+`timeout-minutes`.
+
+Nothing lets a job or a step pass red. A job in `ci.yml` has `runs-on`, `timeout-minutes`
+and `steps`, and a `name` or a `strategy` where it needs one (the Python repository's
+matrix), and nothing else: no `if:`, no `continue-on-error`, no `env:`, no permissions of
+its own (a Pages job's keys are below). A step, in any workflow, has its `run` or its
+`uses`, and any of `name`, `id`, `with`, `env` and `working-directory`: no `continue-on-error`,
+no `shell:`, and no `if:` but `if: failure()` on a step that uploads what a failed run
+left behind. There is no `env:` or `defaults:` at the top of a workflow, and a step's
+`env:` sets its own variables, never one that changes how npm, Node, Python or the shell
+runs (`npm_config_*`, `NODE_OPTIONS`, `PYTHON*`, `PYTEST_*`, `BASH_ENV`, `PATH` and the
+like): `npm_config_script_shell` makes every `npm run` pass, `npm_config_offline` makes the
+audit report nothing, and `PYTEST_ADDOPTS=--collect-only` makes pytest run nothing.
+
+The schedule is there because nothing else runs CI on a tree nobody pushes to. GitHub runs
+a schedule from the default branch's workflow file only, which is `main` once the owner has
+created it from this work and made it the default; from then on an advisory published
+against an unchanged lockfile turns `audit` red within a week without a push, and so does a
+build that rots with no one pushing (an end-to-end walk that has started to flake, a base
+image or toolchain that moved). The minute is not `0`: GitHub's documentation says a
+scheduled run can be delayed at times of high load, that high load times include the start
+of every hour, and that under enough load some queued jobs may be dropped. In a public
+repository GitHub disables a schedule after 60 days without repository activity; the
+Actions tab turns it back on.
+
+The jobs: `check` in every repository with code; `audit` in every npm repository with a
+lockfile and in none without one, and in the Python repository; others only when they need
+a different toolchain (Docker, packaging, a network-bound vendor check). The end-to-end
+suite is a step of `check`, not a job of its own: it needs no other toolchain.
+
+The `check` job has `timeout-minutes: 20` and starts with exactly these steps, in this
+order, each after the two actions a bare `run:`, with nothing between them:
 
 ```yaml
 - uses: actions/checkout@<sha> # v4
@@ -74,31 +153,71 @@ One job, `check`, `timeout-minutes: 20`, steps in this order, each a bare `run:`
 - run: npm run typecheck  # if the script exists
 - run: npm test
 - run: npm run test:conventions
-- <build or bundle step>  # Expo: expo export for the platforms the app ships to
-                          # Next.js: npm run build; static: none
-- run: npx playwright install --with-deps chromium   # repositories with test:e2e
-- run: npm run test:e2e
 ```
 
-Actions are pinned to a commit SHA with the tag in a comment. `npm test` is invoked
-plainly: GitHub sets `CI=true`, which Jest and the Expo CLI both read. A repository
-without a lockfile has no install step and no cache.
+The next step builds or bundles the app: an Expo app's `npx expo export --platform …` for
+the platforms it ships to (with `working-directory` where the app is a workspace), a
+Next.js app's `npm run build`; a static app has none. After it, in whatever order the
+repository needs, come its other suites, a browser install where its end-to-end suite
+drives one (`npx playwright install --with-deps chromium`, after, in a repository without
+a lockfile, the pinned `npm install --no-save --no-package-lock --ignore-scripts
+playwright@<version>`), and `npm run test:e2e` where the script exists, once in the file,
+with at most a `name:` and an `env:` beside it. `npm test` is invoked plainly: GitHub sets
+`CI=true`, which Jest and the Expo CLI both read. A repository without a lockfile has no
+`npm ci` and no cache. The Python repository's `check` runs over a matrix of exactly
+`"3.10"` and `"3.12"`, which its setup-python reads, and starts with checkout, setup-python,
+the project's install, `ruff check .`, `pytest -q` and `python tests/test_conventions.py`,
+with nothing between them; every other setup-python reads `.python-version`. The last runs
+the conventions test again on its own, as `npm run test:conventions` does in an npm
+repository: under pytest a setting such as `addopts = "--collect-only"` collects the test
+and runs none of it, and nothing inside the test can see that from there.
 
-A repository with a lockfile has a second job, `audit`: checkout, setup-node from
-`.nvmrc`, then `npm audit --omit=dev --audit-level=high`, with no install step, since
-the audit reads the lockfile. It is a job of its own so that an advisory published
-against an unchanged tree turns `audit` red and leaves `check` meaning what it always
-meant. `--omit=dev` because the gate is for what the app is built from, not for its
-test runner; `high` because a moderate advisory whose only fix npm can offer is a major
-downgrade of `expo` would otherwise hold every Expo repository red with nothing to do.
-The Python repository's `audit` job runs a pinned `pip-audit` over the project's
-declared dependencies. Other jobs only when they need a different toolchain (Docker,
-packaging, a network-bound vendor check).
+The `audit` job is exactly this, and `npm audit` appears nowhere else in the file:
 
-A GitHub Pages deploy is a separate `pages.yml`: `push` on `main` plus
-`workflow_dispatch`; workflow-level `permissions: contents: read`; a `build` job
-(`persist-credentials: false`, `npm ci`, `npm test`, the export, `upload-pages-artifact`)
-and a `deploy` job that alone holds `pages: write` and `id-token: write`.
+```yaml
+audit:
+  runs-on: ubuntu-latest
+  timeout-minutes: 10
+  steps:
+    - uses: actions/checkout@<sha> # v4
+    - uses: actions/setup-node@<sha> # v4
+      with:
+        node-version-file: .nvmrc
+    - run: npm audit --omit=dev --audit-level=high
+```
+
+No install step, since the audit reads the lockfile; and no `|| true`, no
+`continue-on-error`, no `if:`, because a job that cannot go red gates nothing. It is a job
+of its own so that an advisory, which is news about a tree that has not changed, turns
+`audit` red on the next run (on the default branch, the weekly one at the latest) and
+leaves `check` meaning what it always meant. `--omit=dev` audits what a production install
+would install: everything reachable from `dependencies`, `optionalDependencies` and
+`peerDependencies`, and nothing reachable only through `devDependencies`. That is the line
+`package.json` draws, not the line between what ships and what does not: Expo's bundler,
+Metro, arrives through `react-native` and is audited, and so is the PostCSS that Next.js
+runs, a dependency of `next`; Tailwind, which collectcollect declares as a devDependency
+although it builds the stylesheet, is not, and nor are the test runners, the linters and
+`typescript`; a library copied into the tree from a package is audited only when that
+package is a dependency (simplacad declares `three` one for that reason). Leaving the
+development tree out keeps test runners and linters from holding the gate red; it is also
+this gate's blind spot, and Dependabot's updates are what move those packages. `high`
+because a moderate advisory whose only fix npm can offer is a major downgrade of `expo`
+would otherwise hold every Expo repository red with nothing to do. The Python repository's
+`audit` job installs a hash-pinned `pip-audit` and audits the declared dependencies twice:
+at the newest versions their ranges resolve to, and at the declared floors.
+
+A GitHub Pages deploy is `pages.yml`, triggered by `push` on `main` and by
+`workflow_dispatch`, with workflow-level `permissions: contents: read` and two jobs.
+`build` has no key but `runs-on`, `timeout-minutes` and `steps`, so no permission of its
+own; it checks out with `persist-credentials: false`, sets up Node from `.nvmrc`, runs
+`npm ci` (with a lockfile), then `npm test` (or `npm run test:all`), then the export or
+assembly, then `upload-pages-artifact`, so a red suite stops the upload. `deploy` needs
+`build`, alone holds `pages: write` and `id-token: write`, has no other key but
+`runs-on`, `timeout-minutes` and its `environment`, and runs nothing but
+`actions/deploy-pages`: the job that can publish executes no code from the repository. A
+deploy needs `main` to exist and Pages to be enabled with GitHub Actions as its source,
+and GitHub offers the manual run only for a workflow file the default branch carries (from
+which it can then run another branch's copy).
 
 ## Dependabot
 
@@ -109,13 +228,19 @@ of development dependencies; one `npm` entry per workspace.
 ## Documents
 
 Every repository has `README.md`, `LICENSE`, `SECURITY.md`, `REVIEW.md`, `CLAUDE.md`,
-`CONVENTIONS.md`, `.gitignore`, `.editorconfig`, `.github/dependabot.yml` and
-`.github/workflows/ci.yml`; npm repositories add `.nvmrc`, Python adds
-`.python-version`; `SECURITY-AUDIT.md` records the audit where one ran. `CLAUDE.md` is
-the instruction file; where a tool regenerates `AGENTS.md`, `CLAUDE.md` starts with
-`@AGENTS.md` and carries the hand-written notes below it, and every `CLAUDE.md` has a
-`## Conventions` section pointing here. `CHANGELOG.md` and `PRIVACY.md` are kept where
-they exist. No CODEOWNERS, PR or issue templates: one owner.
+`CONVENTIONS.md`, `.gitignore` and `.editorconfig`; every repository with code adds
+`.github/dependabot.yml` and `.github/workflows/ci.yml`, an npm repository `.nvmrc`, the
+Python repository `.python-version`. `SECURITY-AUDIT.md` records the audit where one ran.
+`CLAUDE.md` is the instruction file; where a tool regenerates `AGENTS.md`, `CLAUDE.md`
+starts with `@AGENTS.md` and carries the hand-written notes below it, and every
+`CLAUDE.md` has a `## Conventions` section pointing here. `CHANGELOG.md` and `PRIVACY.md`
+are kept where they exist. No CODEOWNERS, PR or issue templates: one owner.
+
+`REVIEW.md` is each repository's own record, with one shared part: the block from the
+line `### Status of the shared items` up to the line `### A hardened workflow to copy`
+is the same text in every repository whose review has the shared list, and the
+conventions test pins it by hash. A note about one repository goes in that repository's
+own status section, not in the shared block.
 
 README skeleton: `# Name`, a one-paragraph pitch, the domain sections, then
 `## Running it` (install, start, platform variants, with `### Deploy` or

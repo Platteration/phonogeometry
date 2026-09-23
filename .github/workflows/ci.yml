@@ -5,8 +5,16 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # Weekly, for a tree nobody pushes to: GitHub runs a schedule from the default branch
+  # only, where an advisory or a build that has rotted then shows within a week. Not at
+  # the top of the hour, a high-load time when scheduled runs can be delayed or dropped
+  # (CONVENTIONS.md, "CI").
+  schedule:
+    - cron: "17 6 * * 1"
 
-# A newer push to the same branch supersedes an in-flight run.
+# A newer run for the same ref supersedes an in-flight one. On the default branch the
+# weekly run shares the group with pushes; whichever is cancelled, the other tests the
+# branch's newest commit.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
