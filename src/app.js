@@ -2,7 +2,10 @@
 import { CameraManager } from './camera/cameraManager.js';
 import { CaptureGuide } from './camera/captureGuide.js';
 import { MovementGuide } from './camera/moveGuide.js';
-import { LENS_TYPES, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
+import { LENS_TYPES, HFOV_RANGE, saveLensOverride, intrinsicsFor } from './camera/intrinsics.js';
+import { loadPrefs, savePrefs } from './prefs.js';
+import { APP_VERSION } from './version.js';
+import { wireInstallPrompt } from './install.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
@@ -26,7 +29,20 @@ const state = {
   viewer: null,
   cameraTiles: new Map(),
   autoShutterTouched: false, // once the user sets the switch, the preset stops moving it
+  // Bumped by every build and by every cancel. A build that started before the current
+  // value is stale and must stop where it is: cancelling can happen while photos are still
+  // being decoded, before there is a worker to terminate.
+  buildGen: 0,
+  // True from the moment a build starts until it finishes, fails or is cancelled. The worker
+  // is not that flag: it is created after the decode and outlives a finished build.
+  building: false,
+  // True while a shot is being grabbed. The sequential fallback closes and reopens cameras as
+  // it goes, so nothing else may close them underneath it.
+  capturing: false,
 };
+// Three frames is the least that can give a depth map with a second view to check it
+// against. Two, and often three, cannot produce a surface at all.
+const MIN_FRAMES = 3;
 const cams = new CameraManager();
 const store = new ShotStore();
 
@@ -104,23 +120,43 @@ function toast(msg, ms = 3000) {
 function showScreen(name) {
   for (const s of ['capture', 'process', 'view']) $(`#screen-${s}`).hidden = s !== name;
   $('#capture-bar').hidden = name !== 'capture';
-  if (name === 'capture') { if (cams.open.size) startGuide(); } else stopGuide();
-  if (name === 'view' && state.viewer) state.viewer.resize();
+  // The cameras belong to this screen. A reconstruction runs for minutes on a phone that is
+  // already hot, and an indicator left lit while nothing is being captured is worse than
+  // useless to whoever is in front of the lens: release them on the way out, open them again
+  // on the way back. A capture in flight is the exception — it opens and closes cameras of
+  // its own — and closes them itself if the screen went away while it ran.
+  if (name === 'capture') {
+    reopenCameras();
+    // The guide ticks harmlessly until a camera is open again; it only needs cameras found.
+    if (cams.cameras.length) startGuide();
+  } else {
+    stopGuide();
+    if (!state.capturing) cams.closeAll();
+  }
+  if (state.viewer) {
+    if (name === 'view') state.viewer.resize();
+    // Nothing is on screen to draw otherwise, and the next reconstruction wants the GPU.
+    state.viewer.setActive(name === 'view');
+  }
 }
 function frameCount() { return state.shots.reduce((n, s) => n + s.frames.length, 0); }
+/** The only place `state.building` moves, so the Build button always agrees with it. */
+function markBuilding(on) {
+  state.building = on;
+  updateCounts();
+}
 function updateCounts() {
   $('#shot-count').textContent = state.shots.length;
   const n = frameCount();
-  // Three frames is the least that can give a depth map with a second view to check it
-  // against. Two, and often three, cannot produce a surface at all, so the button does not
-  // offer a build that is going to fail.
-  const MIN_FRAMES = 3;
+  // The button does not offer a build that is going to fail.
   let note = '';
   if (n && n < MIN_FRAMES) note = ` · at least ${MIN_FRAMES} needed`;
   else if (n && n < 8) note = ' · add more';
   else if (n > 60) note = ' · many frames: Fast quality recommended';
   $('#frame-count').textContent = n ? `${n} frames${note}` : '';
-  $('#btn-reconstruct').disabled = n < MIN_FRAMES;
+  // A build already running is the other reason not to offer one: a second press would start
+  // a second decode loop while the first build's worker is still live and talking to the UI.
+  $('#btn-reconstruct').disabled = state.building || n < MIN_FRAMES;
   // Rough on-phone processing time per frame at each quality level
   // Rough seconds per frame on a phone, from timings on a laptop scaled for slower hardware
   const perFrame = { fast: 4, balanced: 8, high: 20 }[$('#quality').value] || 8;
@@ -142,8 +178,20 @@ function renderCameraTiles(results) {
       tile.appendChild(entry.video);
       tile.insertAdjacentHTML('beforeend', '<span class="cam-dot" title="Live"></span>');
     } else {
-      const msg = res && !res.ok ? `Cannot stream simultaneously.<br>Will capture sequentially.` : 'Not open';
-      tile.insertAdjacentHTML('beforeend', `<div class="cam-error">${msg}</div>`);
+      // "Cannot stream simultaneously. Will capture sequentially" is a promise, and it is only
+      // true of the failure it was written for. A permission revoked between a release and a
+      // reopen, a lens claimed by another app, a constraint the device refuses: those will
+      // fail again at the shutter, and saying otherwise sends the user on shooting a scan
+      // that is missing a camera. The reason comes from the platform, so it is set as text.
+      const box = el('div', 'cam-error');
+      if (res && !res.ok && willCaptureSequentially(res)) {
+        box.append('Cannot stream simultaneously.', document.createElement('br'), 'Will capture sequentially.');
+      } else if (res && !res.ok) {
+        box.append('Not available.', document.createElement('br'), res.error || 'Unknown error');
+      } else {
+        box.textContent = 'Not open';
+      }
+      tile.appendChild(box);
       if (res && !res.ok) tile.classList.add('failed');
     }
     // Labels come from the operating system, so they are set as text rather than pasted
@@ -164,6 +212,27 @@ function renderCameraTiles(results) {
   renderLensSettings();
 }
 
+/** The capture long side chosen in Settings, used for both the streams and the grabbed frames. */
+function captureMaxDim() { return parseInt($('#capture-res').value, 10) || 1280; }
+
+// ---------- Preferences ----------
+// The four controls of the settings dialog are the record `phonogeometry.prefs.v1` holds: read
+// once at start-up, through the validator, and written whenever one of them changes.
+const PREF_CONTROLS = { captureRes: '#capture-res', sequential: '#chk-sequential', gpu: '#chk-gpu', rig: '#chk-rig' };
+function applyPrefs(prefs) {
+  $(PREF_CONTROLS.captureRes).value = prefs.captureRes;
+  for (const name of ['sequential', 'gpu', 'rig']) $(PREF_CONTROLS[name]).checked = prefs[name];
+}
+function persistPrefs() {
+  savePrefs({
+    captureRes: $(PREF_CONTROLS.captureRes).value,
+    sequential: $(PREF_CONTROLS.sequential).checked,
+    gpu: $(PREF_CONTROLS.gpu).checked,
+    rig: $(PREF_CONTROLS.rig).checked,
+  });
+}
+function streamSize() { const d = captureMaxDim(); return { width: d, height: Math.round(d * 0.75) }; }
+
 async function startCameras() {
   const btn = $('#btn-start-cameras');
   btn.disabled = true;
@@ -172,14 +241,13 @@ async function startCameras() {
     await cams.discover();
     if (cams.cameras.length === 0) throw new Error('No cameras found.');
     $('#camera-status').textContent = `Found ${cams.cameras.length} camera${cams.cameras.length > 1 ? 's' : ''}. Opening all of them…`;
-    const results = await cams.openAll({ width: 1280, height: 720 });
-    const live = results.filter((r) => r.ok).length;
+    const results = await cams.openAll(streamSize());
     renderCameraTiles(results);
-    const seq = results.length - live;
-    $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} streaming live` + (seq ? `, ${seq} will be captured sequentially (the phone limits concurrent streams).` : '.');
-    $('#btn-capture').disabled = live + seq === 0;
+    // Counting every failure as one the sequential fallback will pick up is what made a
+    // permission failure read as a concurrency limit; reportCameras tells them apart.
+    reportCameras(results);
     btn.textContent = 'Re-scan cameras';
-    if (live > 0) startGuide();
+    if (cams.open.size) startGuide();
   } catch (err) {
     $('#camera-status').textContent = `Camera access failed: ${err.message}. You can still import photos below.`;
     toast(err.message, 5000);
@@ -188,20 +256,79 @@ async function startCameras() {
   }
 }
 
-let reopening = false;
+// The failures the sequential fallback actually works around: the lens is there, and the phone
+// will not run it alongside the others. Anything else fails the same way when the fallback
+// tries it, so the interface must not promise a capture that is not coming.
+const BUSY_ERRORS = new Set(['NotReadableError', 'AbortError', 'TrackStartError']);
+function willCaptureSequentially(res) {
+  if (!$('#chk-sequential').checked) return false;
+  // A failure carried with no name of its own is the app's own note that a camera was left out
+  // of a concurrent open, which is this case by construction.
+  return !res.name || BUSY_ERRORS.has(res.name);
+}
+
+/** Say what the cameras are doing, and stop offering a shutter that cannot capture anything. */
+function reportCameras(results, what = 'streaming live') {
+  const live = cams.cameras.filter((c) => c.enabled && cams.open.has(c.deviceId)).length;
+  const sequential = results.filter((r) => !r.ok && willCaptureSequentially(r)).length;
+  const broken = results.filter((r) => !r.ok && !willCaptureSequentially(r));
+  $('#camera-status').textContent = `${live} camera${live === 1 ? '' : 's'} ${what}`
+    + (sequential ? `, ${sequential} will be captured sequentially (the phone limits concurrent streams).` : '.')
+    + (broken.length ? ` ${broken.length} unavailable: ${broken.map((r) => r.error).join('; ')}` : '');
+  $('#btn-capture').disabled = live + sequential === 0;
+  // A reopen that fails is otherwise silent: the preview tile is dark, the status line still
+  // shows the last shot, and the first anyone hears of it is a capture with no frames in it.
+  if (broken.length && !live && !sequential) toast(`Cameras unavailable: ${broken[0].error}`, 6000);
+}
+
+/**
+ * Open every enabled camera that is not streaming, because the screen that owns them is back.
+ *
+ * Whether they are still wanted is asked again after every open rather than once at entry:
+ * one getUserMedia per lens is 200-800 ms on a phone, `closeAll` can only close what is
+ * already in `cams.open`, and a camera that comes up after the screen has gone would stream
+ * for the whole of a reconstruction with nothing left that could stop it.
+ */
 async function reopenCameras() {
-  if (reopening || !cams.cameras.length || $('#screen-capture').hidden) return;
+  // A capture in flight releases and reopens cameras as it goes (the sequential fallback),
+  // so opening one here would be opening it underneath that.
+  const wanted = () => !state.capturing && !$('#screen-capture').hidden;
+  if (!wanted() || !cams.cameras.length) return;
   const missing = cams.cameras.filter((c) => c.enabled && !cams.open.has(c.deviceId));
   if (!missing.length) return;
-  reopening = true;
-  try {
-    const results = [];
-    for (const cam of missing) {
-      try { results.push({ cam, ok: true, entry: await cams.openCamera(cam, { width: 1280, height: 720 }) }); }
-      catch (err) { results.push({ cam, ok: false, error: err.message }); }
-    }
-    renderCameraTiles(results);
-  } finally { reopening = false; }
+  const outcome = await cams.openSequence(missing, streamSize(), wanted);
+  // null: another sequence is already running, and it is opening the same cameras. cancelled:
+  // the screen went away, and openSequence has already closed whatever came up after it did.
+  if (!outcome || outcome.cancelled || !wanted()) return;
+  renderCameraTiles(outcome.results);
+  reportCameras(outcome.results);
+}
+
+/**
+ * The resolution is a property of the stream, so changing it has to reopen whatever is
+ * already open; otherwise the setting silently applies only to cameras opened afterwards.
+ */
+async function applyCaptureResolution() {
+  const reopen = cams.cameras.filter((c) => cams.open.has(c.deviceId));
+  if (!reopen.length) return;
+  const wanted = () => !state.capturing && !$('#screen-capture').hidden;
+  if (!wanted()) return;
+  $('#camera-status').textContent = `Reopening the cameras at ${captureMaxDim()} px…`;
+  for (const cam of reopen) cams.closeCamera(cam.deviceId);
+  // Same discipline as a reopen, and the same reason: these opens are one getUserMedia each,
+  // and the screen can go away in the middle of them.
+  const outcome = await cams.openSequence(reopen, streamSize(), wanted);
+  if (!outcome || outcome.cancelled || !wanted()) return;
+  const results = outcome.results;
+  // The cameras this phone refused to stream alongside the others were never in `open`, so
+  // they are not among the reopened ones either. Carry them through as failures: a tile with
+  // no result of its own falls back to a bare "Not open", losing the reason it is dark and
+  // the promise that it will still be captured.
+  for (const cam of cams.cameras) {
+    if (cam.enabled && !results.some((r) => r.cam === cam)) results.push({ cam, ok: false, error: 'Cannot stream alongside the others' });
+  }
+  renderCameraTiles(results);
+  reportCameras(results, `streaming live at up to ${captureMaxDim()} px`);
 }
 
 function renderLensSettings() {
@@ -215,13 +342,16 @@ function renderLensSettings() {
     name.title = cam.label;
     name.append(document.createElement('br'), el('span', 'muted', cam.label));
     const sel = document.createElement('select');
+    // The row's only text is the camera's name, so the two controls say whose they are.
+    sel.setAttribute('aria-label', `Lens type of ${cam.shortLabel || cam.label}`);
     for (const [k, v] of Object.entries(LENS_TYPES)) {
       const opt = new Option(v.label, k);
       opt.selected = cam.lens === k;
       sel.append(opt);
     }
     const num = document.createElement('input');
-    Object.assign(num, { type: 'number', min: '20', max: '140', step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
+    Object.assign(num, { type: 'number', min: String(HFOV_RANGE.min), max: String(HFOV_RANGE.max), step: '1', value: String(Math.round(cam.hfovOverride || LENS_TYPES[cam.lens].hfov)) });
+    num.setAttribute('aria-label', `Field of view of ${cam.shortLabel || cam.label}, in degrees`);
     const fov = el('label', 'muted', 'FOV° ');
     fov.append(num);
     row.append(name, sel, fov);
@@ -233,7 +363,7 @@ function renderLensSettings() {
     });
     num.addEventListener('change', () => {
       const v = parseFloat(num.value);
-      if (v >= 20 && v <= 140) { cam.hfovOverride = v; saveLensOverride(cam.key, cam.lens, v); }
+      if (v >= HFOV_RANGE.min && v <= HFOV_RANGE.max) { cam.hfovOverride = v; saveLensOverride(cam.key, cam.lens, v); }
     });
     box.appendChild(row);
   }
@@ -263,13 +393,43 @@ function canvasToBlob(canvas, q = 0.92) {
   return new Promise((resolve) => canvas.toBlob((b) => resolve(b), 'image/jpeg', q));
 }
 
+let storageWarned = false;
+let askedToPersist = false;
+/**
+ * Save a shot for restore after a reload. The write can fail (a phone with no room left),
+ * and a scan the user believes is safe but is not would be lost by the very reload this
+ * exists to survive, so say so — once, not once per shot. A browser that has no database at
+ * all is a different problem with different advice, so it gets a different sentence: telling
+ * someone in private browsing to free up space sends them after the wrong thing.
+ */
+function persistShot(shot) {
+  if (!askedToPersist && navigator.storage?.persist) {
+    askedToPersist = true;
+    // Ask the browser not to evict these photographs while a scan is in progress. Nothing can
+    // take that request back, and what bounds it is ShotStore's retention — which runs when
+    // the app is opened, not on a clock: a scan more than a day old is deleted the next time
+    // somebody launches this, which for an app that is never opened again is never. Eviction
+    // was the one mechanism that would have removed it, and this asks for that to be turned
+    // off, so this grant is the thing to reconsider first if the residue matters.
+    navigator.storage.persisted?.().then((already) => already || navigator.storage.persist()).catch(() => {});
+  }
+  store.saveShot(shot).then((outcome) => {
+    if (outcome === 'saved' || storageWarned) return;
+    storageWarned = true;
+    toast(outcome === 'unavailable'
+      ? 'This browser is not storing data for this site, so the shots are only in memory: a reload would lose them.'
+      : 'This shot could not be saved for restore: storage is full. The scan is still in memory, but a reload would lose it.', 6000);
+  });
+}
+
 async function captureShot() {
   const btn = $('#btn-capture');
   if (btn.disabled) return;
   btn.disabled = true; btn.classList.add('busy');
+  state.capturing = true;
   const flash = $('#flash'); flash.hidden = false; setTimeout(() => { flash.hidden = true; }, 260);
   try {
-    const maxDim = parseInt($('#capture-res').value, 10);
+    const maxDim = captureMaxDim();
     // The sequential fallback closes and reopens cameras, so a preview grab mid-capture would
     // read a dead video element
     guide.pause();
@@ -286,7 +446,7 @@ async function captureShot() {
 
     const shot = { id: `shot-${Date.now()}`, createdAt: Date.now(), frames };
     state.shots.push(shot);
-    store.saveShot(shot);
+    persistShot(shot);
     flagSoftFrames();
     renderShots(); updateCounts();
     const blurry = frames.filter((f) => f.soft).length;
@@ -296,6 +456,9 @@ async function captureShot() {
   } catch (err) {
     toast(`Capture failed: ${err.message}`, 5000);
   } finally {
+    state.capturing = false;
+    // Leaving the capture screen mid-shot skipped the close; it is owed here.
+    if ($('#screen-capture').hidden) cams.closeAll();
     btn.disabled = false; btn.classList.remove('busy');
     guide.resume();
   }
@@ -330,7 +493,7 @@ async function importFiles(files) {
   for (const file of files) {
     try {
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => createImageBitmap(file));
-      const maxDim = Math.max(parseInt($('#capture-res').value, 10), 1280);
+      const maxDim = Math.max(captureMaxDim(), 1280);
       const s = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(bmp.width * s); canvas.height = Math.round(bmp.height * s);
@@ -348,7 +511,7 @@ async function importFiles(files) {
   for (const fr of frames) {
     const shot = { id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, createdAt: Date.now(), frames: [fr] };
     state.shots.push(shot);
-    store.saveShot(shot);
+    persistShot(shot);
   }
   flagSoftFrames();
   renderShots(); updateCounts();
@@ -396,12 +559,27 @@ function flagSoftFrames() {
   markSoftFrames(all);
 }
 
+/**
+ * Put back what the last session left, and say what happened to the rest.
+ *
+ * The deletion is told to the person it happened to. It used to be announced only to whoever
+ * still had shots — the message sat after an early return taken when the list came back empty,
+ * which is exactly the case where everything had just been deleted. That person got an empty
+ * capture screen, a shot count of zero and not one word anywhere: indistinguishable from the
+ * scan having been lost to a bug, which is the thing the store exists to prevent.
+ */
 async function restoreShots() {
-  const saved = await store.loadAll();
-  if (!saved.length) return;
-  state.shots = saved.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
-  renderShots(); updateCounts();
-  toast(`Restored ${saved.length} shot${saved.length === 1 ? '' : 's'} from your previous session`, 4000);
+  const { shots, expired } = await store.loadAll();
+  if (shots.length) {
+    state.shots = shots.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
+    renderShots(); updateCounts();
+  }
+  const said = [];
+  if (shots.length) said.push(`Restored ${shots.length} shot${shots.length === 1 ? '' : 's'} from your previous session.`);
+  if (expired) said.push(`${expired} shot${expired === 1 ? '' : 's'} from more than a day ago ${expired === 1 ? 'was' : 'were'} deleted.`);
+  if (!said.length) return;
+  said.push('Photos stay on this device until you press Clear, or until they are a day old.');
+  toast(said.join(' '), 6000);
 }
 
 // ---------- Reconstruction ----------
@@ -421,7 +599,15 @@ async function decodeForWorker(frame, targetWidth, id, shotIndex) {
 
 let wakeLock = null;
 async function holdWakeLock() {
-  try { if (navigator.wakeLock && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch { /* not allowed or unsupported */ }
+  try {
+    if (navigator.wakeLock && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      // The platform drops a screen lock whenever the document is hidden (an app switch, a
+      // notification shade). Forget the sentinel when that happens, or the guard above turns
+      // every later request into a no-op and a long build is left free to lock the screen.
+      wakeLock.addEventListener?.('release', () => { wakeLock = null; });
+    }
+  } catch { /* not allowed or unsupported */ }
 }
 function releaseWakeLock() {
   try { wakeLock?.release(); } catch { /* ignore */ }
@@ -429,7 +615,14 @@ function releaseWakeLock() {
 }
 
 async function reconstruct() {
-  if (frameCount() < 3) return;
+  if (frameCount() < MIN_FRAMES) return;
+  // The preview puts the user back on the viewer screen with "Add more shots" in reach, so
+  // Build can be pressed again while this one is still going. Two overlapping builds fight
+  // over the same screen, and the older one's worker outlives the terminate below only
+  // because it happens after a decode loop that takes seconds.
+  if (state.building) return;
+  const gen = ++state.buildGen;
+  markBuilding(true);
   showScreen('process');
   holdWakeLock();
   const log = $('#progress-log'); log.textContent = '';
@@ -461,28 +654,57 @@ async function reconstruct() {
   setProgress('features', 0, 'Decoding photos…');
   const images = [];
   let k = 0;
+  let unreadable = 0;
   for (let s = 0; s < state.shots.length; s++) {
     for (const fr of state.shots[s].frames) {
-      images.push(await decodeForWorker(fr, targetWidth, `img-${k++}`, s));
+      // Cancel is pressed here more often than anywhere else: decoding thirty frames on the
+      // main thread takes seconds, and there is no worker to terminate yet.
+      if (gen !== state.buildGen) return;
+      try {
+        images.push(await decodeForWorker(fr, targetWidth, `img-${k}`, s));
+      } catch {
+        // A photo the browser cannot decode (a null blob from a canvas under memory
+        // pressure, a record that no longer reads) costs that frame, not the whole scan.
+        unreadable++;
+      }
+      k++;
     }
+  }
+  if (gen !== state.buildGen) return;
+  if (unreadable) {
+    const msg = `${unreadable} photo${unreadable === 1 ? '' : 's'} could not be read and ${unreadable === 1 ? 'was' : 'were'} left out.`;
+    setProgress('log', 0, msg);
+    toast(msg, 5000);
+  }
+  if (images.length < MIN_FRAMES) {
+    reportFailure(`Only ${images.length} of the photos could be read, and at least ${MIN_FRAMES} are needed. Try capturing again.`);
+    return;
   }
   if (state.worker) state.worker.terminate();
   const worker = new Worker(new URL('./pipeline/worker.js', import.meta.url), { type: 'module' });
   state.worker = worker;
   const t0 = performance.now();
+  // The same token that stops the decode loop: a worker from a build that has been cancelled
+  // or superseded keeps delivering queued messages, and each one would drive the screen,
+  // clear the building flag and drop the wake lock out from under the build that replaced it.
   worker.onmessage = async (ev) => {
+    if (gen !== state.buildGen) return;
     const m = ev.data;
     if (m.type === 'progress') setProgress(m.stage, m.fraction, m.message);
     else if (m.type === 'preview') await showPreview(m);
     else if (m.type === 'error') { reportFailure(m.message); } else if (m.type === 'done') {
       if (state.failed) return;
+      markBuilding(false);
       releaseWakeLock();
       $('#building').hidden = true;
       state.result = m.result;
       await showResult(m.result, (performance.now() - t0) / 1000);
     }
   };
-  worker.onerror = (e) => reportFailure(e.message || 'The reconstruction stopped unexpectedly');
+  worker.onerror = (e) => {
+    if (gen !== state.buildGen) return;
+    reportFailure(e.message || 'The reconstruction stopped unexpectedly');
+  };
   worker.postMessage({ type: 'run', images, options: { quality, preset: state.preset, gpu: $('#chk-gpu').checked, useRig: $('#chk-rig').checked } }, images.map((im) => im.rgba.buffer));
 }
 
@@ -492,6 +714,7 @@ async function reconstruct() {
  */
 function reportFailure(message) {
   state.failed = true;
+  markBuilding(false);
   releaseWakeLock();
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   setProgressLog('ERROR: ' + message);
@@ -691,6 +914,11 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 
 // ---------- Wiring ----------
 function init() {
+  applyPrefs(loadPrefs());
+  $('#about-version').textContent = APP_VERSION;   // the markup says "Version"; this is the number
+  // Chromium offers an install prompt for a page with a manifest and a worker; Safari never
+  // does, so the button is hidden until the offer arrives and stays hidden where none comes.
+  wireInstallPrompt(window, $('#btn-install'));
   $('#preset').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-preset]');
     if (!b) return;
@@ -715,6 +943,9 @@ function init() {
   $('#btn-clear').addEventListener('click', () => { if (!state.shots.length || confirm('Delete all shots?')) { state.shots = []; store.clear(); guide.clearReference(); renderShots(); updateCounts(); } });
   $('#btn-reconstruct').addEventListener('click', reconstruct);
   const stopBuild = () => {
+    // Stops a build that has not created its worker yet, as well as one that has
+    state.buildGen++;
+    markBuilding(false);
     if (state.worker) { state.worker.terminate(); state.worker = null; }
     releaseWakeLock();
     $('#building').hidden = true;
@@ -776,7 +1007,21 @@ function init() {
   });
   // Phones stop camera streams when the tab is hidden; reopen them when it comes back.
   cams.addEventListener('ended', () => { if (document.visibilityState === 'visible') reopenCameras(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reopenCameras(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    reopenCameras();
+    // Re-take the lock the platform released when the tab was hidden, but only while a
+    // build is actually running.
+    if (state.building) holdWakeLock();
+  });
+  $('#capture-res').addEventListener('change', () => { persistPrefs(); applyCaptureResolution(); });
+  for (const name of ['sequential', 'gpu', 'rig']) $(PREF_CONTROLS[name]).addEventListener('change', persistPrefs);
+  // Nothing should be able to leave the user on a progress screen that never moves, with the
+  // wake lock held, because a promise rejected somewhere nobody was catching.
+  window.addEventListener('unhandledrejection', (e) => {
+    if (!state.building) return;
+    reportFailure(e.reason?.message || String(e.reason || 'The reconstruction stopped unexpectedly'));
+  });
   $('#preset-tip').textContent = PRESET_TIPS[state.preset];
   applyAutoShutterDefault();
   trackCaptureBarHeight();

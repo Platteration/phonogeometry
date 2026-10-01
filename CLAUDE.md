@@ -9,20 +9,54 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 ## Commands
 
 - `npm test` runs the node:test suites in `test/` (synthetic scenes with ground truth).
+- `npm run check` is the gate before a push: `npm test`, then `npm run test:conventions`.
 - `npm start` serves over HTTP on :8080 (desktop development, photo import only).
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
-- `npm run test:browser` runs the application end to end in Chromium (multi-camera capture, a
-  good scan, a hopeless one, exports, reload, offline). `test/browser/fakeCameras.mjs` stands
+- `npm run test:e2e` runs the application end to end in Chromium (multi-camera capture, a
+  good scan, a hopeless one, exports, reload, offline). The offline step serves what
+  `pages.yml` publishes from `/phonogeometry/` on a server of its own, as GitHub Pages serves a
+  project site, fails on any request outside that sub-path or for a missing file, checks that a
+  file changed on the host reaches the worker's cache, and then closes that server: Playwright's
+  `setOffline` does not reach a service worker's own fetches, so a worker answering from the
+  network would pass with the host still up. `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
   camera. It starts its own server and renders its own
-  photographs, and skips itself when Playwright is absent, so it is safe to run anywhere.
+  photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
+  `REQUIRE_BROWSER=1` turns that skip into a failure, which is how CI runs it (the workflow
+  installs a pinned Playwright with `npm install --no-save`, so the repository keeps no
+  dependencies).
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
   a secure context: a self-signed certificate blocks service worker registration outright, so
   the HTTPS dev server cannot exercise it. Headless Chromium via Playwright works with fake camera devices
   (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`).
+- `.github/workflows/pages.yml` publishes to GitHub Pages on a push to `main` (which does not
+  exist yet, and has to be a branch the `github-pages` environment accepts: by default the
+  default branch) or by hand (offered only once the file is on the default branch):
+  `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
+  stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence), no
+  build step. `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `sw.js`
+  and the licence, so a module added to one and not the other fails `npm test`, and pins the
+  workflow line for line: the build job is checkout (no persisted credentials), Node, the
+  tests, the assembly and the upload, and only the deploy job holds `pages: write` and
+  `id-token: write`, so a step, scope or trigger added to it fails there first. `sw.js` goes
+  out as committed, not re-stamped per deploy: its `VERSION` is a hash of the shell files'
+  contents, which `test/sw.test.js` recomputes (printing the value to paste in), so a deploy
+  that changes a shell file reaches an installed copy as a new worker that caches the whole
+  shell afresh, and one that changes none (a README edit) makes nobody download it again. The
+  worker is network first and writes each shell file it fetches back into its own cache,
+  cloning the response before the page reads it (a clone taken after throws, and for a long
+  time nothing was written); that refresh covers only what a visit loads, so it is not how a
+  deploy arrives. A cache that will not open counts as a miss, not as a failure: `lookup`
+  heads the fetch handler's chain, and `caches.open` can reject where a match cannot (an
+  evicted quota, a broken backend), so an uncaught rejection there is a network error for
+  every request the worker intercepts, the page itself included, online or offline.
+  `test/sw.test.js` stubs the worker's globals and drives the real fetch handler against a
+  cache that refuses to open, which no browser stages on demand. `sw.js` is not one of the
+  hashed shell files, so a change to the worker alone leaves `VERSION` where it is: the new
+  bytes are what reinstall it.
 
 ## Layout
 
@@ -104,7 +138,25 @@ and give the real distance between them, which sets `state.metresPerUnit`; expor
 positions by it (`scaledGeometry`) so a GLB opens at its true size, glTF being defined in
 metres. The scale is cleared whenever a new build starts.
 
-## Conventions
+## Settings
+
+Two localStorage records, both named in `src/prefs.js` (`KEYS`) and pinned as literals by
+`test/settings-contract.test.js`. `phonogeometry.prefs.v1` holds the four controls of the
+settings dialog (`captureRes`, `sequential`, `gpu`, `rig`): read once in `init()` through
+`cleanPrefs`, written on every change. `phonogeometry.lensOverrides.v1` holds the per-camera
+lens and field-of-view overrides: migrated from the unversioned `phonogeometry.lensOverrides`
+at its one read site (`loadLensOverrides`, which copies the bytes and deletes the old key only
+once the write has succeeded) and checked by `cleanLensOverrides` in `src/camera/intrinsics.js`,
+which returns a null-prototype object because the camera label is the key. Every read goes
+through a validator, `has` is an own-property lookup, and `test/prefs.test.js` walks
+`Object.getOwnPropertyNames(Object.prototype)` through both records. There is no Theme row: the
+app has one dark palette (`color-scheme: dark`) and no theme preference. There is no Reset:
+four controls, each one click from its default. The About block's version is `APP_VERSION` in
+`src/version.js`, pinned to `package.json`; the `VERSION` in `sw.js` is the service worker's
+cache name, a hash of the shell files, and is not that. The shots are IndexedDB
+(`src/storage.js`), not a preference, and none of this touches them.
+
+## Code conventions
 
 - Never paste text that came from outside into markup. Camera labels come from the operating
   system and photo labels from file names, so the interface builds those nodes with
@@ -118,4 +170,33 @@ metres. The scale is cleared whenever a new build starts.
 - Every pipeline change should keep `npm test` green; add a synthetic-scene test when
   adding a stage. Keep the CPU and GPU plane sweeps behaviourally identical.
 - Do not add build tooling or npm dependencies without a strong reason: the app is meant to
-  be deployable by copying the folder to any static HTTPS host.
+  be deployable by copying the folder to any static HTTPS host. three.js is vendored; its
+  version and checksums live in `docs/vendored-three.md`, and `test/vendor.test.js` fails when
+  the files and the note disagree.
+- The dev server (`server.js`) serves only non-hidden files inside the project directory and
+  binds loopback unless `--https` or an explicit `--host=` asks otherwise. Anything that can
+  reach the port can drive it, so its request handling is covered by `test/server.test.js`.
+  It also refuses a request whose `Host` is not one of its own names (a page the developer
+  visits can point its hostname at 127.0.0.1; the rebound request still says so in `Host`).
+  Bound to loopback those names are the loopback ones; bound off it (`--host=`, `--https`)
+  they are this machine's own names, because that is what a phone types: the bound address,
+  every interface address in both spellings, the hostname, `<hostname>.local`, and any other
+  name under `.local`, which is mDNS and cannot be pointed at 127.0.0.1 from the internet.
+  A miss re-reads `os.networkInterfaces()` (throttled) before refusing, so the Wi-Fi joined
+  after the server started is answered, and a refusal is logged once per name with the
+  `ALLOWED_HOST=` that would allow it — that variable is a comma-separated list, for the
+  forwarder or tunnel this process cannot see. No `Host` at all is answered: a browser always
+  sends one. `hostGate` in `server.js` is abientnoiser's `scripts/hosts.js`, form for form;
+  change one and change the other.
+
+## Conventions
+
+This repository follows `CONVENTIONS.md`, which is identical in every platteration
+repository and pinned by the conventions test (`npm run test:conventions`, or
+`tests/test_conventions.py` in a Python repository): the script set (`test`,
+`typecheck`, `lint`, `check`, `test:e2e`, `test:all`), Node 22 via `.nvmrc`, one
+`.editorconfig`, ESLint per stack, the `ci.yml` shape, the documents every repository
+carries and the README skeleton. The repository's check command (`npm run check`, or
+`ruff check .` then `pytest -q` in a Python repository) is the gate before a push. To
+change a convention, change it in every repository in one pass and update the hashes in
+the test.

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Browser tests for the whole application: capture with a fake camera, a scan that works,
 // a scan that cannot work, and offline operation. These need a real browser, so they are
-// not part of `npm test`; run them with `npm run test:browser`.
+// not part of `npm test`; run them with `npm run test:e2e`.
 //
 // Playwright and a Chromium build must be available. Point at them with PLAYWRIGHT_MODULE
-// and CHROMIUM_PATH if they are not where this script looks by default.
+// and CHROMIUM_PATH if they are not where this script looks by default. Without them the
+// suite skips itself, which is what makes it safe to run anywhere — set REQUIRE_BROWSER=1
+// (as CI does) to make a missing browser a failure instead of a silent pass.
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -16,17 +19,16 @@ import { fakePhoneCameras } from './fakeCameras.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const PORT = Number(process.env.PORT || 8099);
+const pkgVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
 const BASE = `http://localhost:${PORT}/`;
 
-const CHROMIUM_CANDIDATES = [
-  process.env.CHROMIUM_PATH,
-  '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
-  '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome',
-].filter(Boolean);
+// Where a globally installed Playwright lives for the node running this script, rather than
+// a path from one particular machine: `<prefix>/lib/node_modules/...` next to the binary.
+const globalModules = path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules');
 const PLAYWRIGHT_CANDIDATES = [
   process.env.PLAYWRIGHT_MODULE,
   'playwright',
-  '/opt/node22/lib/node_modules/playwright/index.mjs',
+  path.join(globalModules, 'playwright', 'index.mjs'),
   '/usr/local/lib/node_modules/playwright/index.mjs',
 ].filter(Boolean);
 
@@ -35,6 +37,71 @@ async function loadPlaywright() {
     try { return (await import(spec)).chromium; } catch { /* try the next */ }
   }
   return null;
+}
+
+/** Playwright's own browser first, then whatever the system has; null means "let it decide". */
+function findChromium(chromium) {
+  const own = (() => { try { return chromium.executablePath(); } catch { return null; } })();
+  const candidates = [process.env.CHROMIUM_PATH, own, '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].filter(Boolean);
+  return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || null;
+}
+
+// GitHub Pages serves the app from <user>.github.io/<repository>/, not from the root.
+const SUB_PATH = '/phonogeometry/';
+const TYPES = {
+  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
+  '.webmanifest': 'application/manifest+json', '.png': 'image/png',
+};
+
+/** A copy of what .github/workflows/pages.yml publishes, taken from the working tree. */
+function assembleSite(into) {
+  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'pages.yml'), 'utf8');
+  const m = workflow.match(/git archive HEAD ((?:[\w./-]+ )*[\w./-]+) \| tar -x -C \S+$/m);
+  if (!m) throw new Error('pages.yml has no `git archive HEAD <paths> | tar -x -C <dir>` line to take the site from');
+  for (const p of m[1].split(' ')) fs.cpSync(path.join(root, p), path.join(into, p), { recursive: true });
+  return into;
+}
+
+/**
+ * Serves `dir` under SUB_PATH the way a static host does, and nothing outside it, recording
+ * every request so a URL that escapes the sub-path or names a missing file is seen. `stop`
+ * closes it for real: Playwright's offline mode does not reach a service worker's own fetches
+ * (measured: a reload after setOffline(true) still sent 26 requests to the host), so a worker
+ * that answered from the network rather than its cache would pass with the host still up.
+ * no-store keeps the browser's HTTP cache out of what the worker is shown.
+ */
+async function serveSite(dir) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const { pathname } = new URL(req.url, 'http://localhost');
+    let file = null;
+    if (pathname.startsWith(SUB_PATH)) {
+      let rel = null;
+      try { rel = decodeURIComponent(pathname.slice(SUB_PATH.length)); } catch { /* a malformed escape is a 404 */ }
+      const candidate = rel === null ? null : path.join(dir, rel === '' || rel.endsWith('/') ? `${rel}index.html` : rel);
+      if (candidate?.startsWith(dir + path.sep) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) file = candidate;
+    }
+    requests.push({ path: pathname, status: file ? 200 : 404 });
+    res.writeHead(file ? 200 : 404, { 'content-type': file ? (TYPES[path.extname(file)] ?? 'application/octet-stream') : 'text/plain', 'cache-control': 'no-store' });
+    res.end(file ? fs.readFileSync(file) : 'not found');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://localhost:${server.address().port}${SUB_PATH}`,
+    requests,
+    stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
+  };
+}
+
+/** The text of `file` in this app's own cache (whatever its generation), or null. */
+function cachedText(page, file) {
+  return page.evaluate(async (f) => {
+    for (const name of (await caches.keys()).filter((k) => k.startsWith('phonogeometry-'))) {
+      const hit = await (await caches.open(name)).match(f);
+      if (hit) return hit.text();
+    }
+    return null;
+  }, file);
 }
 
 const results = [];
@@ -55,13 +122,14 @@ async function waitForResult(page, timeout = 300000) {
 }
 
 async function main() {
+  const required = process.env.REQUIRE_BROWSER === '1' || process.argv.includes('--require');
   const chromium = await loadPlaywright();
   if (!chromium) {
     console.log('Playwright is not installed, so the browser tests were skipped.');
     console.log('Install it with `npm i -D playwright && npx playwright install chromium`, or set PLAYWRIGHT_MODULE.');
-    return 0;
+    return required ? 1 : 0;
   }
-  const executablePath = CHROMIUM_CANDIDATES.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+  const executablePath = findChromium(chromium);
 
   const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'phonogeometry-'));
   const shots = path.join(fixtures, 'shots');
@@ -175,6 +243,54 @@ async function main() {
 
       const liveTiles = await page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.videoWidth > 0 && !v.paused).length);
       check(`${label}: the previews are still live afterwards`, liveTiles === Math.min(3, limit), `${liveTiles} live of ${Math.min(3, limit)} expected`);
+
+      if (limit === 3) {
+        // The cameras belong to the capture screen. A build runs for minutes on a phone that
+        // is already hot, and the OS indicator stays lit through all of it while nothing is
+        // being captured. Held track objects are what says so: closing a stream also clears
+        // the <video>'s srcObject, so counting live previews would pass on a detached but
+        // still-running track.
+        await page.evaluate(() => {
+          window.__tracks = [];
+          for (const v of document.querySelectorAll('video')) for (const t of v.srcObject?.getVideoTracks() || []) window.__tracks.push(t);
+        });
+        const states = () => page.evaluate(() => window.__tracks.map((t) => t.readyState));
+        const before = await states();
+        await page.click('#btn-reconstruct');
+        await page.waitForFunction(() => document.querySelector('#screen-capture').hidden, null, { timeout: 20000 });
+        await page.waitForTimeout(400);
+        const during = await states();
+        // A build that fails fast can put the preview on screen instead, which carries the
+        // other stop button.
+        await page.click(await page.$eval('#screen-process', (e) => e.hidden) ? '#btn-cancel-build' : '#btn-cancel');
+        await page.waitForFunction(() => !document.querySelector('#screen-capture').hidden, null, { timeout: 20000 });
+        const liveNow = () => page.$$eval('#camera-grid .cam-tile video', (els) => els.filter((v) => v.srcObject?.getVideoTracks().some((t) => t.readyState === 'live')).length);
+        // Reopening is one getUserMedia per lens, so give them all a moment to come back.
+        for (let i = 0; i < 40 && (await liveNow()) < 3; i++) await page.waitForTimeout(250);
+        const live = await liveNow();
+        check(`${label}: the cameras stop while a build runs, and come back with the screen`,
+          before.length === 3 && before.every((r) => r === 'live') && during.every((r) => r === 'ended') && live === 3,
+          `before ${before.join(',')} · during ${during.join(',')} · after ${live} live`);
+      }
+
+      if (limit === 1) {
+        // Changing the capture resolution reopens the streams. Only the cameras that were
+        // open can be reopened, so the ones this phone will not run alongside the others are
+        // not part of that — and their tiles must keep saying why they are dark and that they
+        // will still be captured, rather than falling back to a bare "Not open".
+        await page.click('#btn-settings');
+        await page.selectOption('#capture-res', '960');
+        await page.waitForFunction(() => /streaming live at up to 960 px/.test(document.querySelector('#camera-status').textContent), null, { timeout: 30000 });
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(300);
+        const explained = await page.$$eval('#camera-grid .cam-tile', (els) => els.filter((e) => /Will capture sequentially/.test(e.textContent)).length);
+        const flagged = await page.$$eval('#camera-grid .cam-tile.failed', (els) => els.length);
+        const status = (await page.textContent('#camera-status')).replace(/\s+/g, ' ').trim();
+        check(`${label}: changing the capture resolution keeps them explained`,
+          explained === 2 && flagged === 2 && /2 will be captured sequentially/.test(status),
+          `${explained} tiles explained, ${flagged} flagged; status: ${status}`);
+      }
+
       check(`${label}: no page errors`, errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
@@ -185,6 +301,20 @@ async function main() {
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       page.on('dialog', (d) => d.accept());
+      // Count the draw calls the page issues, so the viewer's loop can be watched from
+      // outside it: whether it is still drawing is the behaviour, not what it says about
+      // itself. Counting animation frames instead would count this script's own rAF polling.
+      await page.addInitScript(() => {
+        window.__draws = 0;
+        for (const proto of [window.WebGLRenderingContext?.prototype, window.WebGL2RenderingContext?.prototype]) {
+          if (!proto) continue;
+          for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+            const real = proto[name];
+            if (!real) continue;
+            proto[name] = function (...args) { window.__draws++; return real.apply(this, args); };
+          }
+        }
+      });
       await page.goto(BASE, { waitUntil: 'load' });
       const blurredDir = path.join(fixtures, 'blurred');
       await page.setInputFiles('#file-import', fs.readdirSync(blurredDir).sort().map((f) => path.join(blurredDir, f)));
@@ -259,10 +389,42 @@ async function main() {
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'measure.png') });
       await page.click('#btn-measure');
 
+      // The three.js loop must draw while the viewer is the screen you are on and stop when
+      // it is not: otherwise it runs behind a hidden screen, next to the live camera
+      // previews and the next build's use of the GPU. Counted from the frames the loop
+      // actually draws, not from anything the viewer says about itself: a loop that kept
+      // running while claiming to have stopped is exactly the regression this is for.
+      const drawsAtStart = await page.evaluate(() => window.__draws);
+      await page.waitForTimeout(600);
+      const drawsOnView = await page.evaluate(() => window.__draws);
+      await page.click('#btn-back-capture');
+      await page.waitForTimeout(400);           // let a frame already scheduled land
+      const drawsAfterLeaving = await page.evaluate(() => window.__draws);
+      await page.waitForTimeout(600);
+      const drawsLater = await page.evaluate(() => window.__draws);
+      const drewOnView = drawsOnView - drawsAtStart;
+      const drewAway = drawsLater - drawsAfterLeaving;
+      check('the viewer stops drawing once you leave it',
+        drewOnView > 0 && drewAway === 0,
+        `${drewOnView} draw calls in 0.6s on the viewer, ${drewAway} in 0.6s after leaving`);
+
+      // A preference is written when its control changes and read back on the next load.
+      await page.click('#btn-settings');
+      await page.selectOption('#capture-res', '1920');
+      await page.keyboard.press('Escape');
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 20000 }).catch(() => {});
       const restored = Number(await page.textContent('#shot-count'));
       check('shots survive a reload', restored === 8, `${restored} restored`);
+      const kept = await page.$eval('#capture-res', (s) => s.value);
+      check('a changed preference survives a reload', kept === '1920', `capture resolution came back as ${kept}`);
+      // The About block is filled from the version module, not typed into the markup.
+      await page.click('#btn-settings');
+      // The whole line, not just the span: "Version <n>" is the form the sibling apps show.
+      const about = (await page.$eval('#about-version', (el) => el.parentElement.textContent.replace(/\s+/g, ' ').trim()));
+      check('the About block shows the package version', about === `Version ${pkgVersion}`, `shows "${about}", package.json says ${pkgVersion}`);
+      await page.selectOption('#capture-res', '1280');   // back to the default for the sections after this one
+      await page.keyboard.press('Escape');
       check('no page errors during a good scan', errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
@@ -286,6 +448,144 @@ async function main() {
         !injected && strayImages === 0 && shown.includes('<img'),
         `injected: ${injected}, stray elements: ${strayImages}, label: ${JSON.stringify(shown)}`);
       check('no page errors from an awkward file name', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2c. Cancel during the decode, and a photo that cannot be decoded at all ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Decoding thirty frames on a phone takes seconds. Here it is slowed on purpose so the
+      // Cancel press lands inside that window, which is where there is no worker to terminate.
+      await page.addInitScript(() => {
+        const real = window.createImageBitmap.bind(window);
+        window.createImageBitmap = async (...args) => { await new Promise((r) => setTimeout(r, 400)); return real(...args); };
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      const dir = path.join(fixtures, 'object');
+      await page.setInputFiles('#file-import', fs.readdirSync(dir).sort().map((f) => path.join(dir, f)));
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 60000 });
+      await page.selectOption('#quality', 'fast');
+      await page.click('#btn-reconstruct');
+      await page.waitForTimeout(500);   // still decoding
+      await page.click('#btn-cancel');
+      // A build that ignored the cancel would move past the first stage and then pull the
+      // user onto the viewer when its preview arrives.
+      const carriedOn = await page.waitForFunction(() => !document.querySelector('#screen-view').hidden
+        || /Matching|Solving|Computing|Fusing|Extracting|Done/.test(document.querySelector('#progress-stage').textContent),
+      null, { timeout: 12000 }).then(() => true).catch(() => false);
+      const onCapture = await page.$eval('#screen-capture', (e) => !e.hidden);
+      check('cancelling while the photos are decoding stops the build', !carriedOn && onCapture,
+        `carried on: ${carriedOn}, on the capture screen: ${onCapture}`);
+
+      // A stored photo whose blob cannot be decoded (a canvas that returned null under
+      // memory pressure, a record that no longer reads) must cost that frame, not the scan.
+      await page.evaluate(async () => {
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('phonogeometry', 1);
+          r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+        });
+        await new Promise((res, rej) => {
+          const t = db.transaction('shots', 'readwrite');
+          t.objectStore('shots').put({
+            id: 'shot-unreadable',
+            createdAt: Date.now() + 60000,
+            frames: [{
+              blob: new Blob(['this is not a photograph'], { type: 'image/jpeg' }),
+              thumbUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==',
+              width: 320, height: 240, f: 300, cx: 159.5, cy: 119.5,
+              label: 'unreadable', lens: 'unknown', key: 'import', sharpness: 5,
+            }],
+          });
+          t.oncomplete = res; t.onerror = () => rej(t.error);
+        });
+      });
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 9, null, { timeout: 30000 });
+      await page.selectOption('#quality', 'fast');
+      await page.click('#btn-reconstruct');
+      const outcome = await waitForResult(page, 200000);
+      const log = await page.textContent('#progress-log');
+      check('a photo that cannot be decoded is left out, not left hanging',
+        outcome === 'finished' && /could not be read/.test(log),
+        `${outcome}; log ${/could not be read/.test(log) ? 'says so' : 'is silent'}`);
+      check('no page errors around a cancelled or undecodable build', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2d. A build that has been superseded must not drive the screen ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Keep every worker the page creates. A worker whose build has been cancelled or
+      // replaced is not stopped the instant that happens — the replacement only terminates it
+      // after decoding the photos, which takes seconds — so its queued messages arrive while
+      // the newer build owns the screen. Holding a reference lets one speak on cue.
+      await page.addInitScript(() => {
+        const Real = window.Worker;
+        window.__workers = [];
+        window.Worker = class extends Real {
+          constructor(...args) { super(...args); window.__workers.push(this); }
+        };
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      const dir = path.join(fixtures, 'object');
+      await page.setInputFiles('#file-import', fs.readdirSync(dir).sort().map((f) => path.join(dir, f)));
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 30000 });
+      await page.selectOption('#quality', 'fast');
+
+      await page.click('#btn-reconstruct');
+      const buildOfferedAgain = await page.$eval('#btn-reconstruct', (e) => !e.disabled);
+      check('the Build button does not offer a second build while one is running', !buildOfferedAgain,
+        buildOfferedAgain ? 'still enabled during a build' : 'disabled during a build');
+      await page.waitForFunction(() => window.__workers.length === 1, null, { timeout: 90000 });
+      await page.click('#btn-cancel');
+
+      // A second build, with the first build's worker still holding the handlers it was given.
+      await page.click('#btn-reconstruct');
+      await page.waitForFunction(() => window.__workers.length === 2, null, { timeout: 90000 });
+      await page.evaluate(() => {
+        const stale = window.__workers[0];
+        stale.onmessage({ data: { type: 'progress', stage: 'log', message: 'STALE-WORKER-SPOKE' } });
+        stale.onmessage({ data: { type: 'progress', stage: 'mesh', fraction: 1, message: 'STALE-WORKER-SPOKE' } });
+        stale.onerror({ message: 'the build that was cancelled fell over' });
+      });
+      const outcome = await waitForResult(page, 200000);
+      await page.waitForTimeout(300);
+      const log = await page.textContent('#progress-log');
+      const stats = (await page.textContent('#stats') || '').replace(/\s+/g, ' ').trim();
+      const failureShown = await page.evaluate(() => /failed/i.test(document.querySelector('#progress-stage').textContent)
+        || /Could not/.test(document.querySelector('#building-stage').textContent));
+      const building = await page.evaluate(() => !document.querySelector('#building').hidden);
+      check('a superseded build cannot report, fail or finish over the one that replaced it',
+        outcome === 'finished' && !/STALE-WORKER-SPOKE/.test(log) && !failureShown && !building && /^8\/8/.test(stats),
+        `${outcome}; the stale worker ${/STALE-WORKER-SPOKE/.test(log) ? 'reached the log' : 'was ignored'}, failure shown: ${failureShown}, stats: ${stats.slice(0, 40)}`);
+      check('no page errors around a superseded build', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
+    // ---- 2e. A browser that stores nothing is told what is actually wrong ----
+    {
+      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // Private browsing, or site data blocked by policy: there is no database to write to.
+      // That is not a full disk, and telling someone to free up space sends them nowhere.
+      await page.addInitScript(() => {
+        Object.defineProperty(window, 'indexedDB', { configurable: true, get: () => undefined });
+      });
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.setInputFiles('#file-import', [path.join(fixtures, 'object', 'photo-0.png')]);
+      const warned = await page.waitForFunction(() => {
+        const t = document.querySelector('#toast');
+        return t && !t.hidden && /reload would lose/.test(t.textContent) ? t.textContent : null;
+      }, null, { timeout: 20000 }).then((h) => h.jsonValue()).catch(() => '');
+      const message = String(warned).replace(/\s+/g, ' ').trim();
+      check('a browser that stores nothing is not told its storage is full',
+        /not storing data/.test(message) && !/storage is full/.test(message), message || 'nothing was said');
+      check('no page errors when nothing can be stored', errors.length === 0, errors.slice(0, 2).join(' | '));
       await page.close();
     }
 
@@ -317,15 +617,43 @@ async function main() {
       await page.close();
     }
 
-    // ---- 4. Offline ----
+    // ---- 4. Offline, from the sub-path the deploy publishes to ----
+    // What pages.yml publishes, served from SUB_PATH on a server of this step's own. Every other
+    // step uses the dev server at the root, where a root-relative URL (`/sw.js`, `/styles.css`)
+    // works and the published site would break.
     {
+      const site = await serveSite(assembleSite(path.join(fixtures, 'site')));
       const ctx = await browser.newContext({ viewport: { width: 420, height: 860 } });
       const page = await ctx.newPage();
-      await page.goto(BASE, { waitUntil: 'load' });
-      await page.waitForTimeout(4000);              // let the service worker cache the shell
+      await page.goto(site.url, { waitUntil: 'load' });
+      const scope = await page.evaluate(() => Promise.race([
+        navigator.serviceWorker.ready.then((r) => r.scope),       // active: the shell is cached
+        new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
+      ]));
       await page.reload({ waitUntil: 'load' });     // and take control
       await page.waitForTimeout(1500);
       const controlled = await page.evaluate(() => !!navigator.serviceWorker.controller);
+      check('the service worker takes the sub-path as its scope', scope === site.url, `scope ${scope}, site ${site.url}`);
+
+      // A deploy changes a file on the host. Loaded online, it has to reach the worker's
+      // cache as well as the page: a clone taken after the page had read the body threw
+      // here, and the cache kept the old file while the unit test's stub said otherwise.
+      const marker = '/* published after the install */';
+      fs.appendFileSync(path.join(fixtures, 'site', 'styles.css'), `\n${marker}\n`);
+      await page.reload({ waitUntil: 'load' });
+      let refreshed = false;
+      for (let i = 0; i < 40 && !refreshed; i++) {
+        refreshed = ((await cachedText(page, 'styles.css')) ?? '').includes(marker);
+        if (!refreshed) await page.waitForTimeout(250);
+      }
+      check('a shell file fetched online is written back into the worker\'s cache', refreshed);
+
+      const outside = site.requests.filter((r) => !r.path.startsWith(SUB_PATH));
+      const missing = site.requests.filter((r) => r.status !== 200);
+      check('nothing the app loads leaves its sub-path or is missing there', outside.length === 0 && missing.length === 0,
+        `${site.requests.length} requests, ${outside.length} outside ${SUB_PATH}, ${missing.length} not found: ${[...outside, ...missing].map((r) => r.path).slice(0, 4).join(' ')}`);
+
+      await site.stop();
       await ctx.setOffline(true);
       const reloaded = await page.reload({ waitUntil: 'load', timeout: 25000 }).then(() => true).catch(() => false);
       await page.waitForTimeout(1500);
