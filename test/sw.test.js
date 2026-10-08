@@ -43,7 +43,13 @@ globalThis.caches = {
     const entries = store.get(name);
     return {
       addAll: async (list) => { installed = list; },
-      match: async (req) => entries.get(new URL(req.url).href),
+      // `ignoreSearch` as Cache.match reads it: the query string is left out of both sides.
+      match: async (req, options) => {
+        if (!options?.ignoreSearch) return entries.get(new URL(req.url).href);
+        const bare = (u) => { const x = new URL(u); x.search = ''; return x.href; };
+        for (const [key, res] of entries) if (bare(key) === bare(req.url)) return res;
+        return undefined;
+      },
       put: async (req, res) => { entries.set(new URL(req.url).href, res); },
     };
   },
@@ -69,9 +75,9 @@ async function activated() {
   await Promise.all(waits);
 }
 
-function get(url) {
+function get(url, { mode = 'cors' } = {}) {
   const event = {
-    request: { method: 'GET', url },
+    request: { method: 'GET', url, mode },
     responded: null,
     respondWith(p) { this.responded = p; },
     waitUntil(p) { extended.push(p); },
@@ -194,6 +200,50 @@ test('the page itself counts as shell, with or without index.html', async () => 
   await get(`${ORIGIN}/index.html`);
   await settled();
   assert.equal(cache.size, 2);
+});
+
+// A link carrying a query string is the same page under another name. Keyed by it, every
+// distinct link (a social site's `?fbclid=…` is unique per click) was one more copy of the page
+// in the cache, read back by nothing and kept until the cache name changed; and offline, a link
+// the cache had not seen under that exact name failed although the app was all there.
+test('a URL with a query string is fetched, not kept', async () => {
+  networkAnswer = async () => new Response('page', { status: 200 });
+  for (const url of [`${ORIGIN}/?fbclid=IwAR1`, `${ORIGIN}/?fbclid=IwAR2`, `${ORIGIN}/index.html?utm_source=x`]) {
+    assert.equal(await (await get(url, { mode: 'navigate' })).text(), 'page', url);
+  }
+  networkAnswer = async () => new Response('shell', { status: 200 });
+  assert.equal(await (await get(`${ORIGIN}/src/app.js?v=2`)).text(), 'shell');
+  await settled();
+  assert.deepEqual([...cache.keys()], [], 'nothing carrying a query string is written');
+
+  // The canonical names are still written, as before.
+  await get(`${ORIGIN}/`, { mode: 'navigate' });
+  await settled();
+  assert.deepEqual([...cache.keys()], [`${ORIGIN}/`]);
+});
+
+test('offline, a link with a query string opens the cached page', async () => {
+  cache.set(`${ORIGIN}/`, new Response('cached page', { status: 200 }));
+  cache.set(`${ORIGIN}/index.html`, new Response('cached index', { status: 200 }));
+  cache.set(`${ORIGIN}/src/app.js`, new Response('cached app', { status: 200 }));
+  networkAnswer = async () => { throw new TypeError('Failed to fetch'); };
+  assert.equal(await (await get(`${ORIGIN}/?fbclid=never-seen`, { mode: 'navigate' })).text(), 'cached page');
+  assert.equal(await (await get(`${ORIGIN}/index.html?utm_source=x`, { mode: 'navigate' })).text(), 'cached index');
+  // Only a navigation is matched without its query: a script asked for under another name is
+  // not handed a file it did not name.
+  assert.equal((await get(`${ORIGIN}/src/app.js?v=2`)).type, 'error');
+});
+
+// A navigation's fetch does not follow a redirect; it resolves to an `opaqueredirect`, which is
+// not `ok`. Node's Response cannot be made into one, so a stand-in with the same three fields
+// is what the network answers here; the browser suite moves a real site under a real worker.
+test('a navigation the host redirects is passed on, not answered from the cache', async () => {
+  cache.set(`${ORIGIN}/`, new Response('the old build', { status: 200 }));
+  const moved = { type: 'opaqueredirect', ok: false, status: 0 };
+  networkAnswer = async () => moved;
+  assert.equal(await get(`${ORIGIN}/`, { mode: 'navigate' }), moved);
+  await settled();
+  assert.equal(await cache.get(`${ORIGIN}/`).text(), 'the old build', 'and the redirect is not written over the cached page');
 });
 
 // The runtime refresh above only rewrites what a visitor happens to fetch, so on its own a

@@ -89,8 +89,15 @@ function headersFor(rules, sitePath) {
 async function serveSite(dir) {
   const requests = [];
   const rules = headerRules();
+  let movedTo = null;
   const server = http.createServer((req, res) => {
-    const { pathname } = new URL(req.url, 'http://localhost');
+    const { pathname, search } = new URL(req.url, 'http://localhost');
+    // A site that has moved answers every address with a redirect to the same path there.
+    if (movedTo) {
+      requests.push({ path: pathname, status: 301 });
+      res.writeHead(301, { Location: `${movedTo}${pathname.startsWith(SUB_PATH) ? pathname.slice(SUB_PATH.length) : ''}${search}` });
+      return res.end();
+    }
     let file = null;
     let rel = null;
     if (pathname.startsWith(SUB_PATH)) {
@@ -110,6 +117,7 @@ async function serveSite(dir) {
   return {
     url: `http://localhost:${server.address().port}${SUB_PATH}`,
     requests,
+    moveTo: (url) => { movedTo = url; },
     stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
   };
 }
@@ -918,6 +926,53 @@ async function main() {
         `service worker in control: ${controlled}, reload: ${reloaded}, interface: ${ui}, scan: ${built}`);
       check('offline, the policy refused nothing either', findings.length === 0, findings.slice(0, 3).join(' | '));
       await ctx.close();
+
+      // The addresses the service worker is shown that are not the app's own: a link with a
+      // query string, which every social site and campaign link appends, and a site that has
+      // moved to an origin of its own, as the README advises, and redirects the old address.
+      {
+        const moved = await serveSite(siteDir);
+        const home = http.createServer((req, res) => {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>The new home</title><p>Moved here.</p>');
+        });
+        await new Promise((resolve) => home.listen(0, '127.0.0.1', resolve));
+        const homeUrl = `http://127.0.0.1:${home.address().port}/`;
+        const mc = await browser.newContext({ viewport: { width: 420, height: 860 } });
+        const p = await mc.newPage();
+        await p.goto(moved.url, { waitUntil: 'load' });
+        await p.evaluate(() => Promise.race([navigator.serviceWorker.ready, new Promise((resolve) => setTimeout(resolve, 15000))]));
+        await p.reload({ waitUntil: 'load' });
+        await p.waitForTimeout(500);
+        const inControl = await p.evaluate(() => !!navigator.serviceWorker.controller);
+        for (const q of ['?fbclid=IwAR0a', '?fbclid=IwAR0b', 'index.html?utm_source=readme']) await p.goto(`${moved.url}${q}`, { waitUntil: 'load' });
+        await p.waitForTimeout(500);
+        const withQuery = await p.evaluate(async () => {
+          const out = [];
+          for (const name of (await caches.keys()).filter((k) => k.startsWith('phonogeometry-'))) {
+            for (const req of await (await caches.open(name)).keys()) if (new URL(req.url).search) out.push(req.url);
+          }
+          return out;
+        });
+        check('a link with a query string adds nothing to the worker\'s cache', inControl && withQuery.length === 0,
+          `service worker in control: ${inControl}, entries with a query: ${withQuery.length ? withQuery.join(' ') : 'none'}`);
+
+        moved.moveTo(homeUrl);
+        const landed = [];
+        for (let i = 0; i < 2; i++) {
+          await p.goto(moved.url, { waitUntil: 'load' }).catch(() => {});
+          landed.push(p.url());
+        }
+        check('a site that moved takes its installed copy with it', landed.every((u) => u === homeUrl),
+          `opened the old address twice, landed on ${landed.join(', ')}`);
+
+        await moved.stop();
+        const offline = await p.goto(`${moved.url}?fbclid=IwAR0offline`, { waitUntil: 'load', timeout: 15000 }).then(() => true).catch(() => false);
+        const app = offline && (await p.$('#btn-start-cameras')) !== null;
+        check('offline, a link with a query string opens the app', app, `loaded: ${offline}, interface: ${app}`);
+        await mc.close();
+        await new Promise((resolve) => home.close(resolve));
+      }
     }
   } finally {
     await browser.close();

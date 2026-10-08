@@ -198,8 +198,11 @@ belong to the origin: a script injected into any one of those apps could read th
 keeps in IndexedDB. The app keeps its database, keys and caches named after itself and treats
 what it reads back as untrusted, but that limits the damage rather than preventing it. Give it
 an origin of its own: a custom domain or subdomain (Settings → Pages → Custom domain), or any
-host above on a domain of its own. `robots.txt` and `.well-known/security.txt` are only read at a
-domain's root, so they do their job there and nothing under a Pages project path.
+host above on a domain of its own. Pages then redirects the old address, and an installed copy
+follows the redirect to the new one rather than opening its cached copy of the old build; shots
+taken at the old address stay in that origin's storage, which the new one cannot read.
+`robots.txt` and `.well-known/security.txt` are only read at a domain's root, so they do their
+job there and nothing under a Pages project path.
 
 **Not-found page.** Every host above answers an address the site does not have with `404.html`,
 which carries its own look (an inline style the policy allows by its hash) and loads nothing by

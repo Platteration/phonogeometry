@@ -29,9 +29,14 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith(PREFIX) && k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
 // Only the shell is cached at runtime, so an unexpected 200 from elsewhere on the origin
-// cannot displace a file the app needs offline.
+// cannot displace a file the app needs offline. One file, one URL: a link carrying a query
+// string (the `?fbclid=…` a social site appends to every click, a `?utm_source=…`) is the same
+// page under another name, and keyed by it each one was a further copy that nothing reads back
+// and that stays until VERSION changes, one per distinct link anyone writes. Such a request is
+// fetched, not kept; a navigation finds the page's one copy with `ignoreSearch` below.
 const SHELL_URLS = new Set(SHELL.map((p) => new URL(p, self.location.href).href));
 function isShell(url) {
+  if (url.search) return false;
   const bare = url.origin + url.pathname;
   return SHELL_URLS.has(bare) || SHELL_URLS.has(bare.replace(/index\.html$/, ''));
 }
@@ -43,16 +48,19 @@ function isShell(url) {
 // a rejection here would be a network error for every request the worker intercepts, the page
 // itself included, online or offline. A lookup that cannot answer is a miss, and the network
 // still gets its turn.
-function lookup(req) {
-  return caches.open(VERSION).then((c) => c.match(req)).catch(() => undefined);
+function lookup(req, options) {
+  return caches.open(VERSION).then((c) => c.match(req, options)).catch(() => undefined);
 }
 
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET') return;
   if (url.origin === location.origin) {
+    // Offline, a link with a query string opens the cached page rather than failing: the host
+    // answers it with the same file, and the cache holds that file once, without the query.
+    const navigate = e.request.mode === 'navigate';
     e.respondWith(
-      lookup(e.request).then((cached) => {
+      lookup(e.request, { ignoreSearch: navigate }).then((cached) => {
         const fetched = fetch(e.request).then((res) => {
           if (res && res.ok && isShell(url)) {
             // Copy the body before the response goes to the page, which reads it: a clone taken
@@ -65,7 +73,14 @@ self.addEventListener('fetch', (e) => {
         // Network first so updates land quickly, falling back to the cache when offline —
         // and also when the network answers badly. A 404 during a partial deploy or a 502
         // from the host would otherwise break an app that is sitting complete in the cache.
-        return fetched.then((r) => (r && r.ok ? r : (cached || r || Response.error())));
+        //
+        // A redirect is not answering badly. A navigation's fetch does not follow one: it comes
+        // back as an `opaqueredirect`, which is not `ok`, and the cached page used to win it
+        // every time. So a site that moved (to an origin of its own, as the README advises)
+        // never took its installed copies along: they stayed at the old address on the old
+        // build for good, since the browser's update check of sw.js gets the same redirect and
+        // a worker's script may not be redirected. The browser follows the redirect instead.
+        return fetched.then((r) => (r && (r.ok || r.type === 'opaqueredirect') ? r : (cached || r || Response.error())));
       }),
     );
   }

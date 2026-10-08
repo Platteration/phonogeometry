@@ -60,8 +60,15 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   worker is network first and writes each shell file it fetches back into its own cache,
   cloning the response before the page reads it (a clone taken after throws, and for a long
   time nothing was written); that refresh covers only what a visit loads, so it is not how a
-  deploy arrives. A cache that will not open counts as a miss, not as a failure: `lookup`
-  heads the fetch handler's chain, and `caches.open` can reject where a match cannot (an
+  deploy arrives. It keeps one copy per file: a URL with a query string (the `?fbclid=` a social
+  site appends to every click) is fetched and never written, since keyed by it each link was
+  another copy nothing read back, and a navigation is matched with `ignoreSearch`, so offline
+  such a link still opens the page. A navigation the host answers with a redirect goes to the
+  browser, never the cached page: a navigation's fetch resolves to an `opaqueredirect`, which is
+  not `ok`, and while the cache won it a site that moved kept every installed copy at the old
+  address on the old build for good (the update check of `sw.js` is redirected too, and a
+  worker's script may not be). A cache that will not open counts as a miss, not as a failure:
+  `lookup` heads the fetch handler's chain, and `caches.open` can reject where a match cannot (an
   evicted quota, a broken backend), so an uncaught rejection there is a network error for
   every request the worker intercepts, the page itself included, online or offline.
   `test/sw.test.js` stubs the worker's globals and drives the real fetch handler against a
