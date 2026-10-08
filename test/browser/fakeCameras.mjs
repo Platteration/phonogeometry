@@ -15,7 +15,19 @@ export function fakePhoneCameras({ concurrencyLimit = 3 } = {}) {
     function makeStream(dev, width, height) {
       const canvas = document.createElement('canvas');
       canvas.width = width; canvas.height = height;
-      const ctx = canvas.getContext('2d');
+      // Drawn in memory, not on the GPU. Chromium may put a plain 2D canvas on the GPU, and a
+      // stream captured from one there delivered its first frame late or not at all until the
+      // track was stopped: in the suite's own browser (SwiftShader), a lens reopened after a
+      // build sat at `loadstart` through the app's whole 8 s open deadline and reached
+      // `playing` the instant the app gave up and stopped it, and a drawImage of such a video
+      // held the page for 12 s. How long depended on the timing around it, so "the cameras
+      // come back with the screen" passed or failed on that: with 2.5 s spent on the capture
+      // screen before the build it failed 6 runs in 6, and with none the lenses still took 2
+      // to 5 s to come back. A real camera's frames do not come through a canvas readback, so
+      // this is the fake's fault and not a deadline for the app to stretch.
+      // `willReadFrequently` asks for a canvas kept in memory: the same 2.5 s runs passed 6 in
+      // 6, every lens back within 0.6 s.
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       let t = 0;
       const draw = () => {
         t += 1;

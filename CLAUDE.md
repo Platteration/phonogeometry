@@ -22,8 +22,10 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   network would pass with the host still up. `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
-  camera. It starts its own server and renders its own
-  photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
+  camera. Its lenses draw on canvases kept in memory (`willReadFrequently`): captured from a
+  GPU canvas under the suite's SwiftShader, a stream's first frame came seconds late or only
+  once the track was stopped, and the camera checks passed or failed on timing. It starts its
+  own server and renders its own photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
   `REQUIRE_BROWSER=1` turns that skip into a failure, which is how CI runs it (the workflow
   installs a pinned Playwright with `npm install --no-save`, so the repository keeps no
   dependencies).
