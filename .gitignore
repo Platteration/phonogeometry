@@ -5,6 +5,8 @@ node_modules/
 # project
 .certs/
 scratch/
+# the site, copied by tools/site.js (the Pages deploy writes it in CI)
+/dist/
 
 # editors
 .vscode/

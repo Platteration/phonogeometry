@@ -24,7 +24,6 @@ class FakeElement {
     this.checked = false;
     this.value = '';
     this.title = '';
-    this.html = '';                    // whatever was set as markup, kept verbatim
   }
 
   get className() { return [...this.classes].join(' '); }
@@ -43,9 +42,9 @@ class FakeElement {
   get textContent() { return this.childNodes.map((n) => (typeof n === 'string' ? n : n.textContent)).join(''); }
   set textContent(v) { this.childNodes = v === '' || v === undefined ? [] : [String(v)]; }
 
-  get innerHTML() { return this.html; }
-  set innerHTML(v) { this.childNodes = []; this.html = String(v); }
-  insertAdjacentHTML(_where, markup) { this.html += String(markup); }
+  // No innerHTML: app.js builds every node with createElement and text, which is what the
+  // site's Trusted Types policy requires of it.
+  replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
 
   append(...nodes) { for (const n of nodes) { if (typeof n !== 'string') n.parent = this; this.childNodes.push(n); } }
   appendChild(node) { node.parent = this; this.childNodes.push(node); return node; }

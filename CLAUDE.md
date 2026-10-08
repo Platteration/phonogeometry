@@ -14,10 +14,17 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
   secure origin for camera access).
 - `npm run test:e2e` runs the application end to end in Chromium (multi-camera capture, a
-  good scan, a hopeless one, exports, reload, offline). The offline step serves what
-  `pages.yml` publishes from `/phonogeometry/` on a server of its own, as GitHub Pages serves a
-  project site, fails on any request outside that sub-path or for a missing file, checks that a
-  file changed on the host reaches the worker's cache, and then closes that server: Playwright's
+  good scan, a hopeless one, exports, reload, the website, offline). The sections at the dev
+  server run under the policy `index.html` carries in its `<meta>` and fail on anything it
+  refuses. The website step copies the site with `tools/site.js` (the files `pages.yml`
+  publishes) and serves it from `/phonogeometry/` on a server of its own, as GitHub Pages serves
+  a project site, sending every response the headers `_headers` writes and answering a missing
+  address with `404.html`; it drives the main flow there (Chromium's own fake camera, so the
+  Permissions-Policy decides, import, a build, the viewer, the exports, the worker's install,
+  the manifest) and fails on any violation, console error, page error, request outside that
+  sub-path or for a missing file. It also checks Trusted Types are enforced, the 404 page, that
+  the repository's files are not published, framing, and the safety net. Then it checks that a
+  file changed on the host reaches the worker's cache, and closes that server: Playwright's
   `setOffline` does not reach a service worker's own fetches, so a worker answering from the
   network would pass with the host still up. `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
@@ -38,9 +45,11 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   exist yet, and has to be a branch the `github-pages` environment accepts: by default the
   default branch) or by hand (offered only once the file is on the default branch):
   `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
-  stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence), no
-  build step. `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `sw.js`
-  and the licence, so a module added to one and not the other fails `npm test`, and pins the
+  stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence, plus
+  `404.html`, `robots.txt` and `.well-known/security.txt`), no build step.
+  `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `EXTRA` in
+  `tools/site.js` (the files beside the shell), and to `node tools/site.js --list`, so a module
+  added to one and not the other fails `npm test`, and pins the
   workflow line for line: the build job is checkout (no persisted credentials), Node, the
   tests, the assembly and the upload, and only the deploy job holds `pages: write` and
   `id-token: write`, so a step, scope or trigger added to it fails there first. `sw.js` goes
@@ -63,7 +72,8 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 ## Layout
 
 - `src/app.js` UI and flow; `src/camera/` device discovery, capture, intrinsics, EXIF;
-  `src/storage.js` IndexedDB shot persistence.
+  `src/storage.js` IndexedDB shot persistence; `src/guard.js` the safety net, `src/trust.js` the
+  Trusted Types policy (see Website).
 - `src/pipeline/reconstruct.js` orchestrates the pipeline; `worker.js` is the Web Worker entry.
 - The camera rig (`sfm.js`) ties frames captured in the same shot together: `rigKey` names the
   physical camera, `shotIndex` the moment. It fills gaps and merges a camera that shares no
@@ -158,12 +168,55 @@ four controls, each one click from its default. The About block's version is `AP
 cache name, a hash of the shell files, and is not that. The shots are IndexedDB
 (`src/storage.js`), not a preference, and none of this touches them.
 
+## Website
+
+The app is also a website, on the art app's model: everything still happens in the browser,
+and the host only serves files and the headers around them. The site is `node tools/site.js
+--list` (the worker's `SHELL` plus `EXTRA`: `sw.js`, three.js's licence, `404.html`,
+`robots.txt`, `.well-known/security.txt`); `tools/site.js <folder> --host=…` copies it, and the
+settings that host reads, into an empty folder. Nothing is built.
+
+- **One policy, five places**: `_headers` (Netlify, Cloudflare Pages), `.htaccess`,
+  `deploy/nginx.conf`, and the `<meta>` of `index.html` and `404.html`, which leaves out
+  `frame-ancestors` (a `<meta>` cannot carry it) and `upgrade-insecure-requests` (so the dev
+  server still serves another device over plain http). `test/website.test.js` holds them equal,
+  and walks every repository file through the nginx, Apache and Netlify rules (nginx and Apache
+  allow a pattern of the site's paths; `_redirects` lists the repository's top-level entries, so
+  a new one goes there too). Change one, change all five.
+- **Every source was measured** in Chromium with the policy sent as a header at a sub-path:
+  `img-src data:` is the shot thumbnails (JPEG `data:` URLs); `connect-src 'self'` is the
+  service worker (with `'none'` it registers and caches nothing, silently); `manifest-src
+  'self'`; `form-action 'none'` leaves the `<form method="dialog">` dialogs working;
+  `camera=(self)` and `screen-wake-lock=(self)` are the two features the app uses (with `()`,
+  `getUserMedia` and the build's wake lock are refused), and the muted previews play with
+  `autoplay=()`. Web Share is left out of the Permissions-Policy because Chromium on Linux
+  reports it unrecognised; unlisted, it stays the browser's default (this origin).
+- **Hashes**: `script-src` carries the sha256 of the import map in `index.html` and `style-src`
+  that of `404.html`'s `<style>`; the test recomputes both and prints the new value. Editing the
+  import map or that style means pasting the new hash into all five places (and the import map
+  is a shell file, so `VERSION` too).
+- **Trusted Types are enforced** (`require-trusted-types-for 'script'; trusted-types
+  phonogeometry`). `new Worker()` and `serviceWorker.register()` take a TrustedScriptURL, so both
+  go through `scriptURLs()` in `src/trust.js`, whose one policy vouches for exactly
+  `src/pipeline/worker.js` and `sw.js`. No script writes HTML; the vendored three.js has one
+  sink (`DOMParser` in `FileLoader`'s document mode), on a network path the app never takes.
+- **The safety net**: `<html class="no-js">`, and `src/guard.js` loads first from `<head>`. With
+  JavaScript off, a site file that fails to load, a throw from one of the site's own scripts, or
+  a load event with the app not started, `#start-note` shows and the controls are hidden.
+  `init()` in `src/app.js` adds `started` (and removes `no-js`) as its last step; after that the
+  app reports its own failures.
+- On GitHub Pages only the `<meta>` applies, and only to the page: a worker takes its policy from
+  the response that delivered its script, so there the reconstruction worker and the service
+  worker run without one. `.well-known/security.txt` expires on 2027-10-08 and the website test
+  fails once it has: renew it, a year ahead at most.
+
 ## Code conventions
 
 - Never paste text that came from outside into markup. Camera labels come from the operating
   system and photo labels from file names, so the interface builds those nodes with
   `document.createElement` and `textContent` (there is an `el()` helper in `app.js`).
-  `innerHTML` is for fixed markup and computed numbers only.
+  Nothing uses `innerHTML`, not even for fixed markup: the site's policy enforces Trusted
+  Types, under which every HTML string sink throws, and `test/website.test.js` fails on one.
 
 - Camera model: `Xc = R Xw + t`, pixel = `c + f * distort(Xc.xy / Xc.z)` with
   `distort(x) = x (1 + k1 |x|^2)`. World frame = first registered camera; results are

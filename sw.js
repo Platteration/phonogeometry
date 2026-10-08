@@ -10,10 +10,10 @@
 // the old cache goes on activate. A deploy that touches no shell file leaves it alone, and
 // nobody downloads three.js again for a README edit.
 const PREFIX = 'phonogeometry-';
-const VERSION = `${PREFIX}2f7cd63a33ab`;
+const VERSION = `${PREFIX}89d1a6d63441`;
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
-  'src/app.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/install.js', 'src/camera/cameraManager.js',
+  'src/guard.js', 'src/app.js', 'src/trust.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/install.js', 'src/camera/cameraManager.js',
   'src/camera/moveGuide.js', 'src/camera/captureGuide.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
   'src/pipeline/reconstruct.js', 'src/pipeline/worker.js',
   'src/vision/linalg.js', 'src/vision/image.js', 'src/vision/fast.js', 'src/vision/orb.js', 'src/vision/match.js',

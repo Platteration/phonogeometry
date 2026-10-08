@@ -182,3 +182,10 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .guide-status[data-level="ready"] { color: var(--ok); }
 .guide-status[data-level="far"], .guide-status[data-level="pivot"] { color: var(--danger); }
 .capture-bar { flex-direction: column; align-items: stretch; }
+
+/* The safety net (src/guard.js): with no script running, or a page that could not start, a
+   short note stands where the controls were, rather than buttons that do nothing. */
+.start-note { display: none; margin: 4px 16px 0; padding: 12px 14px; border-radius: 10px; background: var(--panel-2); color: var(--text); font-size: 14px; }
+.no-js .start-note, .start-failed .start-note { display: block; }
+.no-js .topbar-actions, .no-js main, .no-js .capture-bar,
+.start-failed .topbar-actions, .start-failed main, .start-failed .capture-bar { display: none; }

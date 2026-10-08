@@ -1,13 +1,21 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="no-js">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <!-- The site's policy, for a host that sends no headers (GitHub Pages). The same policy is in
+       _headers, .htaccess and deploy/nginx.conf, where it also carries frame-ancestors (which a
+       <meta> cannot) and upgrade-insecure-requests (left to the header, so the dev server still
+       serves a phone on the local network over plain http); test/website.test.js holds every copy
+       equal. The script hash is the import map below, the style hash 404.html's <style>. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'sha256-YZsq6qJLsf/5TaskaAzwZ3b+Wi32EerrwGMOBDVEtUc='; style-src 'self' 'sha256-k6jth54MHrYRc0rvI2w7ZQMS6jqHLr0Lm9hZLmXtrCE='; img-src 'self' data:; worker-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types phonogeometry" />
+  <meta name="referrer" content="no-referrer" />
   <meta name="theme-color" content="#0f1115" />
   <meta name="description" content="Turn every camera on your phone into a 3D scanner. Capture from all lenses at once and build textured meshes of rooms, people and objects, entirely on your device." />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="mobile-web-app-capable" content="yes" />
+  <script src="src/guard.js"></script>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" href="icons/icon-192.png" type="image/png" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
@@ -30,6 +38,7 @@
       <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
     </div>
   </header>
+  <div id="start-note" class="start-note" role="alert">Phonogeometry has not started. It runs in this browser, with JavaScript, and nothing is uploaded. If JavaScript is off, turn it on for this site; otherwise check your connection and reload the page.</div>
 
   <!-- ============ Capture ============ -->
   <main id="screen-capture" class="screen">

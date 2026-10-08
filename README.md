@@ -103,7 +103,7 @@ npm run start:https
 
 There are no dependencies to install and no build step.
 
-The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, deploy the folder to any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages…).
+The server prints a `https://<your LAN IP>:8443/` URL. Open it on the phone (same Wi-Fi), accept the self-signed certificate once, and tap **Enable all cameras**. Alternatively, publish it as a website on any static host with HTTPS (GitHub Pages, Netlify, Cloudflare Pages, Apache, nginx): see [Deploy](#deploy).
 
 `npm run start:https` is the LAN mode, so it listens on every interface. Plain `npm start` listens on `localhost` only; add `--host=0.0.0.0` if you want to reach it from another device over HTTP. In the LAN modes the server answers to this machine's own names — its addresses, its hostname, and mDNS names such as `laptop.local` — and reads its interfaces again on a miss, so a Wi-Fi joined after the start still works. Reaching it any other way — a port forwarded by Docker, WSL2, a VM or a tunnel, or a name your router hands out — needs that address in `ALLOWED_HOST` (a comma-separated list; ports are ignored). Any other `Host` gets a 403 and one line on the terminal saying so, which is what keeps a page you visit from reaching the checkout by pointing its own name at 127.0.0.1.
 
@@ -132,9 +132,105 @@ Some phones refuse to stream several rear cameras at the same time. Cameras that
 
 ### Deploy
 
-`.github/workflows/pages.yml` publishes the app to GitHub Pages: a push to `main` runs `npm test` and uploads the files the app serves, as committed. Nothing is built, and the tests, tools and docs stay behind. Three things outside the files have to be in place first. Pages has to be set to deploy from Actions (Settings → Pages → Source: GitHub Actions). A `main` branch has to exist, and this repository does not have one yet. And the `github-pages` environment has to accept deployments from `main`: by default it admits the default branch, so the simplest arrangement is to make `main` the default (otherwise add it to the environment's deployment branches). Running the workflow by hand (Actions → Run workflow) is offered only once `pages.yml` is on the default branch.
+The app is also a website, and the website is the files the page loads and nothing else: the
+page and its not-found page, the stylesheet, every module under `src/`, the vendored three.js
+and its licence, the service worker, the manifest and icons, `robots.txt` and
+`.well-known/security.txt`. `node tools/site.js <folder>` copies them into an empty folder and
+`node tools/site.js --list` names them; the list is the service worker's shell plus those few
+files, so nothing else in the repository (notes, tests, tools, the dev server, the hosting
+settings) is ever published. Nothing is built: the copy is the committed files as they are.
+Everything still happens in the visitor's browser. The host only serves files, and the
+photographs, shots and meshes never leave the device.
+
+`.github/workflows/pages.yml` publishes that list to GitHub Pages: a push to `main` runs `npm test` and uploads those files as committed. Three things outside the files have to be in place first. Pages has to be set to deploy from Actions (Settings → Pages → Source: GitHub Actions). A `main` branch has to exist, and this repository does not have one yet. And the `github-pages` environment has to accept deployments from `main`: by default it admits the default branch, so the simplest arrangement is to make `main` the default (otherwise add it to the environment's deployment branches). Running the workflow by hand (Actions → Run workflow) is offered only once `pages.yml` is on the default branch.
 
 The app runs from the project's sub-path (`<user>.github.io/<repository>/`), installs, and works offline there. Online the service worker asks the network first, so a visit gets what the host is serving. An installed copy takes a deploy offline as a whole: the service worker's cache name (`VERSION` in `sw.js`) is a hash of the files it caches, so a deploy that changes any of them is a new worker, which downloads them all again and drops the old copy; `npm test` fails, printing the value to use, until `VERSION` matches the files.
+
+Any static host with HTTPS will serve the folder. The repository carries the settings of the
+common ones, with the same headers in each:
+
+| Host | Copy the site with | Settings it reads |
+| --- | --- | --- |
+| Netlify | `node tools/site.js <folder> --host=netlify` | `_headers`, `_redirects` |
+| Cloudflare Pages | `node tools/site.js <folder> --host=cloudflare` | `_headers` |
+| Apache | `node tools/site.js <folder> --host=apache` | `.htaccess` |
+| nginx | `node tools/site.js <folder>` | `deploy/nginx.conf`, copied into the server's configuration by hand |
+| GitHub Pages | the workflow | none: see below |
+
+Serve it over HTTPS only: phones open their cameras only for a secure page, and the Apache and
+nginx settings redirect plain `http://` (Netlify, Cloudflare Pages and GitHub Pages each have a
+switch for it). Never point a web server at a git checkout: `.git/` holds the whole history, and
+`.certs/` the dev server's private key once `npm run start:https` has run. If it happens anyway,
+the Apache and nginx settings serve the site's own files and answer 404 for everything else, and
+`_redirects` does the same for the repository's files on Netlify; Cloudflare Pages has no 404
+rule, so there the folder is the only protection.
+
+**Response headers.** The same set is in `_headers`, `.htaccess` and `deploy/nginx.conf`, and
+`test/website.test.js` fails when one of them says something the others do not. Every source in
+the policy was measured in Chromium with the policy sent as a response header, at a sub-path,
+starting from `default-src 'none'`; the browser suite drives the whole app under it.
+
+| Header | Value | Why |
+| --- | --- | --- |
+| `Content-Security-Policy` | `default-src 'none'; script-src 'self' 'sha256-…'; style-src 'self' 'sha256-…'; img-src 'self' data:; worker-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types phonogeometry; frame-ancestors 'none'; upgrade-insecure-requests` | Only the site's own scripts run, and nothing inline or evaluated but the import map that names three.js, allowed by its hash; the style hash is the not-found page's inline style. `img-src data:` is the shot thumbnails, which are JPEG `data:` URLs kept with each shot. `connect-src 'self'` is the service worker fetching the site's own files: with `'none'` it registers and caches nothing, silently. The app itself makes no network request. Trusted Types make an HTML string sink a TypeError, so a camera label or a file name can only ever be text; the one named policy (`src/trust.js`) vouches for exactly two scripts, the reconstruction worker and `sw.js`. |
+| `X-Content-Type-Options` | `nosniff` | A file is what its type says. |
+| `X-Frame-Options` | `DENY` | With `frame-ancestors 'none'`: no other site can frame the app and steer its buttons (clickjacking). |
+| `Referrer-Policy` | `no-referrer` | The one link out, to the source, tells GitHub nothing about where the app is hosted. |
+| `Permissions-Policy` | thirty powerful features named, all off (microphone, location, motion sensors, USB, serial, MIDI, payment, display capture, fullscreen, autoplay and the rest) but `camera` and `screen-wake-lock`, which are this site's alone | The cameras, and the screen kept on through a build. With `camera=()` the browser refuses the cameras outright, and with `screen-wake-lock=()` the lock a build takes. The previews are muted, which plays with `autoplay` off as well. |
+| `Cross-Origin-Opener-Policy` | `same-origin` | Another window keeps no handle on this one. |
+| `Cross-Origin-Resource-Policy` | `same-origin` | Other sites cannot embed the app's files. |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Browsers remember to use HTTPS. |
+| `Cache-Control` | `no-cache` | No file name carries a version, so every load revalidates (an unchanged file costs a 304) and a deploy never mixes old scripts with new HTML. The service worker keeps the offline copy. |
+
+**GitHub Pages sends no headers.** The page carries the same policy in a `<meta>` tag, and the
+referrer policy in another, so the scripts, styles, images and Trusted Types rules hold for the
+page there too. What a `<meta>` cannot do needs a host that sends headers (Netlify, Cloudflare
+Pages, Apache, nginx): `frame-ancestors`, so on Pages another site can frame the app; nosniff,
+the permissions, the cross-origin and HTTPS headers; and the workers' own policy, since a
+worker takes its policy from the response that delivered its script, not from the page, so on
+Pages the reconstruction worker and the service worker run without one. `upgrade-insecure-requests`
+is left out of the `<meta>` on purpose, so that `npm start -- --host=0.0.0.0` still serves another
+device over plain `http://`; Pages forces HTTPS by itself.
+
+**One origin per app.** A Pages project site lives under `platteration.github.io`, an origin it
+shares with every other app the account publishes, and storage, caches and service workers
+belong to the origin: a script injected into any one of those apps could read the shots this one
+keeps in IndexedDB. The app keeps its database, keys and caches named after itself and treats
+what it reads back as untrusted, but that limits the damage rather than preventing it. Give it
+an origin of its own: a custom domain or subdomain (Settings → Pages → Custom domain), or any
+host above on a domain of its own. `robots.txt` and `.well-known/security.txt` are only read at a
+domain's root, so they do their job there and nothing under a Pages project path.
+
+**Not-found page.** Every host above answers an address the site does not have with `404.html`,
+which carries its own look (an inline style the policy allows by its hash) and loads nothing by
+a relative path but the icon, so it renders at any address. Its one link, back to the app, is
+`./`: right for any address one level below the site's root, which is what a mistyped page name
+is. The Apache setting names it from the document root (`ErrorDocument 404 /404.html`); for a
+site in a sub-folder, put the folder in front.
+
+**If the page cannot start.** `src/guard.js` loads first and depends on nothing. With JavaScript
+off, with a file that did not load, or with a module that threw before the app started, the
+visitor reads a short note saying so where the controls would have been, rather than a page of
+buttons that do nothing.
+
+**Security contact.** `.well-known/security.txt` points to this repository's private
+vulnerability report form and to `SECURITY.md`. Its `Expires` date (8 October 2027) is renewed
+every year; `npm test` fails once it has passed.
+
+**Launch checklist**, with `SITE` the https address:
+
+```sh
+curl -sI http://SITE/ | head -1                         # a 301 to https
+curl -sI https://SITE/ | grep -i -E 'content-security|strict-transport|nosniff|frame-options|referrer|permissions|cross-origin|cache-control'
+curl -sI https://SITE/.git/HEAD | head -1                # 404
+curl -sI https://SITE/README.md | head -1                # 404
+curl -s  https://SITE/src/ | grep -c 'Page not found'    # 1: the not-found page, not a file list
+curl -sI https://SITE/.well-known/security.txt | head -1 # 200
+```
+
+Then open the site on a phone, enable the cameras, take a few shots, build a mesh and download
+it, and check that the browser console shows no `Content Security Policy`, `Permissions policy`
+or `Trusted Type` lines.
 
 ## Development
 
@@ -155,9 +251,16 @@ browser's fake camera, imports rendered photographs, checks that a blurred one i
 sharp ones are not, reconstructs a scan and confirms every photo was used, times the camera
 preview against the finished mesh, downloads all three exports, reloads to confirm shots
 survive, feeds it a scan that cannot work and checks the reason reaches whichever screen the
-user is on, and finally serves what the Pages workflow publishes from a sub-path, as GitHub
-Pages does, checks that nothing the app loads leaves it and that a file changed on the host
-reaches the offline copy, then shuts that server down and runs a whole scan offline. It skips itself with
+user is on, all under the policy the page carries in its `<meta>`. Then it copies the website
+with `tools/site.js` and serves it from a sub-path, as GitHub Pages does, sending every response
+the headers `_headers` writes, and drives the app there under the header policy (camera, shots,
+import, a build, the viewer, all four exports, the service worker's install, the manifest),
+failing on any policy violation, console error, page error or request that leaves the site. It
+checks that Trusted Types are enforced, that a missing address gets the site's 404 page, that
+the repository's own files are not published, that another site cannot frame the app, and that
+the safety net speaks with JavaScript off, a module missing and a module that throws; then it
+checks that a file changed on the host reaches the offline copy, shuts that server down and runs
+a whole scan offline. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
 CI runs `npm test`, `npm run test:conventions` and the browser suite, and a separate job
@@ -177,9 +280,15 @@ src/pipeline/                        worker entry and the reconstruction orchest
 src/vision/                          linear algebra, features, matching, geometry, SfM, BA, plane sweep
 src/mesh/                            TSDF, surface nets, mesh utilities, exporters
 src/viewer/                          three.js viewer
+src/guard.js                         the safety net, loaded first: a note in place of the controls when the page cannot start
+src/trust.js                         the Trusted Types policy for the two scripts the app starts
 test/                                node:test suites and synthetic scene renderers
 server.js                            dev server (HTTP/HTTPS with self-signed certificate)
 sw.js, manifest.webmanifest, icons/  PWA
+tools/site.js                        the website: the files it publishes, copied into a folder for a host
+404.html, robots.txt, .well-known/   the rest of the website
+_headers, _redirects, .htaccess,     Netlify and Cloudflare Pages, Netlify, Apache and nginx settings:
+deploy/nginx.conf                    one set of headers
 ```
 
 ## License

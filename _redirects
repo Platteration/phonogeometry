@@ -1,0 +1,34 @@
+# Netlify. Publish the folder `node tools/site.js <folder> --host=netlify` writes, which holds
+# the site and nothing else. If the repository itself is published instead, these rules keep
+# its own files out of the site: forced (404!), because Netlify otherwise serves a file that
+# exists ahead of any rule for its path. Cloudflare Pages ignores 404 rules, so there the
+# folder is the only protection. test/website.test.js checks that every file of the repository
+# outside the site is answered 404 here.
+/.git/*             /404.html  404!
+/.github/*          /404.html  404!
+/.claude/*          /404.html  404!
+/.certs/*           /404.html  404!
+/.editorconfig      /404.html  404!
+/.env               /404.html  404!
+/.gitignore         /404.html  404!
+/.nvmrc             /404.html  404!
+/.htaccess          /404.html  404!
+/_headers           /404.html  404!
+/_redirects         /404.html  404!
+/AGENTS.md          /404.html  404!
+/CLAUDE.md          /404.html  404!
+/CONVENTIONS.md     /404.html  404!
+/LICENSE            /404.html  404!
+/README.md          /404.html  404!
+/REVIEW.md          /404.html  404!
+/SECURITY.md        /404.html  404!
+/SECURITY-AUDIT.md  /404.html  404!
+/package.json       /404.html  404!
+/package-lock.json  /404.html  404!
+/server.js          /404.html  404!
+/deploy/*           /404.html  404!
+/docs/*             /404.html  404!
+/node_modules/*     /404.html  404!
+/scratch/*          /404.html  404!
+/test/*             /404.html  404!
+/tools/*            /404.html  404!

@@ -14,13 +14,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { EXTRA, siteFiles } from '../tools/site.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'pages.yml'), 'utf8');
 
 // Published beside the shell though the worker does not cache them: the worker itself, which
-// the page registers, and the licence the vendored three.js is distributed under.
-const NOT_CACHED = ['sw.js', 'vendor/three/LICENSE'];
+// the page registers, the licence the vendored three.js is distributed under, the page a host
+// answers a missing address with, robots.txt and the security contact. tools/site.js names
+// them, because it copies the same site for every other host.
+const NOT_CACHED = EXTRA;
+for (const f of ['sw.js', 'vendor/three/LICENSE', '404.html', 'robots.txt', '.well-known/security.txt']) {
+  assert.ok(NOT_CACHED.includes(f), `${f} is published beside the shell`);
+}
 
 const SITE = 'https://example.test/phonogeometry/';
 
@@ -82,7 +88,7 @@ async function shell() {
   });
 }
 
-test('the site the deploy publishes is the service worker\'s shell, the worker and the three.js licence', async () => {
+test('the site the deploy publishes is the service worker\'s shell and the files beside it, and tools/site.js copies the same', async () => {
   const { paths } = assembly();
   const files = repositoryFiles(root);
   const tracked = (spec) => files.filter((f) => spec.some((p) => f === p || f.startsWith(`${p.replace(/\/$/, '')}/`)));
@@ -93,9 +99,11 @@ test('the site the deploy publishes is the service worker\'s shell, the worker a
   const expected = [...new Set([...(await shell()), ...NOT_CACHED])].sort();
   assert.deepEqual(
     published, expected,
-    'The files pages.yml publishes and the files sw.js caches (plus sw.js and vendor/three/LICENSE) must be the same set.\n'
+    `The files pages.yml publishes and the files sw.js caches (plus ${NOT_CACHED.join(', ')}) must be the same set.\n`
     + 'A file the app loads belongs in both: in SHELL so it works offline, in the `git archive` line so it is on the site.',
   );
+  // And the folder tools/site.js copies for every other host is that same site.
+  assert.deepEqual(siteFiles(), expected, 'tools/site.js lists the site pages.yml publishes');
 });
 
 // A copy that is not a checkout: a directory no work tree is rooted in, once on its own and once

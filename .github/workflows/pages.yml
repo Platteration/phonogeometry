@@ -40,9 +40,12 @@ jobs:
       # tracked tree, not the working directory). That is the page, its stylesheet, manifest
       # and icons, the service worker, every module under src/, and the vendored three.js
       # with its licence, whose permission notice has to travel with the copy: the minified
-      # file carries only a copyright and SPDX line, and OrbitControls.js neither. Not the
-      # tests, tools, docs, dev server or dotfiles. test/pages.test.js holds this list to the
-      # service worker's SHELL.
+      # file carries only a copyright and SPDX line, and OrbitControls.js neither. Beside
+      # them, the not-found page, robots.txt and the security contact. Not the tests, tools,
+      # docs, dev server, hosting settings or any other dotfile. test/pages.test.js holds this
+      # list to the service worker's SHELL and to `node tools/site.js --list`. GitHub Pages
+      # sends no headers of its own, so the pages carry the policy in a <meta> (README.md,
+      # "Deploy").
       #
       # sw.js is published as committed, not re-stamped per commit. Its VERSION is a hash of
       # the shell files' contents, and the npm test above fails when it does not match them,
@@ -53,7 +56,7 @@ jobs:
       # changes no shell file (a README edit) keeps the name, where a per-commit stamp would
       # make every installed copy download the shell, three.js and all, again.
       - name: Assemble the site
-        run: mkdir dist && git archive HEAD index.html styles.css manifest.webmanifest sw.js icons src vendor/three | tar -x -C dist
+        run: mkdir dist && git archive HEAD index.html 404.html styles.css manifest.webmanifest sw.js robots.txt .well-known/security.txt icons src vendor/three | tar -x -C dist
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: dist

@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeObjectScan, writeStandingStillScan } from './fixtures.mjs';
 import { fakePhoneCameras } from './fakeCameras.mjs';
+import { build as buildSite, siteFiles } from '../../tools/site.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
@@ -49,41 +50,61 @@ function findChromium(chromium) {
 // GitHub Pages serves the app from <user>.github.io/<repository>/, not from the root.
 const SUB_PATH = '/phonogeometry/';
 const TYPES = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
-  '.webmanifest': 'application/manifest+json', '.png': 'image/png',
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.txt': 'text/plain; charset=utf-8',
 };
 
-/** A copy of what .github/workflows/pages.yml publishes, taken from the working tree. */
-function assembleSite(into) {
-  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'pages.yml'), 'utf8');
-  const m = workflow.match(/git archive HEAD ((?:[\w./-]+ )*[\w./-]+) \| tar -x -C \S+$/m);
-  if (!m) throw new Error('pages.yml has no `git archive HEAD <paths> | tar -x -C <dir>` line to take the site from');
-  for (const p of m[1].split(' ')) fs.cpSync(path.join(root, p), path.join(into, p), { recursive: true });
-  return into;
+/** _headers as [{ pattern, headers }], in file order: what Netlify and Cloudflare Pages send. */
+function headerRules() {
+  const rules = [];
+  for (const line of fs.readFileSync(path.join(root, '_headers'), 'utf8').split('\n')) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    if (!/^\s/.test(line)) { rules.push({ pattern: line.trim(), headers: {} }); continue; }
+    const m = line.match(/^\s+([A-Za-z-]+):\s*(.+)$/);
+    rules[rules.length - 1].headers[m[1]] = m[2].trim();
+  }
+  return rules;
+}
+/** The headers such a host sends for a path of the site ('/x', from the site's root). */
+function headersFor(rules, sitePath) {
+  const out = {};
+  for (const { pattern, headers } of rules) {
+    if (pattern.endsWith('/*') ? sitePath.startsWith(pattern.slice(0, -1)) : sitePath === pattern) Object.assign(out, headers);
+  }
+  return out;
 }
 
 /**
- * Serves `dir` under SUB_PATH the way a static host does, and nothing outside it, recording
- * every request so a URL that escapes the sub-path or names a missing file is seen. `stop`
- * closes it for real: Playwright's offline mode does not reach a service worker's own fetches
- * (measured: a reload after setOffline(true) still sent 26 requests to the host), so a worker
- * that answered from the network rather than its cache would pass with the host still up.
- * no-store keeps the browser's HTTP cache out of what the worker is shown.
+ * Serves `dir` under SUB_PATH the way a static host does, and nothing outside it: every
+ * response carries the headers _headers writes for its path, and an address the site does not
+ * have is answered 404 with the site's own 404.html, as Netlify, Cloudflare Pages and GitHub
+ * Pages answer it. Every request is recorded, the service worker's own included, so a URL that
+ * escapes the sub-path or names a missing file is seen. `stop` closes it for real: Playwright's
+ * offline mode does not reach a service worker's own fetches (measured: a reload after
+ * setOffline(true) still sent 26 requests to the host), so a worker that answered from the
+ * network rather than its cache would pass with the host still up. The files carry no
+ * validators, so the no-cache _headers sends makes the browser fetch each one afresh: what the
+ * host serves is what the worker is shown.
  */
 async function serveSite(dir) {
   const requests = [];
+  const rules = headerRules();
   const server = http.createServer((req, res) => {
     const { pathname } = new URL(req.url, 'http://localhost');
     let file = null;
+    let rel = null;
     if (pathname.startsWith(SUB_PATH)) {
-      let rel = null;
       try { rel = decodeURIComponent(pathname.slice(SUB_PATH.length)); } catch { /* a malformed escape is a 404 */ }
       const candidate = rel === null ? null : path.join(dir, rel === '' || rel.endsWith('/') ? `${rel}index.html` : rel);
       if (candidate?.startsWith(dir + path.sep) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) file = candidate;
     }
     requests.push({ path: pathname, status: file ? 200 : 404 });
-    res.writeHead(file ? 200 : 404, { 'content-type': file ? (TYPES[path.extname(file)] ?? 'application/octet-stream') : 'text/plain', 'cache-control': 'no-store' });
-    res.end(file ? fs.readFileSync(file) : 'not found');
+    const shown = file || path.join(dir, '404.html');
+    res.writeHead(file ? 200 : 404, {
+      'Content-Type': TYPES[path.extname(shown)] ?? 'application/octet-stream',
+      ...headersFor(rules, `/${file ? rel : '404.html'}`),
+    });
+    res.end(fs.readFileSync(shown));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
@@ -91,6 +112,30 @@ async function serveSite(dir) {
     requests,
     stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
   };
+}
+
+/**
+ * Records what a policy refused in `target` (a page or a context): securitypolicyviolation
+ * events from every document it loads (a binding outlives a navigation, which drops a page's
+ * own record), console lines about the policy, the permissions policy or Trusted Types, every
+ * console error and every page error.
+ */
+async function watchPolicy(target, into, { consoleErrors = true } = {}) {
+  await target.exposeBinding('__policyViolation', (_source, line) => { into.push(`violation: ${line}`); });
+  await target.addInitScript(() => {
+    addEventListener('securitypolicyviolation', (e) => {
+      window.__policyViolation(`${e.effectiveDirective} refused ${e.blockedURI || '(inline)'} at ${e.sourceFile || location.href}:${e.lineNumber} ${e.sample || ''}`.trim());
+    }, true);
+  });
+  // Without console errors and page errors this watches the policy alone, for the sections that
+  // check their own errors and stage failures on purpose.
+  const onPage = (page) => {
+    page.on('console', (m) => {
+      if ((consoleErrors && m.type() === 'error') || /Content.Security.Policy|Permissions.policy|Trusted.?Type/i.test(m.text())) into.push(`console ${m.type()}: ${m.text().slice(0, 300)} (${m.location().url})`);
+    });
+    if (consoleErrors) page.on('pageerror', (e) => into.push(`page error: ${e.message}`));
+  };
+  if (typeof target.pages === 'function') target.on('page', onPage); else onPage(target);
 }
 
 /** The text of `file` in this app's own cache (whatever its generation), or null. */
@@ -151,10 +196,20 @@ async function main() {
     ...(process.env.HTTPS_PROXY ? { ignoreDefaultArgs: ['--no-proxy-server'] } : {}),
   });
 
+  // Every page the sections below open at the dev server runs under the policy index.html
+  // carries in its <meta>, which is what GitHub Pages serves: anything it refuses there is
+  // recorded and checked at the end. (The headers are section 4's.)
+  const metaFindings = [];
+  const newPage = async (options) => {
+    const page = await browser.newPage(options);
+    await watchPolicy(page, metaFindings, { consoleErrors: false });
+    return page;
+  };
+
   try {
     // ---- 1. Cameras and capture, with the browser's fake camera device ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 }, permissions: ['camera'] });
+      const page = await newPage({ viewport: { width: 420, height: 860 }, permissions: ['camera'] });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       await page.goto(BASE, { waitUntil: 'load' });
@@ -171,7 +226,7 @@ async function main() {
 
     // ---- 1b. A phone with three cameras, one of which cannot stream alongside the others ----
     for (const limit of [3, 1]) {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 }, permissions: ['camera'] });
+      const page = await newPage({ viewport: { width: 420, height: 860 }, permissions: ['camera'] });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       await page.addInitScript(fakePhoneCameras(), { limit });
@@ -297,7 +352,7 @@ async function main() {
 
     // ---- 2. A scan that works, from import to export ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       page.on('dialog', (d) => d.accept());
@@ -431,7 +486,7 @@ async function main() {
 
     // ---- 2b. Names that come from outside are shown, not executed ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       await page.goto(BASE, { waitUntil: 'load' });
@@ -453,7 +508,7 @@ async function main() {
 
     // ---- 2c. Cancel during the decode, and a photo that cannot be decoded at all ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       // Decoding thirty frames on a phone takes seconds. Here it is slowed on purpose so the
@@ -516,7 +571,7 @@ async function main() {
 
     // ---- 2d. A build that has been superseded must not drive the screen ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       // Keep every worker the page creates. A worker whose build has been cancelled or
@@ -568,7 +623,7 @@ async function main() {
 
     // ---- 2e. A browser that stores nothing is told what is actually wrong ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       // Private browsing, or site data blocked by policy: there is no database to write to.
@@ -591,7 +646,7 @@ async function main() {
 
     // ---- 3. A scan that cannot work says so, where the user is looking ----
     {
-      const page = await browser.newPage({ viewport: { width: 420, height: 860 } });
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
       await page.goto(BASE, { waitUntil: 'load' });
@@ -617,29 +672,126 @@ async function main() {
       await page.close();
     }
 
-    // ---- 4. Offline, from the sub-path the deploy publishes to ----
-    // What pages.yml publishes, served from SUB_PATH on a server of this step's own. Every other
+    // The meta policy, at the dev server, across every section above.
+    check('the <meta> policy refused nothing the app does at the dev server', metaFindings.length === 0,
+      metaFindings.slice(0, 3).join(' | '));
+
+    // ---- 4. The website: the built site, under its own headers, at the sub-path ----
+    // What tools/site.js copies (the files pages.yml publishes) served from SUB_PATH by a server
+    // of this step's own, which sends every response the headers _headers writes for it, as
+    // Netlify and Cloudflare Pages do, and answers a missing address with 404.html. Every other
     // step uses the dev server at the root, where a root-relative URL (`/sw.js`, `/styles.css`)
-    // works and the published site would break.
+    // works and the published site would break, and where only the <meta> policy applies. The
+    // main flow runs here under the header policy, so a source the app needs and the policy
+    // leaves out fails here rather than on a visitor's phone: a refusal, a console error or a
+    // page error anywhere in it fails the step.
     {
-      const site = await serveSite(assembleSite(path.join(fixtures, 'site')));
-      const ctx = await browser.newContext({ viewport: { width: 420, height: 860 } });
+      const siteDir = path.join(fixtures, 'site');
+      buildSite(siteDir);
+      const site = await serveSite(siteDir);
+      const findings = [];
+      const offSite = [];
+      const ctx = await browser.newContext({ viewport: { width: 420, height: 860 }, permissions: ['camera'], acceptDownloads: true });
+      await watchPolicy(ctx, findings);
+      ctx.on('request', (r) => {
+        const u = r.url();
+        if (!u.startsWith(new URL(site.url).origin + SUB_PATH) && !/^(data|blob):/.test(u)) offSite.push(u);
+      });
       const page = await ctx.newPage();
-      await page.goto(site.url, { waitUntil: 'load' });
+      page.on('dialog', (d) => d.accept());
+      const response = await page.goto(site.url, { waitUntil: 'load' });
+      const sent = response.headers()['content-security-policy'];
+      const rootClass = await page.evaluate(() => document.documentElement.className);
+      const noteShown = await page.$eval('#start-note', (e) => getComputedStyle(e).display !== 'none');
+      check('the site is served under the policy _headers writes, and the app starts under it',
+        sent === headersFor(headerRules(), '/index.html')['Content-Security-Policy'] && /\bstarted\b/.test(rootClass) && !/no-js|start-failed/.test(rootClass) && !noteShown,
+        `policy sent: ${sent ? 'yes' : 'no'}, <html class="${rootClass}">, start note shown: ${noteShown}`);
+
+      // The phone's own camera path (Chromium's fake device behind a real getUserMedia), which
+      // is what the Permissions-Policy decides: with camera=() it is refused.
+      await page.click('#btn-start-cameras');
+      const tiles = await page.waitForFunction(() => document.querySelectorAll('#camera-grid .cam-tile video').length > 0, null, { timeout: 20000 })
+        .then(() => page.$$eval('#camera-grid .cam-tile', (els) => els.length)).catch(() => 0);
+      for (let i = 0; i < 2 && tiles; i++) {
+        await page.click('#btn-capture');
+        await page.waitForFunction((n) => document.querySelectorAll('#thumbs .shot').length >= n, i + 1, { timeout: 20000 }).catch(() => {});
+      }
+      // The thumbnails are data: URLs: img-src has to allow them, or every shot is a blank tile.
+      const drawn = () => page.$$eval('#thumbs img', (els) => els.map((i) => i.complete && i.naturalWidth > 0));
+      await page.waitForFunction(() => [...document.querySelectorAll('#thumbs img')].every((i) => i.complete), null, { timeout: 5000 }).catch(() => {});
+      const camThumbs = await drawn();
+      check('the site: the camera opens, shoots, and its thumbnails are drawn', tiles > 0 && camThumbs.length === 2 && camThumbs.every(Boolean),
+        `${tiles} camera tiles, thumbnails ${camThumbs.map((d) => (d ? 'drawn' : 'blank')).join(', ') || 'none'}`);
+
+      // The dialogs are <form method="dialog">, which form-action 'none' must leave working.
+      await page.click('#btn-settings');
+      await page.click('#settings button[value=close]');
+      await page.click('#btn-help');
+      await page.click('#help button[value=close]');
+      const dialogsShut = await page.evaluate(() => !document.querySelector('#settings').open && !document.querySelector('#help').open);
+      check('the site: Settings and Help open and close', dialogsShut);
+
+      await page.click('#btn-clear');
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length === 0, null, { timeout: 10000 }).catch(() => {});
+      const objectDir = path.join(fixtures, 'object');
+      await page.setInputFiles('#file-import', fs.readdirSync(objectDir).sort().map((f) => path.join(objectDir, f)));
+      await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 30000 }).catch(() => {});
+      await page.waitForFunction(() => [...document.querySelectorAll('#thumbs img')].every((i) => i.complete), null, { timeout: 5000 }).catch(() => {});
+      const importThumbs = await drawn();
+      // The worker is started through the Trusted Types policy, the viewer is three.js through
+      // the import map the policy allows by its hash, and the wake lock the build takes is the
+      // other feature the Permissions-Policy grants.
+      await page.selectOption('#quality', 'fast');
+      await page.click('#btn-reconstruct');
+      const outcome = await waitForResult(page);
+      const stats = (await page.textContent('#stats')).replace(/\s+/g, ' ').trim();
+      const gpu = /Depth maps on the GPU/.test(await page.textContent('#progress-log'));
+      const viewer = await page.$$eval('#viewer canvas', (els) => els.length);
+      check('the site: photos import, a scan builds in the worker and the viewer shows it',
+        importThumbs.length === 8 && importThumbs.every(Boolean) && outcome === 'finished' && /^8\/8/.test(stats) && viewer === 1,
+        `${importThumbs.filter(Boolean).length}/${importThumbs.length} thumbnails drawn, ${outcome}: ${stats.slice(0, 40)}, depth on the ${gpu ? 'GPU' : 'CPU'}, ${viewer} viewer canvas`);
+      const downloads = [];
+      for (const button of ['#btn-export-glb', '#btn-export-ply', '#btn-export-obj', '#btn-export-points']) {
+        const size = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), page.click(button)])
+          .then(async ([dl]) => { const f = path.join(shots, `site-${dl.suggestedFilename()}`); await dl.saveAs(f); return fs.statSync(f).size; })
+          .catch(() => 0);
+        downloads.push(size);
+      }
+      check('the site: all four exports download', downloads.every((n) => n > 1000), downloads.map((n) => `${n} bytes`).join(', '));
+
+      // The service worker's install is its own fetches, which connect-src governs: with 'none'
+      // it registers and caches nothing, and nothing on the page says so.
       const scope = await page.evaluate(() => Promise.race([
         navigator.serviceWorker.ready.then((r) => r.scope),       // active: the shell is cached
         new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
       ]));
+      const uncached = await page.evaluate(async (files) => {
+        const names = (await caches.keys()).filter((k) => k.startsWith('phonogeometry-'));
+        const out = [];
+        for (const f of files) {
+          let hit = false;
+          for (const name of names) hit = hit || !!(await (await caches.open(name)).match(f));
+          if (!hit) out.push(f);
+        }
+        return out;
+      }, ['./', ...siteFiles().filter((f) => !['sw.js', '404.html', 'robots.txt', '.well-known/security.txt', 'vendor/three/LICENSE'].includes(f))]);
+      check('the service worker takes the sub-path as its scope and caches the whole shell under the policy',
+        scope === site.url && uncached.length === 0, `scope ${scope}, site ${site.url}, not cached: ${uncached.join(' ') || 'none'}`);
+      const cdp = await ctx.newCDPSession(page);
+      const manifest = await cdp.send('Page.getAppManifest');
+      await cdp.detach();
+      check('the site: the manifest loads under manifest-src', manifest.errors.length === 0 && (manifest.data || '').includes('Phonogeometry'),
+        `${manifest.url}: ${manifest.errors.length} errors`);
+
       await page.reload({ waitUntil: 'load' });     // and take control
       await page.waitForTimeout(1500);
       const controlled = await page.evaluate(() => !!navigator.serviceWorker.controller);
-      check('the service worker takes the sub-path as its scope', scope === site.url, `scope ${scope}, site ${site.url}`);
 
       // A deploy changes a file on the host. Loaded online, it has to reach the worker's
       // cache as well as the page: a clone taken after the page had read the body threw
       // here, and the cache kept the old file while the unit test's stub said otherwise.
       const marker = '/* published after the install */';
-      fs.appendFileSync(path.join(fixtures, 'site', 'styles.css'), `\n${marker}\n`);
+      fs.appendFileSync(path.join(siteDir, 'styles.css'), `\n${marker}\n`);
       await page.reload({ waitUntil: 'load' });
       let refreshed = false;
       for (let i = 0; i < 40 && !refreshed; i++) {
@@ -648,20 +800,115 @@ async function main() {
       }
       check('a shell file fetched online is written back into the worker\'s cache', refreshed);
 
+      // The server saw every request, the service worker's own included.
       const outside = site.requests.filter((r) => !r.path.startsWith(SUB_PATH));
       const missing = site.requests.filter((r) => r.status !== 200);
-      check('nothing the app loads leaves its sub-path or is missing there', outside.length === 0 && missing.length === 0,
-        `${site.requests.length} requests, ${outside.length} outside ${SUB_PATH}, ${missing.length} not found: ${[...outside, ...missing].map((r) => r.path).slice(0, 4).join(' ')}`);
+      check('nothing the app loads leaves its sub-path or is missing there', outside.length === 0 && missing.length === 0 && offSite.length === 0,
+        `${site.requests.length} requests, ${outside.length} outside ${SUB_PATH}, ${missing.length} not found, ${offSite.length} to other hosts: ${[...outside, ...missing].map((r) => r.path).concat(offSite).slice(0, 4).join(' ')}`);
+      check('the site: the policy refused nothing, and nothing threw or logged an error', findings.length === 0, findings.slice(0, 3).join(' | '));
+
+      // The policy is in force, not merely sent: under require-trusted-types-for an HTML
+      // string sink throws. The probe is itself a violation, so it runs in a context of its own.
+      {
+        const probe = await browser.newContext();
+        const p = await probe.newPage();
+        await p.goto(site.url, { waitUntil: 'load' });
+        const refused = await p.evaluate(() => { try { document.createElement('div').innerHTML = '<b>probe</b>'; return 'assigned'; } catch (e) { return e.name; } });
+        check('Trusted Types are enforced on the site: an HTML string is refused', refused === 'TypeError', `innerHTML assignment: ${refused}`);
+        await probe.close();
+      }
+
+      // The page every host answers a missing address with: its look is its own <style>,
+      // which the policy allows by its hash, and its link leads back to the app.
+      {
+        const nfFindings = [];
+        const nf = await browser.newContext({ viewport: { width: 420, height: 860 } });
+        await watchPolicy(nf, nfFindings);
+        const p = await nf.newPage();
+        const missing = `${site.url}no-such-page`;
+        const res = await p.goto(missing, { waitUntil: 'load' });
+        const look = await p.evaluate(() => ({ title: document.title, bg: getComputedStyle(document.body).backgroundColor, link: document.querySelector('a.open')?.href }));
+        await p.click('a.open');
+        await p.waitForFunction(() => document.documentElement.classList.contains('started'), null, { timeout: 15000 }).catch(() => {});
+        const back = p.url();
+        // Chromium logs the 404 of the address itself as a console error; that one is the point.
+        const own404 = (f) => f.startsWith('console error: Failed to load resource: the server responded with a status of 404') && f.endsWith(`(${missing})`);
+        const refused = nfFindings.filter((f) => !own404(f));
+        check('a missing address gets the site\'s 404 page, styled under the policy, with a way back',
+          res.status() === 404 && /Page not found/.test(look.title) && look.bg === 'rgb(15, 17, 21)' && look.link === site.url && back === site.url && refused.length === 0,
+          `${res.status()} "${look.title}", background ${look.bg}, link ${look.link}, then ${back}; ${refused.slice(0, 2).join(' | ') || 'nothing refused'}`);
+        await nf.close();
+      }
+
+      // What is not the site is not published: the folder holds the site and nothing else.
+      const statuses = [];
+      for (const f of ['README.md', 'tools/site.js', '_headers', 'deploy/nginx.conf', '.git/config', 'server.js', 'test/website.test.js']) {
+        statuses.push(`${f} ${(await fetch(site.url + f)).status}`);
+      }
+      check('the repository\'s own files are not part of the site', statuses.every((x) => x.endsWith(' 404')), statuses.join(', '));
+
+      // frame-ancestors 'none': another site cannot put the app in a frame and dress it up.
+      {
+        const framer = http.createServer((req, res) => {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(`<!doctype html><title>framer</title><iframe src="${site.url}" width="400" height="600"></iframe>`);
+        });
+        await new Promise((resolve) => framer.listen(0, '127.0.0.1', resolve));
+        const fc = await browser.newContext();
+        const p = await fc.newPage();
+        const refusals = [];
+        // The policy's refusal, not X-Frame-Options' (which old browsers fall back on): it is
+        // frame-ancestors that this proves is in force.
+        p.on('console', (m) => { if (/frame-ancestors 'none'/.test(m.text())) refusals.push(m.text()); });
+        await p.goto(`http://127.0.0.1:${framer.address().port}/`, { waitUntil: 'load' });
+        await p.waitForTimeout(1000);
+        const framed = await (p.frames()[1]?.$('#btn-start-cameras').catch(() => null)) ?? null;
+        check('another site cannot frame the app', framed === null && refusals.length > 0, `${refusals.length} refusal(s) logged, app in frame: ${framed !== null}`);
+        await fc.close();
+        await new Promise((resolve) => framer.close(resolve));
+      }
+
+      // The safety net: no JavaScript, a module that does not load, one that throws while the
+      // app starts, and an app that never runs at all each leave a short note where the
+      // controls were, not dead buttons. A failure the guard sees is shown as it happens, before
+      // the page has finished loading (which a slow image or font can hold back); the load event
+      // is the backstop for one nothing reports.
+      for (const [label, setup, expect, early] of [
+        ['with JavaScript off', { javaScriptEnabled: false }, /has not started/, null],
+        ['when one of its modules does not load', { route: ['**/src/storage.js', { status: 404, contentType: 'text/plain', body: 'gone' }] }, /did not load/, true],
+        ['when it throws while starting', { route: ['**/src/version.js', { status: 200, contentType: 'text/javascript', body: 'throw new Error("broken at start");' }] }, /could not start/, true],
+        ['when the app never runs', { route: ['**/src/app.js', { status: 200, contentType: 'text/javascript', body: '// nothing runs' }] }, /could not start/, false],
+      ]) {
+        const gc = await browser.newContext({ viewport: { width: 420, height: 860 }, javaScriptEnabled: setup.javaScriptEnabled !== false, serviceWorkers: 'block' });
+        if (setup.route) await gc.route(setup.route[0], (route) => route.fulfill(setup.route[1]));
+        if (early !== null) {
+          await gc.addInitScript(() => {
+            document.addEventListener('DOMContentLoaded', () => { window.__failedEarly = document.documentElement.classList.contains('start-failed'); });
+          });
+        }
+        const p = await gc.newPage();
+        await p.goto(site.url, { waitUntil: 'load' });
+        await p.waitForTimeout(300);
+        const failedEarly = early === null ? null : await p.evaluate(() => window.__failedEarly);
+        // Locators, not evaluate: they work in a page whose own scripts are off.
+        const state = {
+          note: (await p.locator('#start-note').isVisible()) ? (await p.locator('#start-note').textContent()).trim() : '',
+          controls: (await p.locator('#screen-capture').isVisible()) || (await p.locator('#capture-bar').isVisible()) || (await p.locator('#btn-settings').isVisible()),
+        };
+        check(`the safety net speaks ${label}`, expect.test(state.note) && !state.controls && failedEarly === early,
+          `note: "${state.note.slice(0, 80)}", controls shown: ${state.controls}${early === null ? '' : `, shown before the load event: ${failedEarly}`}`);
+        await gc.close();
+      }
 
       await site.stop();
       await ctx.setOffline(true);
       const reloaded = await page.reload({ waitUntil: 'load', timeout: 25000 }).then(() => true).catch(() => false);
       await page.waitForTimeout(1500);
       const ui = await page.$('#btn-start-cameras') !== null;
-      const dir = path.join(fixtures, 'object');
       let built = 'not attempted';
       if (reloaded && ui) {
-        await page.setInputFiles('#file-import', fs.readdirSync(dir).sort().map((f) => path.join(dir, f)));
+        await page.click('#btn-clear');
+        await page.setInputFiles('#file-import', fs.readdirSync(objectDir).sort().map((f) => path.join(objectDir, f)));
         await page.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length >= 8, null, { timeout: 30000 });
         await page.selectOption('#quality', 'fast');
         await page.click('#btn-reconstruct');
@@ -669,6 +916,7 @@ async function main() {
       }
       check('the app works with the network cut', controlled && reloaded && ui && built === 'finished',
         `service worker in control: ${controlled}, reload: ${reloaded}, interface: ${ui}, scan: ${built}`);
+      check('offline, the policy refused nothing either', findings.length === 0, findings.slice(0, 3).join(' | '));
       await ctx.close();
     }
   } finally {

@@ -1,0 +1,3 @@
+# Phonogeometry is one page; everything a visitor can use is on it.
+User-agent: *
+Allow: /

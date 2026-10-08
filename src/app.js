@@ -11,6 +11,7 @@ import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
 import { toGLB, toPLY, toOBJ, toPointCloudPLY } from './mesh/exporters.js';
 import { ShotStore } from './storage.js';
+import { scriptURLs } from './trust.js';
 
 const $ = (sel) => document.querySelector(sel);
 /** Build an element with a class and text. Text is set as text, never parsed as markup. */
@@ -45,6 +46,8 @@ const state = {
 const MIN_FRAMES = 3;
 const cams = new CameraManager();
 const store = new ShotStore();
+// The two scripts the app starts go through the site's Trusted Types policy (src/trust.js).
+const scriptURL = scriptURLs(window);
 
 // How far the view must change before the next shot is worth taking. Displacement is not an
 // angle: the same movement shifts features about twice as far for a subject at arm's length
@@ -167,7 +170,7 @@ function updateCounts() {
 // ---------- Cameras ----------
 function renderCameraTiles(results) {
   const grid = $('#camera-grid');
-  grid.innerHTML = '';
+  grid.replaceChildren();
   state.cameraTiles.clear();
   for (const cam of cams.cameras) {
     const tile = document.createElement('div');
@@ -175,8 +178,9 @@ function renderCameraTiles(results) {
     const res = results?.find((r) => r.cam === cam);
     const entry = cams.open.get(cam.deviceId);
     if (entry) {
-      tile.appendChild(entry.video);
-      tile.insertAdjacentHTML('beforeend', '<span class="cam-dot" title="Live"></span>');
+      const dot = el('span', 'cam-dot');
+      dot.title = 'Live';
+      tile.append(entry.video, dot);
     } else {
       // "Cannot stream simultaneously. Will capture sequentially" is a promise, and it is only
       // true of the failure it was written for. A permission revoked between a release and a
@@ -333,8 +337,8 @@ async function applyCaptureResolution() {
 
 function renderLensSettings() {
   const box = $('#lens-settings');
-  if (!cams.cameras.length) { box.innerHTML = '<p class="muted">Enable cameras first.</p>'; return; }
-  box.innerHTML = '';
+  if (!cams.cameras.length) { box.replaceChildren(el('p', 'muted', 'Enable cameras first.')); return; }
+  box.replaceChildren();
   for (const cam of cams.cameras) {
     const row = document.createElement('div');
     row.className = 'lens-row';
@@ -521,7 +525,7 @@ async function importFiles(files) {
 
 function renderShots() {
   const box = $('#thumbs');
-  box.innerHTML = '';
+  box.replaceChildren();
   state.shots.forEach((shot, i) => {
     const row = document.createElement('div');
     row.className = 'shot';
@@ -681,7 +685,7 @@ async function reconstruct() {
     return;
   }
   if (state.worker) state.worker.terminate();
-  const worker = new Worker(new URL('./pipeline/worker.js', import.meta.url), { type: 'module' });
+  const worker = new Worker(scriptURL(new URL('./pipeline/worker.js', import.meta.url).href), { type: 'module' });
   state.worker = worker;
   const t0 = performance.now();
   // The same token that stops the decode loop: a worker from a build that has been cancelled
@@ -878,14 +882,22 @@ function updateStatsLine() {
   const s = state.stats;
   if (!s) return;
   const dims = modelDimensions();
-  const size = dims
-    ? `<span>${state.metresPerUnit ? dims.map(formatLength).join(' × ') : 'scale not set'}</span>`
-    : '';
-  $('#stats').innerHTML = `<span><b>${s.registered}</b>/${s.images} images used</span>`
-    + `<span><b>${s.triangles.toLocaleString()}</b> triangles</span>`
-    + `<span><b>${s.vertices.toLocaleString()}</b> vertices</span>`
-    + `<span><b>${s.sparsePoints}</b> sparse · <b>${(s.densePoints || 0).toLocaleString()}</b> dense points</span>`
-    + `<span><b>${s.seconds.toFixed(0)}s</b></span>` + size;
+  // Each item is text and bold figures, built as elements: nothing on this page is parsed from
+  // a string (the policy's Trusted Types would refuse it).
+  const item = (...parts) => {
+    const span = el('span');
+    for (const part of parts) span.append(typeof part === 'string' ? part : el('b', '', String(part.b)));
+    return span;
+  };
+  const items = [
+    item({ b: s.registered }, `/${s.images} images used`),
+    item({ b: s.triangles.toLocaleString() }, ' triangles'),
+    item({ b: s.vertices.toLocaleString() }, ' vertices'),
+    item({ b: s.sparsePoints }, ' sparse · ', { b: (s.densePoints || 0).toLocaleString() }, ' dense points'),
+    item({ b: `${s.seconds.toFixed(0)}s` }),
+  ];
+  if (dims) items.push(item(state.metresPerUnit ? dims.map(formatLength).join(' × ') : 'scale not set'));
+  $('#stats').replaceChildren(...items);
 }
 
 function updateScaleReadout() {
@@ -1032,8 +1044,12 @@ function init() {
   // A secure context, not specifically https: browsers count http://localhost as secure, which
   // is how the app is developed and tested.
   if ('serviceWorker' in navigator && window.isSecureContext) {
-    navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Offline support unavailable:', err.message));
+    navigator.serviceWorker.register(scriptURL('sw.js')).catch((err) => console.warn('Offline support unavailable:', err.message));
   }
+  // The safety net (src/guard.js) stands down: from here on the app reports its own failures.
+  // no-js comes off here too, in case the guard itself is what did not load.
+  document.documentElement.classList.remove('no-js');
+  document.documentElement.classList.add('started');
 }
 
 init();

@@ -18,6 +18,8 @@ Repository hardening applied here as well: every GitHub Action is pinned to a co
 
 Default branch (2026-09-23): `claude/multi-camera-3d-mesh-qhtjqq`, not `claude/repo-review-security-baiyud`, the branch this work was done on, so neither Dependabot's security updates nor CI's weekly run reach this work until `main` is created from it and made the default (shared items 4 and 10).
 
+**Website pass (2026-10-08)** — `SEC-3` is fixed, as part of making the app a website on the art app's model: one `default-src 'none'` policy, every source measured in Chromium with it sent as a response header at a sub-path, written in `_headers`, `.htaccess` and `deploy/nginx.conf` and carried in the pages' `<meta>` for GitHub Pages; Trusted Types enforced, with every `innerHTML` and `insertAdjacentHTML` in `app.js` replaced by elements and text. The import map is kept and allowed by its hash rather than removed, because removing it means editing the vendored `OrbitControls.js`, which `npm run verify:vendor` holds byte-identical to the registry; Chromium was measured, Safari and Firefox were not (no suite here can run them). README, "Deploy", has the rest.
+
 The rest of this document is the review as written. Fixed items are left in place so the reasoning behind each change stays with it.
 
 ## Summary
