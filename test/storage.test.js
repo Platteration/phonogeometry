@@ -83,7 +83,7 @@ test('a write the database refuses is reported as a failed write', async () => {
 test('the other operations still do nothing quietly without a database', async () => {
   delete globalThis.indexedDB;
   const store = new ShotStore();
-  assert.deepEqual(await store.loadAll(), { shots: [], expired: 0 });
+  assert.deepEqual(await store.loadAll(), { shots: [], expired: 0, unreadable: 0 });
   await store.deleteShot('shot-1');
   await store.clear();
 });
@@ -125,7 +125,7 @@ test('a deletion nobody survived is still counted', async () => {
   useIndexedDb(db);
   const store = new ShotStore();
   await store.saveShot({ ...shot, id: 'gone', createdAt: Date.now() - 40 * 60 * 60 * 1000 });
-  assert.deepEqual(await store.loadAll(), { shots: [], expired: 1 });
+  assert.deepEqual(await store.loadAll(), { shots: [], expired: 1, unreadable: 0 });
 });
 
 test('a record the database refuses to delete is kept where it can still be got rid of', async () => {
@@ -142,4 +142,37 @@ test('a record the database refuses to delete is kept where it can still be got 
   assert.deepEqual(loaded.shots.map((r) => r.id), ['stuck', 'today']);
   assert.equal(loaded.expired, 0, 'nothing was deleted, so nothing may be reported as deleted');
   assert.equal(await store.deleteShot('stuck'), false, 'and a refused delete says so');
+});
+
+// The database is the origin's. On a GitHub Pages project site the origin is shared with every
+// other app the account publishes, so a record this app did not write is possible, and one whose
+// frames were not a list stopped the shot list from drawing on every launch, with every capture
+// after it saved but never shown.
+test('a record that is not a shot the app can show is left out and counted, and stays on the disk', async () => {
+  const db = fakeDb();
+  useIndexedDb(db);
+  const store = new ShotStore();
+  const now = Date.now();
+  db.written.set('good', { ...shot, id: 'good', createdAt: now - 2000 });
+  db.written.set('frames-null', { id: 'frames-null', createdAt: now, frames: null });
+  db.written.set('frames-object', { id: 'frames-object', createdAt: now, frames: { 0: shot.frames[0], length: 1 } });
+  db.written.set('frames-empty', { id: 'frames-empty', createdAt: now, frames: [null, 7, 'x', [shot.frames[0]]] });
+  db.written.set('mixed', { id: 'mixed', createdAt: now - 1000, frames: [null, shot.frames[0], 3] });
+
+  const loaded = await store.loadAll();
+  assert.deepEqual(loaded.shots.map((r) => r.id), ['good', 'mixed']);
+  assert.deepEqual(loaded.shots[1].frames, [shot.frames[0]], 'what is not a frame is dropped from a shot that has one');
+  assert.equal(loaded.unreadable, 3);
+  assert.equal(loaded.expired, 0);
+  // Left out, not deleted: the day rule and Clear apply to it as to any other record.
+  assert.deepEqual(Array.from(db.written.keys()).sort(), ['frames-empty', 'frames-null', 'frames-object', 'good', 'mixed']);
+});
+
+test('an unreadable record past the restore window is deleted with the rest, and counted with them', async () => {
+  const db = fakeDb();
+  useIndexedDb(db);
+  const store = new ShotStore();
+  db.written.set('old-junk', { id: 'old-junk', createdAt: Date.now() - 30 * 60 * 60 * 1000, frames: null });
+  assert.deepEqual(await store.loadAll(), { shots: [], expired: 1, unreadable: 0 });
+  assert.equal(db.written.size, 0);
 });

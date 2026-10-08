@@ -212,6 +212,12 @@ settings that host reads, into an empty folder. Nothing is built.
   a load event with the app not started, `#start-note` shows and the controls are hidden.
   `init()` in `src/app.js` adds `started` (and removes `no-js`) as its last step; after that the
   app reports its own failures.
+- The shots database is the origin's, so on Pages every app the account publishes can write it.
+  `loadAll` restores a record only through `cleanShot` in `src/storage.js` (`frames` a list, each
+  frame an object), leaves out and counts the rest, and the restore toast says how many: one
+  record whose frames were not a list stopped the shot list on every launch, and every capture
+  after it was saved but never shown. A left-out record stays on the disk for the day rule and
+  Clear, like any other.
 - On GitHub Pages only the `<meta>` applies, and only to the page: a worker takes its policy from
   the response that delivered its script, so there the reconstruction worker and the service
   worker run without one. `.well-known/security.txt` expires on 2027-10-08 and the website test

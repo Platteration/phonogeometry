@@ -125,6 +125,25 @@ test('a restore says what came back and what went', async () => {
   assert.match(said, /until they are a day old/);
 });
 
+// One record the app cannot show (a page elsewhere on a shared origin can write this database)
+// used to stop the restore at the shot list: a count of 0, Build off, and every capture after
+// it failing while still saving the shot it took.
+test('a record the app cannot show is left out, said, and the rest of the restore goes on', async () => {
+  const { $, database } = await launchApp({
+    records: [
+      shotRecord('fresh', 2 * hour),
+      { id: 'no-list', createdAt: Date.now() - hour, frames: null },
+      { id: 'no-frames', createdAt: Date.now() - hour, frames: [null, 5] },
+    ],
+  });
+  assert.equal($('#shot-count').textContent, '1');
+  assert.equal($('#frame-count').textContent, '1 frames · at least 3 needed');
+  const said = $('#toast').textContent;
+  assert.match(said, /Restored 1 shot from your previous session/);
+  assert.match(said, /2 saved shots could not be read and were left out/);
+  assert.equal(database.written.size, 3, 'left out of the list, not deleted from the disk');
+});
+
 test('a restore with nothing to say says nothing', async () => {
   const { $ } = await launchApp({ records: [] });
   assert.equal($('#toast').textContent, '');

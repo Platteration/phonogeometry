@@ -32,6 +32,27 @@ function tx(db, mode, fn) {
   });
 }
 
+/**
+ * A stored shot in the shape the app reads, or null when the record cannot be one.
+ *
+ * The database belongs to the origin, not to this app, and on a GitHub Pages project site the
+ * origin is shared with every other app the account publishes: a page there writes this store as
+ * easily as this one does. One record whose `frames` was not a list, or held something that is
+ * not an object, stopped the shot list from drawing on every launch: the count stayed at 0, Build
+ * stayed off, and every capture after it said "Capture failed" (an import failed silently) while
+ * still saving the photograph it had just taken, so the visitor kept shooting into a list they
+ * could not see, with nothing pointing at Clear. The fields inside a frame are not checked here: a photo the browser
+ * cannot decode already costs only that frame at build time (decodeForWorker in app.js), the
+ * label is only ever set as text, and the thumbnail is an <img> source the site's policy limits
+ * to this site and data: URLs.
+ */
+export function cleanShot(record) {
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!isObject(record) || !Array.isArray(record.frames)) return null;
+  const frames = record.frames.filter(isObject);
+  return frames.length ? { id: record.id, createdAt: record.createdAt, frames } : null;
+}
+
 export class ShotStore {
   constructor() { this.dbPromise = openDb().catch(() => null); }
 
@@ -72,9 +93,12 @@ export class ShotStore {
   }
 
   /**
-   * Resolves `{shots, expired}`: the shots worth restoring, oldest first, and how many were
-   * deleted for being older than MAX_AGE_MS. A photograph with no createdAt to judge is
-   * treated as old.
+   * Resolves `{shots, expired, unreadable}`: the shots worth restoring, oldest first, how many
+   * were deleted for being older than MAX_AGE_MS, and how many were left out because they are
+   * not a shot the app can show (cleanShot). A photograph with no createdAt to judge is treated
+   * as old. An unreadable record is left on the disk, not deleted: it goes the way every record
+   * goes, when it is a day old or when the visitor presses Clear, and the caller says it was
+   * left out.
    *
    * Anything past MAX_AGE_MS is deleted here as well as left out: a record that is not offered
    * back to the user but stays on the disk is the worst of both. The count comes back so the
@@ -87,18 +111,19 @@ export class ShotStore {
    */
   async loadAll() {
     const db = await this.dbPromise;
-    if (!db) return { shots: [], expired: 0 };
+    if (!db) return { shots: [], expired: 0, unreadable: 0 };
     try {
       const all = await tx(db, 'readonly', (s) => s.getAll());
       const cutoff = Date.now() - MAX_AGE_MS;
       const shots = [];
       let expired = 0;
+      let unreadable = 0;
       for (const r of all || []) {
-        if (r.createdAt >= cutoff) shots.push(r);
-        else if (await this.deleteShot(r.id)) expired++;
-        else shots.push(r);
+        if (!(r?.createdAt >= cutoff) && await this.deleteShot(r?.id)) { expired++; continue; }
+        const shot = cleanShot(r);
+        if (shot) shots.push(shot); else unreadable++;
       }
-      return { shots: shots.sort((a, b) => a.createdAt - b.createdAt), expired };
-    } catch { return { shots: [], expired: 0 }; }
+      return { shots: shots.sort((a, b) => a.createdAt - b.createdAt), expired, unreadable };
+    } catch { return { shots: [], expired: 0, unreadable: 0 }; }
   }
 }

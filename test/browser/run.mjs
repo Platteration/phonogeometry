@@ -652,6 +652,42 @@ async function main() {
       await page.close();
     }
 
+    // ---- 2f. A record in the shots database that this app did not write ----
+    {
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // The database is the origin's, and on a GitHub Pages project site every other app the
+      // account publishes shares the origin. Another page on it writes one record whose frames are
+      // not a list: that stopped the shot list on every launch, and every capture and import
+      // after it was saved but never shown.
+      await page.goto(`${BASE}404.html`, { waitUntil: 'load' });
+      await page.evaluate(() => new Promise((resolve, reject) => {
+        const req = indexedDB.open('phonogeometry', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('shots', { keyPath: 'id' });
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          const t = req.result.transaction('shots', 'readwrite');
+          t.objectStore('shots').put({ id: 'not-ours', createdAt: Date.now(), frames: null });
+          t.oncomplete = () => { req.result.close(); resolve(); };
+          t.onerror = () => reject(t.error);
+        };
+      }));
+      await page.goto(BASE, { waitUntil: 'load' });
+      const said = await page.waitForFunction(() => {
+        const t = document.querySelector('#toast');
+        return t && !t.hidden && t.textContent ? t.textContent : null;
+      }, null, { timeout: 10000 }).then((h) => h.jsonValue()).catch(() => '');
+      await page.setInputFiles('#file-import', [path.join(fixtures, 'object', 'photo-0.png')]);
+      const listed = await page.waitForFunction(() => document.querySelector('#shot-count').textContent === '1'
+        && document.querySelectorAll('#thumbs .shot').length === 1, null, { timeout: 20000 }).then(() => true).catch(() => false);
+      const count = await page.textContent('#shot-count');
+      check('a record this app did not write is left out, and the app goes on working', /could not be read/.test(said) && listed,
+        `said: "${String(said).replace(/\s+/g, ' ').trim().slice(0, 70)}", shot count after an import: ${count}`);
+      check('no page errors around a record this app did not write', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
     // ---- 3. A scan that cannot work says so, where the user is looking ----
     {
       const page = await newPage({ viewport: { width: 420, height: 860 } });

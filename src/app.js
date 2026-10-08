@@ -573,7 +573,7 @@ function flagSoftFrames() {
  * scan having been lost to a bug, which is the thing the store exists to prevent.
  */
 async function restoreShots() {
-  const { shots, expired } = await store.loadAll();
+  const { shots, expired, unreadable } = await store.loadAll();
   if (shots.length) {
     state.shots = shots.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
     renderShots(); updateCounts();
@@ -581,6 +581,8 @@ async function restoreShots() {
   const said = [];
   if (shots.length) said.push(`Restored ${shots.length} shot${shots.length === 1 ? '' : 's'} from your previous session.`);
   if (expired) said.push(`${expired} shot${expired === 1 ? '' : 's'} from more than a day ago ${expired === 1 ? 'was' : 'were'} deleted.`);
+  // Not a shot this app can show (see cleanShot): said, so a count that looks short is explained.
+  if (unreadable) said.push(`${unreadable} saved shot${unreadable === 1 ? '' : 's'} could not be read and ${unreadable === 1 ? 'was' : 'were'} left out.`);
   if (!said.length) return;
   said.push('Photos stay on this device until you press Clear, or until they are a day old.');
   toast(said.join(' '), 6000);
