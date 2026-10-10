@@ -9,7 +9,7 @@ import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const root = path.dirname(fileURLToPath(import.meta.url));
+const root = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 const useHttps = args.includes('--https');
 const port = parseInt((args.find((a) => a.startsWith('--port=')) || '').split('=')[1] || (useHttps ? '8443' : '8080'), 10);
@@ -21,22 +21,52 @@ const MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
 };
 
-function handler(req, res) {
-  let urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-  if (urlPath.endsWith('/')) urlPath += 'index.html';
-  const file = path.normalize(path.join(root, urlPath));
-  if (!file.startsWith(root) || file.includes(`${path.sep}.git${path.sep}`) || file.includes(`${path.sep}.certs${path.sep}`)) {
-    res.writeHead(403); return res.end('Forbidden');
-  }
-  fs.stat(file, (err, st) => {
-    if (err || !st.isFile()) { res.writeHead(404); return res.end('Not found'); }
-    res.writeHead(200, {
-      'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': 'no-cache',
-      'Cross-Origin-Opener-Policy': 'same-origin',
+function inside(base, candidate) {
+  const relative = path.relative(base, candidate);
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+/** The real path is checked too: a symlink must not expose files outside the app. */
+export function createHandler(base = root) {
+  const publicRoot = fs.realpathSync(base);
+  return (req, res) => {
+    let urlPath;
+    try {
+      urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+      if (urlPath.includes('\0') || urlPath.includes('\\')) throw new Error('invalid path');
+    } catch {
+      res.writeHead(400); return res.end('Bad request');
+    }
+    if (urlPath.endsWith('/')) urlPath += 'index.html';
+    const file = path.resolve(publicRoot, `.${urlPath}`);
+    if (!inside(publicRoot, file) || urlPath.split('/').some((part) => part.startsWith('.'))) {
+      res.writeHead(403); return res.end('Forbidden');
+    }
+    fs.realpath(file, (realError, realFile) => {
+      if (realError) { res.writeHead(404); return res.end('Not found'); }
+      const relative = path.relative(publicRoot, realFile);
+      if (!inside(publicRoot, realFile) || relative.split(path.sep).some((part) => part.startsWith('.'))) {
+        res.writeHead(403); return res.end('Forbidden');
+      }
+      fs.stat(realFile, (err, st) => {
+        if (err || !st.isFile()) { res.writeHead(404); return res.end('Not found'); }
+        const stream = fs.createReadStream(realFile);
+        stream.on('error', () => {
+          if (!res.headersSent) { res.writeHead(404); res.end('Not found'); }
+          else res.destroy();
+        });
+        stream.on('open', () => {
+          res.writeHead(200, {
+            'Content-Type': MIME[path.extname(realFile).toLowerCase()] || 'application/octet-stream',
+            'Cache-Control': 'no-cache',
+            'Cross-Origin-Opener-Policy': 'same-origin',
+          });
+          stream.pipe(res);
+        });
+        res.on('close', () => stream.destroy());
+      });
     });
-    fs.createReadStream(file).pipe(res);
-  });
+  };
 }
 
 function lanAddresses() {
@@ -58,6 +88,8 @@ function ensureCert() {
   return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
 }
 
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+const handler = createHandler();
 const server = useHttps ? https.createServer(ensureCert(), handler) : http.createServer(handler);
 server.listen(port, '0.0.0.0', () => {
   const proto = useHttps ? 'https' : 'http';
@@ -67,3 +99,4 @@ server.listen(port, '0.0.0.0', () => {
   if (!useHttps) console.log('\nNote: phones only allow camera access over HTTPS. Run `npm run start:https` for LAN testing.');
   else console.log('\nThe certificate is self-signed: accept the browser warning once on the phone.');
 });
+}
