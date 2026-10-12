@@ -149,11 +149,12 @@ const DEFAULT_HOSTS = allowedHosts('127.0.0.1');
 
 /**
  * Turn a request URL into the file to serve, or the status to refuse it with.
- * Everything a request can influence is decided here, so it can be tested without a socket.
- * `host` is the request's Host header; `hosts` the names this server answers to, as a Set or
- * as a gate from hostGate (which is the Set plus the re-read and the refusal log).
+ * Everything the address says is decided here, so it can be tested without a socket; what the
+ * filesystem then makes of the path is `servable`'s, below. `host` is the request's Host
+ * header; `hosts` the names this server answers to, as a Set or as a gate from hostGate (which
+ * is the Set plus the re-read and the refusal log); `base` the directory served.
  */
-export function resolveRequest(url, host, hosts = DEFAULT_HOSTS) {
+export function resolveRequest(url, host, hosts = DEFAULT_HOSTS, base = root) {
   // The Host check is the first answer, before the path is even looked at: a rebound page gets
   // nothing, not even a 400 to probe with. Why it is the check that matters is in hostGate.
   if (!(typeof hosts === 'function' ? hosts(host) : hostAllowed(host, hosts))) return { status: 403 };
@@ -170,12 +171,15 @@ export function resolveRequest(url, host, hosts = DEFAULT_HOSTS) {
   // same process-ending shape one step later. Refuse every control character while here, so
   // a raw CR or LF cannot reach a header either.
   if (/[\u0000-\u001f]/.test(urlPath)) return { status: 400 };
+  // A backslash is a separator on Windows and in no name the app serves, so `/%5C.git%5Cconfig`
+  // is refused here rather than left for the filesystem to read as `.git/config`.
+  if (urlPath.includes('\\')) return { status: 400 };
   if (urlPath.endsWith('/')) urlPath += 'index.html';
-  const file = path.normalize(path.join(root, urlPath));
+  const file = path.normalize(path.join(base, urlPath));
   // path.relative, not a startsWith prefix test: `/..%2fphonogeometry-old/.env` keeps its
   // escape through the URL parser, becomes a `..` segment here, and resolves to a sibling
   // directory whose name merely starts with this one's.
-  const rel = path.relative(root, file);
+  const rel = path.relative(base, file);
   if (rel.startsWith('..') || path.isAbsolute(rel)) return { status: 403 };
   // Nothing the app serves is hidden, so refusing every dotted segment keeps .git, .certs,
   // .env and any local scratch out of reach rather than listing them one by one.
@@ -183,18 +187,61 @@ export function resolveRequest(url, host, hosts = DEFAULT_HOSTS) {
   return { status: 200, file };
 }
 
-export function handler(req, res, hosts = DEFAULT_HOSTS) {
+/**
+ * Whether a path the filesystem resolved may be served: inside `realBase` (the served directory
+ * as the filesystem names it), through no dot-named segment. resolveRequest reads the address
+ * as written; what opens is the filesystem's call. A link goes where it points — `escape` ->
+ * a sibling directory, `notes.txt` -> `.env` — and on Windows GIT~1, the 8.3 short name of
+ * .git, opens .git. The resolved path has none of those spellings left in it. `..` starts with
+ * a dot, so a path outside the base is refused by the same rule; on Windows a path on another
+ * drive has no relative form at all and comes back absolute. abientnoiser's `scripts/serve.js`
+ * decides on the resolved path by the same rule. `paths` is the path module, so a test can read
+ * a path the way Windows does.
+ */
+export function servable(real, realBase, paths = path) {
+  const rel = paths.relative(realBase, real);
+  return !paths.isAbsolute(rel) && !rel.split(paths.sep).some((seg) => seg.startsWith('.'));
+}
+
+/** A directory as the filesystem names it. `.native`: on Windows it is the call that answers a
+ *  short name with the long one. */
+const realDir = (dir) => fs.realpathSync.native(dir);
+const REAL_ROOT = realDir(root);
+
+/**
+ * Answer one request for a file under `base`, whose real path is `realBase`. A server that
+ * serves another directory (a test's) gets its listener from createHandler, which resolves the
+ * base once rather than per request.
+ */
+export function handler(req, res, hosts = DEFAULT_HOSTS, base = root, realBase = REAL_ROOT) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { Allow: 'GET, HEAD' });
     return res.end('Method not allowed');
   }
-  const resolved = resolveRequest(req.url, req.headers.host, hosts);
+  const resolved = resolveRequest(req.url, req.headers.host, hosts, base);
   if (resolved.status !== 200) {
     res.writeHead(resolved.status);
     return res.end(resolved.status === 400 ? 'Bad request' : 'Forbidden');
   }
   const file = resolved.file;
-  fs.stat(file, (err, st) => {
+  fs.realpath.native(file, (realError, real) => {
+    if (realError) { res.writeHead(404); return res.end('Not found'); }
+    // Refused like a hidden path in the address: what this guards is the same thing, reached
+    // by another spelling.
+    if (!servable(real, realBase)) { res.writeHead(403); return res.end('Forbidden'); }
+    send(req, res, file, real);
+  });
+}
+
+/** The listener for a server of `base` that answers to `hosts`. */
+export function createHandler(base = root, hosts = DEFAULT_HOSTS) {
+  const realBase = realDir(base);
+  return (req, res) => handler(req, res, hosts, base, realBase);
+}
+
+/** Send `real`, the file the request for `file` resolved to. */
+function send(req, res, file, real) {
+  fs.stat(real, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404); return res.end('Not found'); }
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
@@ -214,7 +261,7 @@ export function handler(req, res, hosts = DEFAULT_HOSTS) {
     // descriptor per abandoned request, never released, from anything that can reach the
     // port; `npm run start:https` binds the LAN. pipeline destroys both ends whichever one
     // fails.
-    pipeline(fs.createReadStream(file), res, () => { /* either end failing costs this one response */ });
+    pipeline(fs.createReadStream(real), res, () => { /* either end failing costs this one response */ });
   });
 }
 
@@ -242,7 +289,7 @@ export function startServer({ port = 0, host = '127.0.0.1', useHttps = false } =
   // The names this server answers to follow from where it is bound. The gate re-reads them on
   // a miss, so an interface that appears after this point is answered as well.
   const hosts = hostGate({ host });
-  const serve = (req, res) => handler(req, res, hosts);
+  const serve = createHandler(root, hosts);
   const server = useHttps ? https.createServer(ensureCert(), serve) : http.createServer(serve);
   // A half-open or malformed connection must not hold the dev server open.
   server.on('clientError', (err, socket) => { try { socket.destroy(); } catch { /* already gone */ } });

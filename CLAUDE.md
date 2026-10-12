@@ -244,6 +244,10 @@ settings that host reads, into an empty folder. Nothing is built.
 - The dev server (`server.js`) serves only non-hidden files inside the project directory and
   binds loopback unless `--https` or an explicit `--host=` asks otherwise. Anything that can
   reach the port can drive it, so its request handling is covered by `test/server.test.js`.
+  The rule is applied twice: to the address as written (`resolveRequest`, which also refuses a
+  backslash), and to the path the filesystem resolves it to (`servable`, through
+  `fs.realpath.native`), so a link inside the checkout cannot reach a sibling directory or a
+  hidden file, and on Windows neither can a short name such as `GIT~1`.
   It also refuses a request whose `Host` is not one of its own names (a page the developer
   visits can point its hostname at 127.0.0.1; the rebound request still says so in `Host`).
   Bound to loopback those names are the loopback ones; bound off it (`--host=`, `--https`)

@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { resolveRequest, startServer, hostName, allowedHosts, hostGate, MAX_LOGGED, MAX_NAME, RESCAN_MS } from '../server.js';
+import { resolveRequest, startServer, createHandler, servable, hostName, allowedHosts, hostGate, MAX_LOGGED, MAX_NAME, RESCAN_MS } from '../server.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -206,6 +206,12 @@ test('a refused name is logged once, with the way to allow it, and no more than 
   assert.equal(allowed('localhost:8443'), true, 'and the server is still serving its own names');
 });
 
+test('a backslash in the path is refused: it is a separator on Windows and in no served name', () => {
+  for (const url of ['/%5C.git%5Cconfig', '/src%5Capp.js', '/%5C..%5C..%5Cetc%5Cpasswd', '/index.html%5C']) {
+    assert.equal(resolveRequest(url).status, 400, url);
+  }
+});
+
 test('hidden files and directories are never served', () => {
   for (const url of ['/.gitignore', '/.env', '/.git/config', '/.certs/key.pem', '/src/../.git/HEAD', '/.config/tokens.json']) {
     assert.equal(resolveRequest(url).status, 403, url);
@@ -397,4 +403,82 @@ test('os.tmpdir is not reachable through an absolute-looking path', () => {
   const outside = path.join(os.tmpdir(), 'phonogeometry-not-served.txt');
   assert.equal(resolveRequest(`/${outside}`).status, 200); // joined under root, so it is simply a 404 there
   assert.equal(resolveRequest(`/..%2f..%2f..${outside}`).status, 403);
+});
+
+// What the address says is resolveRequest's; what the filesystem makes of it is servable's. A
+// link inside the checkout can point anywhere, and only the resolved path says where.
+test('static server rejects malformed paths and paths outside its real root', async (t) => {
+  const parent = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'phonogeometry-server-'));
+  t.after(() => fs.promises.rm(parent, { recursive: true, force: true }));
+  const root = path.join(parent, 'public');
+  const sibling = path.join(parent, 'public-backup');
+  await fs.promises.mkdir(root);
+  await fs.promises.mkdir(sibling);
+  await fs.promises.writeFile(path.join(root, 'index.html'), 'app');
+  await fs.promises.writeFile(path.join(root, '.env'), 'private');
+  await fs.promises.writeFile(path.join(sibling, 'credentials.txt'), 'outside');
+  await fs.promises.symlink(sibling, path.join(root, 'escape'));
+  await fs.promises.symlink(path.join(root, '.env'), path.join(root, 'alias.txt'));
+  const server = http.createServer(createHandler(root));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const port = server.address().port;
+  const get = async (urlPath) => { const { status, body } = await request(port, urlPath); return { status, body }; };
+  assert.equal((await get('/%')).status, 400);
+  assert.equal((await get('/%00')).status, 400);
+  assert.equal((await get('/%2e%2e%2fpublic-backup%2fcredentials.txt')).status, 403);
+  assert.equal((await get('/escape/credentials.txt')).status, 403);
+  assert.equal((await get('/.env')).status, 403);
+  assert.equal((await get('/alias.txt')).status, 403);
+  assert.equal((await get('/missing')).status, 404);
+  assert.deepEqual(await get('/'), { status: 200, body: 'app' });
+});
+
+test('a link that stays inside the root is served, and so is a root reached through a link', { timeout: 15000 }, async (t) => {
+  const parent = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'phonogeometry-server-'));
+  t.after(() => fs.promises.rm(parent, { recursive: true, force: true }));
+  const root = path.join(parent, 'public');
+  await fs.promises.mkdir(path.join(root, 'src'), { recursive: true });
+  await fs.promises.writeFile(path.join(root, 'index.html'), 'app');
+  await fs.promises.writeFile(path.join(root, 'src', 'app.js'), 'code');
+  await fs.promises.symlink(path.join(root, 'src', 'app.js'), path.join(root, 'entry.js'));
+  // The checkout itself reached through a link: the base is compared as the filesystem names
+  // it, or every file under it would resolve "outside" and be refused.
+  const linked = path.join(parent, 'checkout');
+  await fs.promises.symlink(root, linked);
+  for (const base of [root, linked]) {
+    const server = http.createServer(createHandler(base));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    try {
+      const page = await request(port, '/');
+      assert.deepEqual([page.status, page.body], [200, 'app'], base);
+      const entry = await request(port, '/entry.js');
+      assert.deepEqual([entry.status, entry.body], [200, 'code'], `${base}: a link to a served file`);
+      assert.match(entry.headers['content-type'], /text\/javascript/);
+      const head = await request(port, '/entry.js', 'HEAD');
+      assert.deepEqual([head.status, head.headers['content-length'], head.body], [200, '4', '']);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+});
+
+test('servable reads the resolved path: inside the base, through no dotted segment', () => {
+  const base = path.join(os.tmpdir(), 'phonogeometry-base');
+  assert.equal(servable(path.join(base, 'index.html'), base), true);
+  assert.equal(servable(path.join(base, 'src', 'vision', 'sfm.js'), base), true);
+  assert.equal(servable(path.join(base, '.env'), base), false);
+  assert.equal(servable(path.join(base, '.git', 'config'), base), false);
+  assert.equal(servable(path.join(base, 'src', '.cache', 'x.js'), base), false);
+  assert.equal(servable(path.join(`${base}-backup`, 'credentials.txt'), base), false, 'a sibling sharing the prefix');
+  assert.equal(servable(path.join(os.tmpdir(), 'elsewhere.txt'), base), false);
+  // Read the way Windows reads them: a path on another drive has no relative form, and the
+  // backslash is the separator a hidden segment is found by.
+  const win = 'C:\\Users\\dev\\phonogeometry';
+  assert.equal(servable(`${win}\\src\\app.js`, win, path.win32), true);
+  assert.equal(servable('D:\\secrets\\credentials.txt', win, path.win32), false, 'another drive');
+  assert.equal(servable(`${win}\\.git\\config`, win, path.win32), false);
+  assert.equal(servable(`${win}\\src\\.cache\\x.js`, win, path.win32), false, 'a hidden segment past the first');
+  assert.equal(servable('C:\\Users\\dev\\phonogeometry-old\\x.txt', win, path.win32), false);
 });
