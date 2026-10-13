@@ -948,6 +948,8 @@ function init() {
     confirm: (message) => confirm(message),
     note: toast,
     wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // Reaching for it can itself throw (site data blocked); then a reload forgets a payment in flight.
+    session: (() => { try { return window.sessionStorage; } catch { return undefined; } })(),
     els: { section: $('#account'), body: $('#account-body'), thanks: $('#about-thanks'), privacyLocal: $('#about-privacy'), privacy: $('#about-privacy-account') },
   });
   $('#preset').addEventListener('click', (e) => {

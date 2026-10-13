@@ -21,7 +21,10 @@
 // .htaccess give for the virtual host. Through each, everything under /api/ is the API's answer,
 // with the API's own headers and the site's Strict-Transport-Security, and none of the site's
 // other headers; and an Apache with no ProxyPass serves the folder's api/config, which says
-// nothing is on.
+// nothing is on. Then the API is stopped: nginx, as deploy/nginx.conf is shipped, answers as a site
+// with no API (the folder's api/config, the not-found page for the rest, with the site's
+// headers), where it used to answer its own 502 page with HSTS alone; and Apache with the
+// ProxyPass answers 503, as the README says.
 //
 // Needs nginx, Apache as Debian and Ubuntu lay it out (/usr/sbin/apache2, its modules in
 // /usr/lib/apache2/modules), openssl and /etc/mime.types; GitHub's Ubuntu runner has them all.
@@ -193,6 +196,11 @@ const apiData = path.join(work, 'api-data');
 const fakes = await createFakes();
 const api = await startApi({ env: envFor(API_URL), dataDir: apiData, port: 0, fetch: fakes.fetch, log: () => {} });
 const apiPort = new URL(api.url).port;
+let apiRunning = true;
+const stopApi = async () => {
+  if (apiRunning) await api.close();
+  apiRunning = false;
+};
 /** What the API says itself, every response: the site's headers are not its to send. */
 const KIT_HEADERS = {
   'content-security-policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
@@ -297,6 +305,31 @@ async function nginx() {
   await proxies('nginx', origin);
   const redirect = await get(`http://127.0.0.1:${plain}/a/b?x=1`);
   check('nginx: plain http answers a 301 to the same address over https', redirect.status === 301 && redirect.headers.location === 'https://127.0.0.1/a/b?x=1', `${redirect.status} ${redirect.headers.location}`);
+  return origin;
+}
+
+/** The API's addresses a page or a visitor asks for, besides api/config. */
+const API_ROUTES = [['GET', '/api/me'], ['GET', '/api/auth/google/start?return=%2F'], ['GET', '/api/auth/google/callback?code=x&state=y'], ['POST', '/api/checkout'], ['DELETE', '/api/me'], ['POST', '/api/webhooks/stripe'], ['GET', '/api/no/such/route'], ['GET', '/api/']];
+
+/** nginx at `origin`, the API's process not running: deploy/nginx.conf answers as a site with no
+ *  API does. The folder's api/config, saying nothing is on, so the page draws nothing and logs
+ *  nothing; and the site's not-found page at every other address under /api/; all with the
+ *  site's headers. As shipped before, it answered its own 502 page with HSTS alone, and the page
+ *  logged a failed request on every load. */
+async function nginxWithoutApi(origin) {
+  const wrong = [];
+  const config = await get(`${origin}/api/config`);
+  const bad = wrongHeaders(config, '/api/config');
+  if (config.status !== 200 || config.body !== fs.readFileSync(path.join(dir, 'api', 'config'), 'utf8') || !/^application\/json/.test(config.headers['content-type'] || '') || bad.length) {
+    wrong.push(`GET /api/config ${config.status} ${config.headers['content-type']} ${JSON.stringify(config.body.slice(0, 60))}${bad.length ? ` (${bad.join('; ')})` : ''}`);
+  }
+  for (const [method, p] of API_ROUTES) {
+    const r = await send(`${origin}${p}`, { method, headers: method === 'GET' ? {} : { origin: 'https://phonogeometry.example', 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}' });
+    const off = wrongHeaders(r, '/404.html');
+    if (r.status !== 404 || !r.body.includes(NOT_FOUND) || off.length) wrong.push(`${method} ${p} ${r.status}${off.length ? ` (${off.join('; ')})` : ''}`);
+  }
+  check('nginx with the API not running: api/config is the folder\'s, saying nothing is on, and the rest of /api/ the site\'s not-found page, all with the site\'s headers', wrong.length === 0,
+    wrong.length ? wrong.join(' | ') : `api/config and ${API_ROUTES.length} other addresses`);
 }
 
 async function apache() {
@@ -371,16 +404,28 @@ async function apache() {
   // the stock refusal of .htaccess (AH01630) is logged as an error and is not one
   const errors = log().split('\n').filter((l) => /:(error|crit|alert|emerg)\]/.test(l) && !/AH01630: client denied by server configuration: \S+\/\.htaccess$/.test(l));
   check('Apache logged no error while serving', errors.length === 0, errors.join(' | '));
+  return `https://127.0.0.1:${proxied}`;
+}
+
+/** Apache with the README's ProxyPass, the API's process not running: 503 for every address under
+ *  /api/, which is why the README says to add the ProxyPass once the process runs. */
+async function apacheWithoutApi(origin) {
+  const answers = [];
+  for (const p of ['/api/config', '/api/me']) answers.push(`${p} ${(await get(`${origin}${p}`)).status}`);
+  check('Apache with the ProxyPass and the API not running: 503 under /api/, as the README says', answers.every((a) => a.endsWith(' 503')), answers.join(', '));
 }
 
 try {
-  await nginx();
-  await apache();
+  const nginxOrigin = await nginx();
+  const apacheOrigin = await apache();
+  await stopApi();
+  if (nginxOrigin) await nginxWithoutApi(nginxOrigin);
+  if (apacheOrigin) await apacheWithoutApi(apacheOrigin);
 } catch (e) {
   console.error(e);
   check('the host checks ran to the end', false, String(e?.message ?? e));
 } finally {
-  await api.close();
+  await stopApi();
   for (const child of children) child.kill('SIGTERM');
   await Promise.all(children.map((c) => (c.exitCode === null && c.signalCode === null ? new Promise((r) => c.once('exit', r)) : null)));
   fs.rmSync(work, { recursive: true, force: true });

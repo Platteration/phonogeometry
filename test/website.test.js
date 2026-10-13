@@ -360,7 +360,15 @@ test('nginx hands /api/ to the API on loopback, with the server\'s HSTS line and
     'client_max_body_size 1m',
     'proxy_read_timeout 30s',
     `add_header Strict-Transport-Security "${HEADERS['Strict-Transport-Security']}" always`,
-  ], 'the proxy to 127.0.0.1:8788 with no URI, and the server block\'s HSTS line as it is written there');
+    'error_page 502 503 504 = @api-off',
+    'recursive_error_pages on',
+  ], 'the proxy to 127.0.0.1:8788 with no URI, the server block\'s HSTS line as it is written there, and nginx\'s own errors handed to @api-off');
+  // With the API not running, nginx answers as a site with no API (test/hosts.mjs runs it): the
+  // folder's api/config, typed, and the not-found page for the rest. That location adds no header,
+  // so it sends the server block's, all of them.
+  const off = tls.match(/location @api-off \{([^}]*)\}/);
+  assert.ok(off, 'nginx.conf has `location @api-off`, in the https server');
+  assert.deepEqual(off[1].split('\n').map((l) => l.replace(/#.*$/, '').trim()).filter(Boolean), ['default_type application/json;', 'try_files $uri =404;']);
   for (const p of ['/api/config', '/api/me', '/api/auth/google/start', '/api/auth/google/callback', '/api/webhooks/stripe', '/api/no/such/route', '/api/.git/config', '/api/index.html']) {
     assert.equal(nginxAnswers(p), 'proxied', `${p} goes to the API, neither served from the folder nor refused`);
   }

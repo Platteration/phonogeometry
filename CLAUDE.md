@@ -48,7 +48,10 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   TLS-ending proxy: every site file 200 with `_headers`' headers, everything else the not-found
   page with them, plain http a 301. Neither showed in any other suite: `http2 on;` stopped nginx
   1.24 loading the file, and Apache's `env=HTTPS` dropped HSTS behind a proxy. It also runs the
-  API (`server/start.mjs`) behind nginx's `/api/` location and an Apache `ProxyPass`. It skips
+  API (`server/start.mjs`) behind nginx's `/api/` location and an Apache `ProxyPass`, then stops
+  it: nginx must then answer as a site with no API (the folder's `api/config`, the not-found page
+  for the rest, the site's headers), where it used to send its own 502 page with HSTS alone, and
+  Apache with the `ProxyPass` answers 503, as the README says. It skips
   where a server is missing unless `CI` is set (GitHub sets it on every runner).
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
@@ -195,7 +198,12 @@ four controls, each one click from its default. The About block's version is `AP
 cache name, a hash of the shell files, and is not that. The shots are IndexedDB
 (`src/storage.js`), not a preference, and none of this touches them. Nor is the account: the
 page keeps nothing about it (the API's session cookie is HttpOnly, and `api/me` is asked afresh
-on every load), so there is no new key.
+on every load) but one sessionStorage record, `phonogeometry.purchasePending.v1`
+(`SESSION_KEYS` in `src/prefs.js`, pinned beside `KEYS`): `{ at }`, written when Checkout sends
+the tab back with a purchase `api/me` has not reported yet, read by `src/account.js`, which
+offers no Buy within `PENDING_MS` (ten minutes) of it, and removed once the purchase is reported
+or the account signs out or is deleted. It is the tab's own and ends with it; a value that is
+not a number of milliseconds in that window counts as none.
 
 ## Website
 
@@ -299,12 +307,25 @@ of thanks in About. The specification is the kit's README (`server/kit/README.md
   bound to fail would be a console error on every offline load). A 404, a network error, a body
   that is not the kit's shape, or sign-in off (the folder's own `api/config`, which equals the
   kit's answer with nothing set, and is published so that a host with no API answers rather than
-  404s) leaves `#account` and About's account sentence hidden. Where it is on, Settings shows the
-  Account section and the product, About's privacy sentence is swapped for the one that says
-  what an account sends where, and a supporter reads the thank-you. Everything from the server is
-  read field by field and drawn with `createElement` and `textContent`; Buy follows only a
+  404s) leaves `#account` and About's account sentence hidden. So does sign-in on with nothing
+  for sale (Google's variables set, Stripe's not), for a visitor not signed in: signing in would
+  change nothing here; a visitor still signed in from before gets the section, to sign out or
+  delete the account. Where it is on, Settings shows the Account section and the product, About's
+  privacy sentence is swapped for the one that says what an account sends where (the email kept
+  while signed in, the account id Stripe is told with a payment: `test/api.test.js` holds the kit
+  to both), and a supporter reads the thank-you. Everything from the server is read field by
+  field and drawn with `createElement` and `textContent`; Buy follows only a
   `https://checkout.stripe.com/` address; Delete account is confirmed with `window.confirm` (the
   app's confirm), saying the support goes with it.
+- **No second Checkout for a payment on its way.** Stripe's webhook can land after the visitor
+  is back, and Cloudflare KV can take a minute more to reach every location, while the kit's own
+  guard against buying twice (409 for an owned product) reads the record only the webhook writes.
+  So after `?purchase=success`, for a signed-in visitor, the product reads "Payment received —
+  processing" where Buy was until `api/me` reports it: for the life of the page, and across a
+  reload within `PENDING_MS` through the sessionStorage record above. Before, Buy came back after
+  the fifteen-second poll and a second press charged the visitor twice. A `?purchase=success`
+  link opened by someone not signed in says nothing and asks nothing. The canonical fix belongs
+  in the kit (refuse or reuse a Checkout while one is in flight), and is asked for there.
 - **The service worker leaves `api/` alone.** `sw.js` returns before `respondWith` for anything
   under `api/` beside it (`API`, from its own address, so a sub-path deploy works): no cache
   is opened, nothing is written, and the sign-in navigations (the start, Google's redirect back
@@ -317,7 +338,12 @@ of thanks in About. The specification is the kit's README (`server/kit/README.md
   answer and `_redirects` does not apply to it, so the kit sends its own headers. Self-hosted,
   `server/start.mjs` (the kit's Node adapter, 127.0.0.1:8788, records under `KIT_DATA_DIR`)
   sits behind nginx's `location ^~ /api/` or an Apache virtual host's `ProxyPass` (`.htaccess`
-  cannot proxy). GitHub Pages and Netlify run nothing, and the folder's `api/config` answers.
+  cannot proxy). With the process not running, nginx hands its own 502/503/504 (never the API's,
+  since `proxy_intercept_errors` stays off) to `location @api-off`, which serves the folder's
+  `api/config` and the not-found page for the rest with the server block's headers
+  (`recursive_error_pages` lets that second error page follow); Apache answers 503, so the README
+  says to add the `ProxyPass` once the process runs. GitHub Pages and Netlify run nothing, and
+  the folder's `api/config` answers.
   `test/hosts.mjs` runs the API behind the real nginx and Apache.
 - **Tests.** `test/api.test.js` (the catalogue, the Pages entry over a fake KV, `server/start.mjs`
   over a loopback socket, the static `api/config` equal to the kit's answer), `test/account.test.js`

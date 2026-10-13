@@ -256,7 +256,7 @@ curl -sI https://SITE/.git/HEAD | head -1                # 404
 curl -sI https://SITE/README.md | head -1                # 404
 curl -s  https://SITE/src/ | grep -c 'Page not found'    # 1: the not-found page, not a file list
 curl -sI https://SITE/.well-known/security.txt | head -1 # 200
-curl -s  https://SITE/api/config                         # {"auth":{"google":false},...} until the API is set up
+curl -s  https://SITE/api/config                         # {"auth":{"google":false},...} until the API is set up and running
 ```
 
 Then open the site on a phone, enable the cameras, take a few shots, build a mesh and download
@@ -271,21 +271,41 @@ changes nothing in the app (a supporter reads "Thank you for supporting Phonogeo
 About). They live in a small API on the site's own origin under `api/`: the shared kit, copied
 into `server/kit/` (its README is the full setup guide), with this app's catalogue in
 `server/catalogue.js`. The page asks `api/config` once when it starts (not when the browser says
-it is offline); only where that says sign-in is on does Settings show an Account section (Sign in
-with Google; then "Signed in as …", Sign out, Delete account) holding Support this app with its
-price and Buy, and only there does About's privacy sentence change, to say what an account sends
-where. Everywhere else (GitHub Pages, Netlify, any static host, a host whose API is not set up)
-the answer is "nothing on", from the site's own `api/config` file or from the API, and the app
-looks and behaves as it always has.
+it is offline); only where that says sign-in is on and Support this app is for sale does Settings
+show an Account section (Sign in with Google; then "Signed in as …", Sign out, Delete account)
+holding Support this app with its price and Buy, and only there does About's privacy sentence
+change, to say what an account sends where. Where sign-in is on and nothing is for sale (Google's
+variables set, Stripe's not), signing in would change nothing in this app, so it is not offered:
+only a visitor still signed in from before sees the section, to sign out or delete the account.
+Everywhere else (GitHub Pages, Netlify, any static host, a host whose API is not set up, and
+nginx while the API process is not running) the answer is "nothing on", from the site's own
+`api/config` file or from the API, and the app looks and behaves as it always has. On Apache,
+with the virtual host's `ProxyPass` in place and the process not running, `api/` answers 503:
+the page draws nothing then either, but the browser logs the failed request, so add the
+`ProxyPass` once the process runs.
 
 - **What leaves the device**: nothing, unless the visitor signs in or buys. Signing in is a
   visit to Google, which tells the site an account id and (if verified) the email; buying is a
-  visit to Stripe's Checkout, which handles the payment. The site keeps the account id, what
-  was bought and Stripe's customer id, and Delete account removes them (the payment itself
-  stays with Stripe). The photographs, shots and meshes never leave the device either way.
+  visit to Stripe's Checkout, which handles the payment and is told that account id with it
+  (the site sends it with every Checkout, so each payment can be traced to the account that
+  made it). The site keeps the account id, the email while the visitor is signed in (to say
+  "Signed in as …"; signing out removes it), what was bought and Stripe's customer id, and
+  Delete account removes them all; the payment itself stays with Stripe, with the account id it
+  was made under. The photographs, shots and meshes never leave the device either way.
 - **What grants a purchase**: Stripe's signed webhook, and nothing the page says. The thank-you
   line is drawn from `api/me`; a visitor who edits the page can show it to themselves without
   paying, and since it unlocks nothing, there is nothing for that to take.
+- **Between paying and the webhook**: back from Checkout (`?purchase=success`), the page asks
+  `api/me` five times over fifteen seconds. Until it reports the purchase, Support this app reads
+  "Payment received — processing" where Buy was, for as long as that page is open and, through
+  one sessionStorage record (`phonogeometry.purchasePending.v1`, the tab's own), after a reload
+  within ten minutes: the webhook can land after the visitor is back, and on Cloudflare KV a
+  purchase can take up to a minute more to reach every location, so Buy used to be offered again
+  there, and a second press opened a second Checkout that charged twice. Another tab, or a reload
+  after ten minutes with the purchase still not reported, offers Buy again: the API itself does
+  not yet refuse a second Checkout for a payment on its way. Checkout's return address carries
+  nothing to tell a real return from a copied one, so a signed-in visitor sent that link reads
+  "processing" (and nothing is bought); to anyone not signed in it says nothing and asks nothing.
 - **The service worker** answers nothing under `api/` and keeps none of it: the sign-in start and
   Google's redirect back are navigations in its scope, and it leaves them, like every API
   request, to the browser.
@@ -297,14 +317,14 @@ looks and behaves as it always has.
 | Host | The API | Its settings |
 | --- | --- | --- |
 | Cloudflare Pages (the reference) | `functions/api/[[path]].js`, which Pages builds from the repository (build command `node tools/site.js site --host=cloudflare`, output directory `site`); `_routes.json`, which that folder holds, sends it `/api/*` and nothing else | a KV namespace bound as `KIT_STORE`; the variables below, encrypted |
-| nginx | `server/start.mjs` (`KIT_DATA_DIR=/var/lib/phonogeometry-api node server/start.mjs`), on 127.0.0.1:8788, one process per data directory, as its own user | `deploy/nginx.conf`'s `location ^~ /api/` proxies to it; the variables below in the process's environment |
-| Apache | `server/start.mjs`, as for nginx | `.htaccess` cannot proxy (mod_proxy is server configuration): in the virtual host, with mod_proxy and mod_proxy_http, `ProxyPass "/api/" "http://127.0.0.1:8788/api/"` and the `Strict-Transport-Security` line, since a proxied answer never reads `.htaccess` |
+| nginx | `server/start.mjs` (`KIT_DATA_DIR=/var/lib/phonogeometry-api node server/start.mjs`), on 127.0.0.1:8788, one process per data directory, as its own user | `deploy/nginx.conf`'s `location ^~ /api/` proxies to it; the variables below in the process's environment. While the process is not running (nginx's own 502 or 504), the same file answers as a site with no API: the folder's `api/config` and the not-found page for the rest of `/api/`, with the site's headers |
+| Apache | `server/start.mjs`, as for nginx | `.htaccess` cannot proxy (mod_proxy is server configuration): in the virtual host, with mod_proxy and mod_proxy_http, `ProxyPass "/api/" "http://127.0.0.1:8788/api/"` and the `Strict-Transport-Security` line, since a proxied answer never reads `.htaccess`. Add them once the process runs: with them and no process, `/api/` answers 503 |
 | GitHub Pages, Netlify | none: they run no function, and the site's `api/config` says nothing is on | |
 
 `_headers` does not reach a function's answer on Cloudflare Pages, and `_redirects` does not
 apply to a request a function serves, so the API sends its own headers (its own
 `default-src 'none'` policy, `no-store`, `no-referrer`), and nginx's `/api/` location adds only
-the site's `Strict-Transport-Security`. Give the app an origin of its own (see "One origin per
+the site's `Strict-Transport-Security` to what the API sends. Give the app an origin of its own (see "One origin per
 app" above) before turning sign-in on: the session cookie is the origin's, so every page on it
 could act as the signed-in visitor.
 
@@ -361,8 +381,9 @@ checks that a file changed on the host reaches the offline copy, shuts that serv
 a whole scan offline. Then it serves the site again with the API answering its `api/` (Google and
 Stripe faked through the API's `fetch`, their pages answered by routes that send the browser back
 as each would) and goes through the account under the same policy, the service worker in
-control: sign in, buy, Stripe's signed webhook, the thank-you, sign out, sign in again, delete
-the account, a forged callback, then offline; it fails on any violation, console error, page
+control: sign in, buy ("processing" and no Buy until Stripe's signed webhook), the thank-you,
+sign out, sign in again, delete the account, buy again and reload before the webhook (still
+"processing"), a forged callback, then offline; it fails on any violation, console error, page
 error, request off the site but the routed Checkout, or API answer from the worker. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
@@ -375,7 +396,9 @@ redirected; Apache also runs behind a stand-in for a proxy that ends TLS. The AP
 (`server/start.mjs`, with the fakes): through nginx's `/api/` location and through Apache with
 the virtual host's `ProxyPass`, everything under `/api/` is the API's answer with its own headers
 and the site's HSTS alone, and an Apache without the `ProxyPass` serves the folder's
-`api/config`. It skips itself where either server is missing, unless `CI` is set (GitHub sets it
+`api/config`. Then the API is stopped: nginx answers the folder's `api/config` and the not-found
+page for the rest of `/api/`, with the site's headers, and Apache with the `ProxyPass` answers
+503. It skips itself where either server is missing, unless `CI` is set (GitHub sets it
 on every runner).
 CI runs `npm test`, `npm run test:conventions` and `npm run test:e2e` (the browser suite, then
 the host checks), and a separate job

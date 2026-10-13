@@ -207,6 +207,9 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
     const me = async () => (await send('GET', 'api/me')).json();
     return { jar, send, signIn, me };
   };
+  /** The records the file store holds that mention `text`, by key. */
+  const recordsWith = (text) => fs.readdirSync(dataDir).filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(fs.readFileSync(path.join(dataDir, name), 'utf8'))).filter((entry) => JSON.stringify(entry.value).includes(text)).map((entry) => entry.key);
   const webhook = (delivery) => realFetch(new URL('api/webhooks/stripe', api.url), {
     method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': delivery.signature }, body: delivery.body,
   });
@@ -229,6 +232,8 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
     assert.equal((await visitor.send('POST', 'api/checkout', { json: { product: 'supporter' } })).status, 401, 'signed out, nothing is sold');
     await visitor.signIn();
     assert.deepEqual(await visitor.me(), { user: { email: 'ada@example.com' }, entitlements: [] });
+    // What About and the README say the site keeps: the email, in the session record alone.
+    assert.deepEqual(recordsWith('ada@example.com').map((key) => key.replace(/[0-9a-f]{64}$/, '…')), ['phonogeometry:session:…'], 'the email is kept with the sign-in, and nowhere else');
 
     const checkout = await visitor.send('POST', 'api/checkout', { json: { product: 'supporter' } });
     assert.equal(checkout.status, 200);
@@ -240,6 +245,10 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
     assert.equal(asked.get('metadata[app]'), 'phonogeometry');
     assert.equal(asked.get('metadata[product]'), 'supporter');
     assert.equal(asked.get('metadata[user]'), 'google:1001');
+    // ...and what they say Stripe is told: the account id, with the payment.
+    assert.equal(asked.get('client_reference_id'), 'google:1001');
+    assert.equal(asked.get('payment_intent_data[metadata][user]'), 'google:1001');
+    assert.equal([...asked.values()].some((value) => value.includes('ada@example.com')), false, 'and not the email');
     assert.equal(asked.get('success_url'), `${APP_URL}?purchase=success`);
     assert.equal(asked.get('cancel_url'), `${APP_URL}?purchase=cancelled`);
     assert.equal((await visitor.send('POST', 'api/checkout', { json: { product: 'pro' } })).status, 404, 'nothing outside the catalogue is sold');
@@ -256,10 +265,13 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
 
     assert.equal((await visitor.send('POST', 'api/auth/logout')).status, 204);
     assert.deepEqual(await visitor.me(), { user: null, entitlements: [] });
+    assert.deepEqual(recordsWith('ada@example.com'), [], 'kept while signed in: signing out takes it');
     await visitor.signIn();
     assert.deepEqual((await visitor.me()).entitlements, ['supporter'], 'the purchase is the account\'s');
     assert.equal((await visitor.send('DELETE', 'api/me')).status, 204);
     assert.deepEqual(await visitor.me(), { user: null, entitlements: [] });
+    assert.deepEqual(recordsWith('ada@example.com'), [], 'Delete account takes the email with it');
+    assert.deepEqual(recordsWith('google:1001'), [], 'and every record of the account');
     await visitor.signIn();
     assert.deepEqual(await visitor.me(), { user: { email: 'ada@example.com' }, entitlements: [] }, 'deleting the account took the purchase with it');
 

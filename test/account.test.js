@@ -9,9 +9,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FakeElement } from './fakeDom.js';
 import {
-  SUPPORTER, POLL, NOTE_MS, WORDS, NOTES,
+  SUPPORTER, POLL, NOTE_MS, PENDING_MS, WORDS, NOTES,
   readConfig, readMe, formatPrice, landingOf, checkoutAddress, pollFor, apiClient, startAccount,
 } from '../src/account.js';
+import { SESSION_KEYS } from '../src/prefs.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BASE = 'https://example.test/phonogeometry/';
@@ -29,7 +30,7 @@ const button = (els, label) => {
 
 /**
  * A fake api/: `answers` maps "METHOD route" to a status and a body (or a function returning
- * one, or 'network' for a fetch that rejects). Every request is recorded.
+ * one, or a promise of one, or 'network' for a fetch that rejects). Every request is recorded.
  */
 function fakeApi(answers) {
   const requests = [];
@@ -38,7 +39,7 @@ function fakeApi(answers) {
     const route = url.startsWith(`${BASE}api/`) ? url.slice(`${BASE}api/`.length) : `outside ${url}`;
     requests.push({ method, route, init });
     let answer = answers[`${method} ${route}`];
-    if (typeof answer === 'function') answer = answer();
+    if (typeof answer === 'function') answer = await answer();
     if (answer === 'network') throw new TypeError('Failed to fetch');
     if (!answer) return new Response(JSON.stringify({ error: 'not_found' }), { status: 404 });
     const [status, body] = answer;
@@ -47,8 +48,21 @@ function fakeApi(answers) {
   return { fetch, requests };
 }
 
+/** The tab's sessionStorage, on a Map; `refuse` makes every call throw, as a browser that keeps
+ *  no site data does. */
+function fakeSession({ refuse = false } = {}) {
+  const map = new Map();
+  const no = () => { throw new DOMException('The operation is insecure.', 'SecurityError'); };
+  return {
+    map,
+    getItem: (k) => (refuse ? no() : map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => (refuse ? no() : void map.set(k, String(v))),
+    removeItem: (k) => (refuse ? no() : void map.delete(k)),
+  };
+}
+
 /** startAccount on a fake page: the four elements app.js hands it, and a window's parts. */
-function page({ answers, href = BASE, online = true, confirmAnswer = true, withFetch = true } = {}) {
+function page({ answers, href = BASE, online = true, confirmAnswer = true, withFetch = true, session, now, onWait } = {}) {
   const els = { section: new FakeElement('div'), body: new FakeElement('div'), thanks: new FakeElement('p'), privacyLocal: new FakeElement('p'), privacy: new FakeElement('p') };
   els.section.hidden = true;
   els.thanks.hidden = true;
@@ -65,7 +79,9 @@ function page({ answers, href = BASE, online = true, confirmAnswer = true, withF
     online: () => online,
     confirm: (message) => { log.confirms.push(message); return confirmAnswer; },
     note: (message, ms) => log.notes.push([message, ms]),
-    wait: async (ms) => { log.waits.push(ms); },
+    wait: async (ms) => { log.waits.push(ms); onWait?.(); },
+    ...(session ? { session } : {}),
+    ...(now ? { now } : {}),
     els,
   });
   return { ...handle, els, api, log };
@@ -93,6 +109,8 @@ test('api/config: a product that is not this app\'s "Support this app", as the k
   assert.equal(only({ ...SUPPORT, name: 'x'.repeat(101) }), null);
   assert.equal(only({ ...SUPPORT, name: '' }), null);
   assert.equal(only({ ...SUPPORT, description: 7 }), null);
+  assert.equal(only({ ...SUPPORT, description: 'd'.repeat(500) }).description.length, 500, 'a description of 500 characters is drawn');
+  assert.equal(only({ ...SUPPORT, description: 'd'.repeat(501) }), null, 'one of 501 is not');
   for (const price of [{ unit_amount: -1, currency: 'eur' }, { unit_amount: 1.5, currency: 'eur' }, { unit_amount: '400', currency: 'eur' }, { unit_amount: 400, currency: 'EUR' }, { unit_amount: 400, currency: 'eu' }, { unit_amount: 400 }, 'four euros']) {
     assert.equal(only({ ...SUPPORT, price }).price, null, JSON.stringify(price));
   }
@@ -107,6 +125,9 @@ test('api/me: a user, their verified email and the entitlements, or nothing', ()
   assert.deepEqual(readMe({ user: { email: 'ada@example.com' }, entitlements: ['supporter', 'supporter', 'Pro', 'a b', 7, 'x'.repeat(33)] }),
     { user: { email: 'ada@example.com' }, entitlements: ['supporter'] });
   assert.equal(readMe({ user: { email: 'ada@example.com\u0000' }, entitlements: [] }).user.email, null);
+  const at = (n) => `${'a'.repeat(n - '@example.com'.length)}@example.com`;
+  assert.equal(readMe({ user: { email: at(320) }, entitlements: [] }).user.email, at(320), 'an address of 320 characters, the longest there is, is shown');
+  assert.equal(readMe({ user: { email: at(321) }, entitlements: [] }).user.email, null, 'a longer one is not');
   assert.equal(readMe({ user: {}, entitlements: Array.from({ length: 80 }, (_, i) => `e${i}`) }).entitlements.length, 50);
 });
 
@@ -165,6 +186,16 @@ test('the client asks the site\'s own api/, under the site\'s path, and maps eac
   assert.equal(await apiClient({ fetch: fakeApi({ 'POST checkout': [200, { url: 'https://evil.example/' }] }).fetch, base: BASE }).checkout('supporter'), 'failed');
   assert.equal(await apiClient({ fetch: fakeApi({ 'POST checkout': 'network' }).fetch, base: BASE }).checkout('supporter'), 'failed');
   assert.equal(await apiClient({ fetch: fakeApi({ 'POST auth/logout': [403, {}] }).fetch, base: BASE }).signOut(), false);
+});
+
+test('api/me is asked past every cache, and only a 200 is an answer', async () => {
+  const signedIn = { user: { email: 'ada@example.com' }, entitlements: ['supporter'] };
+  const api = fakeApi({ 'GET me': [200, signedIn] });
+  assert.deepEqual(await apiClient({ fetch: api.fetch, base: BASE }).me(), signedIn);
+  assert.deepEqual(api.requests.at(-1).init, { credentials: 'same-origin', cache: 'no-store' }, 'a purchase that just landed is not hidden behind a cached answer');
+  for (const status of [404, 500, 502]) {
+    assert.equal(await apiClient({ fetch: fakeApi({ 'GET me': [status, signedIn] }).fetch, base: BASE }).me(), null, `${status}, whatever its body says`);
+  }
 });
 
 // ---- What the page draws
@@ -234,6 +265,33 @@ test('signed in: who, Sign out, Delete account and Buy, and Buy goes to Stripe\'
   assert.deepEqual(p.api.requests.at(-1).route, 'checkout');
 });
 
+test('sign-in on with nothing for sale: nothing is offered to a visitor who is not signed in, and About keeps its sentence', async () => {
+  for (const config of [{ auth: { google: true } }, { auth: { google: true }, shop: { products: [] } }, { auth: { google: true }, shop: { products: [{ ...SUPPORT, id: 'pro' }] } }]) {
+    const p = page({ answers: { 'GET config': [200, config], 'GET me': [200, { user: null, entitlements: [] }] }, href: `${BASE}?signin=failed&purchase=success` });
+    assert.equal(await p.ready, false, JSON.stringify(config));
+    await settle();
+    assert.equal(p.els.section.hidden, true, 'signing in would change nothing in this app, so no Account section');
+    assert.equal(p.els.privacy.hidden, true, 'About keeps the sentence for a site that sells nothing');
+    assert.equal(p.els.privacyLocal.hidden, false);
+    assert.deepEqual(p.els.body.childNodes, []);
+    assert.deepEqual(p.log.notes, [], 'and says nothing');
+    assert.deepEqual(p.log.replaced, ['/phonogeometry/'], 'the flags still leave the address');
+    assert.deepEqual(p.api.requests.map((r) => `${r.method} ${r.route}`), ['GET config', 'GET me']);
+  }
+});
+
+test('sign-in on with nothing for sale: a visitor still signed in can sign out or delete the account, and nothing else', async () => {
+  const p = page({ answers: { 'GET config': [200, { auth: { google: true }, shop: { products: [] } }], 'GET me': [200, { user: { email: 'ada@example.com' }, entitlements: ['supporter'] }] }, href: `${BASE}?purchase=success` });
+  assert.equal(await p.ready, true);
+  assert.equal(p.els.section.hidden, false);
+  assert.equal(p.els.privacy.hidden, false, 'About says what the account sent where');
+  assert.equal(p.els.thanks.hidden, false, 'a supporter from when the site sold support is still thanked');
+  assert.deepEqual(buttons(p.els.body).map((b) => b.textContent), [WORDS.signOut, WORDS.deleteAccount], 'no product, no Buy');
+  assert.deepEqual(p.log.notes, [], 'nothing on sale, so a ?purchase=success says nothing');
+  assert.deepEqual(p.log.waits, [], 'and asks nothing more');
+  assert.equal(p.api.requests.filter((r) => r.route === 'me').length, 1);
+});
+
 test('a signed-in account Google gave no verified email is "Signed in with Google"', async () => {
   const p = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: {}, entitlements: [] }] } });
   await p.ready;
@@ -262,6 +320,27 @@ test('a Checkout address that is not Stripe\'s is not followed, and each refusal
     assert.deepEqual(p.log.notes, [[note, NOTE_MS]], JSON.stringify(answer));
     assert.equal(buttons(p.els.body).every((b) => !b.disabled), true, 'the controls come back');
   }
+});
+
+test('one action at a time: every control is disabled while one is out, and comes back after', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const p = page({ answers: {
+    'GET config': [200, ON],
+    'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }],
+    'POST checkout': async () => { await held; return [404, {}]; },
+  } });
+  await p.ready;
+  assert.equal(buttons(p.els.body).every((b) => !b.disabled), true);
+  button(p.els, WORDS.buy).dispatch('click');
+  await settle();
+  assert.deepEqual(buttons(p.els.body).map((b) => [b.textContent, b.disabled]), [[WORDS.signOut, true], [WORDS.deleteAccount, true], [WORDS.buy, true]],
+    'a second press of Buy would open a second Checkout');
+  assert.equal(p.api.requests.filter((r) => r.route === 'checkout').length, 1);
+  release();
+  await settle();
+  assert.deepEqual(buttons(p.els.body).map((b) => [b.textContent, b.disabled]), [[WORDS.signOut, false], [WORDS.deleteAccount, false], [WORDS.buy, false]]);
+  assert.deepEqual(p.log.notes, [[NOTES.unavailable, NOTE_MS]]);
 });
 
 test('Buy answered 401 shows the visitor signed out; 409 reads the account again and shows Owned', async () => {
@@ -310,6 +389,34 @@ test('Sign out ends the session and draws the signed-out section; a refusal is s
   assert.match(words(refused.els.body).join('|'), /Signed in as a@b\.c/);
 });
 
+test('after Sign out and Delete account, the keyboard is on the section\'s first control, not lost with the one it was on', async () => {
+  const focused = [];
+  const focus = FakeElement.prototype.focus;
+  FakeElement.prototype.focus = function () { focused.push(this.textContent); };
+  try {
+    const answers = { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }], 'POST auth/logout': [204], 'DELETE me': [204] };
+    const out = page({ answers });
+    await out.ready;
+    await button(out.els, WORDS.signOut).dispatch('click');
+    await settle();
+    assert.deepEqual(focused, [WORDS.signIn], 'signed out: on Sign in with Google');
+    focused.length = 0;
+    const refused = page({ answers: { ...answers, 'POST auth/logout': [403, {}] } });
+    await refused.ready;
+    await button(refused.els, WORDS.signOut).dispatch('click');
+    await settle();
+    assert.deepEqual(focused, [WORDS.signOut], 'refused: back on Sign out');
+    focused.length = 0;
+    const gone = page({ answers });
+    await gone.ready;
+    await button(gone.els, WORDS.deleteAccount).dispatch('click');
+    await settle();
+    assert.deepEqual(focused, [WORDS.signIn], 'deleted: on Sign in with Google');
+  } finally {
+    FakeElement.prototype.focus = focus;
+  }
+});
+
 test('Delete account asks first, says the support goes with it, and deletes only when confirmed', async () => {
   const answers = { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: ['supporter'] }], 'DELETE me': [204] };
   const kept = page({ answers, confirmAnswer: false });
@@ -318,7 +425,7 @@ test('Delete account asks first, says the support goes with it, and deletes only
   await settle();
   assert.deepEqual(kept.log.confirms, [NOTES.confirmDelete]);
   assert.match(NOTES.confirmDelete, /support with it/);
-  assert.match(NOTES.confirmDelete, /The payment itself stays with Stripe/);
+  assert.match(NOTES.confirmDelete, /The payment itself stays with Stripe, with the account id it was made under\./);
   assert.ok(!kept.api.requests.some((r) => r.method === 'DELETE'), 'cancelled: nothing is deleted');
 
   const gone = page({ answers });
@@ -362,11 +469,110 @@ test('back from Checkout: thanked once the webhook has landed, told to reload wh
   assert.equal(late.log.waits.length, POLL.tries);
   assert.equal(late.api.requests.filter((r) => r.route === 'me').length, 1 + POLL.tries);
 
+  const already = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: ['supporter'] }] }, href: `${BASE}?purchase=success` });
+  await already.ready;
+  assert.deepEqual(already.log.notes, [[WORDS.thanks('Support this app'), NOTE_MS]], 'already there on arrival: thanked at once');
+  assert.deepEqual(already.log.waits, [], 'and nothing is asked again');
+  assert.equal(already.api.requests.filter((r) => r.route === 'me').length, 1);
+
   const cancelled = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }] }, href: `${BASE}?purchase=cancelled` });
   await cancelled.ready;
   assert.deepEqual(cancelled.log.replaced, ['/phonogeometry/']);
   assert.deepEqual(cancelled.log.notes, [], 'a cancelled Checkout says nothing');
   assert.equal(cancelled.api.requests.filter((r) => r.route === 'me').length, 1);
+});
+
+test('a ?purchase=success link opened by someone not signed in says nothing and asks nothing', async () => {
+  for (const me of [[200, { user: null, entitlements: [] }], [200, { user: null, entitlements: ['supporter'] }], [500, { user: { email: 'a@b.c' }, entitlements: [] }]]) {
+    const session = fakeSession();
+    const p = page({ answers: { 'GET config': [200, ON], 'GET me': me }, href: `${BASE}?purchase=success`, session });
+    assert.equal(await p.ready, true);
+    assert.deepEqual(p.log.replaced, ['/phonogeometry/'], 'the flag leaves the address');
+    assert.deepEqual(p.log.notes, [], `${JSON.stringify(me)}: no payment was received from this visitor`);
+    assert.deepEqual(p.log.waits, []);
+    assert.equal(p.api.requests.filter((r) => r.route === 'me').length, 1, 'api/me once, as on any load');
+    assert.deepEqual(buttons(p.els.body)[0].textContent, WORDS.signIn, 'signed out');
+    assert.equal(session.map.size, 0, 'and nothing is kept');
+  }
+});
+
+// Between Checkout's return and Stripe's webhook (on Cloudflare KV, up to a minute more before
+// every location reads it), api/me does not report the purchase yet. Buy used to be offered again
+// there, and a second press opened a second Checkout that charged the visitor twice.
+test('back from Checkout before the webhook: "processing" where Buy was, for the life of the page', async () => {
+  let clock = 1_000_000;
+  const session = fakeSession();
+  const during = [];
+  const p = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }] }, href: `${BASE}?purchase=success`, session, now: () => clock,
+    onWait: () => during.push(buttons(p.els.body).map((b) => b.textContent).join(', ')) });
+  await p.ready;
+  assert.deepEqual(during, Array(POLL.tries).fill(`${WORDS.signOut}, ${WORDS.deleteAccount}`), 'no Buy while api/me is asked either');
+  assert.deepEqual(p.log.notes, [[WORDS.paymentPending, NOTE_MS]]);
+  const row = () => words(p.els.body).slice(-1)[0];
+  assert.equal(row(), WORDS.processing);
+  assert.equal(row(), 'Payment received — processing');
+  assert.deepEqual(buttons(p.els.body).map((b) => b.textContent), [WORDS.signOut, WORDS.deleteAccount], 'no Buy');
+  assert.deepEqual(JSON.parse(session.map.get(SESSION_KEYS.purchasePending)), { at: 1_000_000 }, 'and a reload is told so');
+  clock += PENDING_MS * 3;
+  await button(p.els, WORDS.signOut).dispatch('click');   // a refused sign-out redraws the section
+  await settle();
+  assert.equal(row(), WORDS.processing, 'still, long after: this page saw the payment go through');
+});
+
+test('a reload within PENDING_MS keeps "processing"; after it, Buy is back', async () => {
+  const answers = { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }] };
+  // -1: written "later" than now, which a clock set back makes; not a payment this tab saw.
+  for (const [age, shown] of [[0, WORDS.processing], [PENDING_MS - 1, WORDS.processing], [PENDING_MS, WORDS.buy], [-1, WORDS.buy]]) {
+    const session = fakeSession();
+    session.setItem(SESSION_KEYS.purchasePending, JSON.stringify({ at: 5_000_000 }));
+    const p = page({ answers, session, now: () => 5_000_000 + age });
+    await p.ready;
+    assert.equal(words(p.els.body).slice(-1)[0], shown, `${age} ms after`);
+    assert.deepEqual(p.log.notes, [], 'a reload says nothing, and asks api/me once');
+    assert.equal(p.api.requests.filter((r) => r.route === 'me').length, 1);
+    assert.equal(session.map.size, shown === WORDS.processing ? 1 : 0, shown === WORDS.processing ? 'kept for the next reload' : 'a marker out of its time is taken away');
+  }
+  for (const stored of ['{"at":"5000000"}', '{"at":[5000000]}', '{"at":null}', '[5000000]', '5000000', 'not json', '{}']) {
+    const bad = fakeSession();
+    bad.setItem(SESSION_KEYS.purchasePending, stored);
+    const p = page({ answers, session: bad, now: () => 5_000_000 });
+    await p.ready;
+    assert.equal(words(p.els.body).slice(-1)[0], WORDS.buy, `${stored} is not a payment in flight`);
+  }
+  const out = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: null, entitlements: [] }] }, session: (() => { const t = fakeSession(); t.setItem(SESSION_KEYS.purchasePending, '{"at":5000000}'); return t; })(), now: () => 5_000_000 });
+  await out.ready;
+  assert.deepEqual(buttons(out.els.body).map((b) => b.textContent), [WORDS.signIn, WORDS.signInToBuy], 'signed out, it is the sign-in that is offered');
+});
+
+test('the marker goes once the purchase is there, or with the account that paid', async () => {
+  const marked = () => { const t = fakeSession(); t.setItem(SESSION_KEYS.purchasePending, '{"at":5000000}'); return t; };
+  const now = () => 5_000_000;
+  const arrived = marked();
+  const owned = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: ['supporter'] }] }, session: arrived, now });
+  await owned.ready;
+  assert.ok(words(owned.els.body).includes(WORDS.owned));
+  assert.equal(arrived.map.size, 0, 'reported: nothing left to wait for');
+
+  let asks = 0;
+  const landing = fakeSession();
+  const polled = page({ answers: { 'GET config': [200, ON], 'GET me': () => [200, { user: { email: 'a@b.c' }, entitlements: ++asks >= 3 ? ['supporter'] : [] }] }, href: `${BASE}?purchase=success`, session: landing, now });
+  await polled.ready;
+  assert.deepEqual(polled.log.notes, [[WORDS.thanks('Support this app'), NOTE_MS]]);
+  assert.equal(landing.map.size, 0, 'the poll saw it land');
+
+  for (const [label, control, answer] of [['signed out', WORDS.signOut, { 'POST auth/logout': [204] }], ['deleted', WORDS.deleteAccount, { 'DELETE me': [204] }]]) {
+    const session = marked();
+    const p = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }], ...answer }, session, now });
+    await p.ready;
+    assert.equal(words(p.els.body).slice(-1)[0], WORDS.processing);
+    await button(p.els, control).dispatch('click');
+    await settle();
+    assert.equal(session.map.size, 0, `${label}: the next account in this tab is not told of this one's payment`);
+  }
+
+  const refusing = page({ answers: { 'GET config': [200, ON], 'GET me': [200, { user: { email: 'a@b.c' }, entitlements: [] }] }, href: `${BASE}?purchase=success`, session: fakeSession({ refuse: true }), now });
+  assert.equal(await refusing.ready, true, 'a browser that keeps no site data');
+  assert.equal(words(refusing.els.body).slice(-1)[0], WORDS.processing, 'still holds Buy back on this page');
 });
 
 test('the page holds the Account section and About\'s account lines hidden until the API says otherwise', () => {
@@ -378,8 +584,9 @@ test('the page holds the Account section and About\'s account lines hidden until
   }
   const app = fs.readFileSync(path.join(root, 'src', 'app.js'), 'utf8');
   assert.match(app, /els: \{ section: \$\('#account'\), body: \$\('#account-body'\), thanks: \$\('#about-thanks'\), privacyLocal: \$\('#about-privacy'\), privacy: \$\('#about-privacy-account'\) \}/);
+  assert.match(app, /session: \(\(\) => \{ try \{ return window\.sessionStorage; \} catch \{ return undefined; \} \}\)\(\),/, 'the tab\'s sessionStorage, for a payment in flight');
   assert.match(html, /<p id="about-thanks" class="tip" hidden>Thank you for supporting Phonogeometry\.<\/p>/);
   const account = html.match(/<p id="about-privacy-account"[^>]*>([^<]*)<\/p>/)[1];
   assert.match(account, /nothing else leaves it unless you sign in or buy/);
-  assert.match(account, /Google tells this site an account id and your email, Stripe handles the payment, and the site keeps the account id, what was bought and Stripe's customer id/);
+  assert.match(account, /Google tells this site an account id and your email, Stripe handles the payment and is told that account id with it, and the site keeps the account id, your email while you are signed in, what was bought and Stripe's customer id\.$/);
 });

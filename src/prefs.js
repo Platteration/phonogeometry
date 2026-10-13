@@ -1,5 +1,5 @@
-// Everything this app keeps in localStorage, and the shape each record has to hold on its
-// way back in.
+// Everything this app keeps in localStorage and sessionStorage, and the shape each record has
+// to hold on its way back in.
 //
 // The keys are named here and nowhere else, so a rename is one edit and the settings-contract
 // test sees it. Every read site goes through a `cleanX(raw, fallback)` below: localStorage is
@@ -15,6 +15,13 @@
 export const KEYS = Object.freeze({
   lensOverrides: 'phonogeometry.lensOverrides.v1',
   prefs: 'phonogeometry.prefs.v1',
+});
+
+/** What this app keeps in the tab's sessionStorage, gone when the tab closes. `purchasePending`
+ *  is `{ at }`, when Checkout sent this tab back with a payment the API had not reported yet:
+ *  read by src/account.js, which offers no Buy within PENDING_MS of it. */
+export const SESSION_KEYS = Object.freeze({
+  purchasePending: 'phonogeometry.purchasePending.v1',
 });
 
 /** Keys earlier builds wrote. Each is migrated to its `KEYS` entry the first time that is read. */

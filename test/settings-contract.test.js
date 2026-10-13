@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { KEYS, LEGACY_KEYS, DEFAULT_PREFS, CAPTURE_RES } from '../src/prefs.js';
+import { KEYS, SESSION_KEYS, LEGACY_KEYS, DEFAULT_PREFS, CAPTURE_RES } from '../src/prefs.js';
 import { APP_VERSION } from '../src/version.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,6 +19,13 @@ test('the storage keys are exactly these, and the migrated key is not one of the
   assert.deepEqual(LEGACY_KEYS, { lensOverrides: 'phonogeometry.lensOverrides' });
   for (const key of Object.values(KEYS)) assert.match(key, /^phonogeometry\.[a-zA-Z]+\.v\d+$/, key);
   assert.equal(new Set(Object.values(KEYS)).size, Object.values(KEYS).length, 'no two records share a key');
+  // The tab's sessionStorage holds one record: a payment Checkout returned from that the API has
+  // not reported yet (src/account.js), so a reload does not offer Buy again.
+  assert.deepEqual(SESSION_KEYS, { purchasePending: 'phonogeometry.purchasePending.v1' });
+  for (const key of Object.values(SESSION_KEYS)) {
+    assert.match(key, /^phonogeometry\.[a-zA-Z]+\.v\d+$/, key);
+    assert.ok(!Object.values(KEYS).includes(key) && !Object.values(LEGACY_KEYS).includes(key), `${key} is no localStorage record's`);
+  }
 });
 
 test('the preferences record holds the four settings controls and nothing else', () => {

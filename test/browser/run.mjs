@@ -1241,6 +1241,10 @@ async function main() {
       const returned = await backAt;
       const cleaned = await until((u) => location.href === u && !document.querySelector('#account').hidden, appUrl);
       const notYet = (await about()).thanks;
+      // Until the webhook lands, the product says so where Buy was: a second press opened a second
+      // Checkout and charged the visitor twice. The tab keeps that across a reload (sessionStorage).
+      const waiting = await account();
+      const markedWhileWaiting = await page.evaluate(() => sessionStorage.getItem('phonogeometry.purchasePending.v1') !== null);
       // Coming back from Checkout grants nothing: Stripe's signed webhook does, and the page,
       // asking api/me every three seconds, draws it when it arrives.
       const delivery = signedDelivery(fakes.paid(paidAt[0]));
@@ -1248,9 +1252,12 @@ async function main() {
       const thanked = await until(() => document.querySelector('#toast')?.textContent === 'Thank you — Support this app is unlocked.', undefined, 20000);
       const after = await about();
       const owned = await account();
-      check('buy: Stripe\'s Checkout, back at the page with the flag taken out, and thanked once the signed webhook has landed',
-        paidAt.length === 1 && /^https:\/\/checkout\.stripe\.com\/c\/pay\/cs_test_fake\d+$/.test(paidAt[0]) && returned && cleaned && !notYet && hook.status === 200 && thanked && after.thanks && / \| Owned$/.test(owned) && !/\bBuy\b/.test(owned),
-        `checkout ${paidAt.join(' ')}; back at ?purchase=success: ${returned}, flag taken out: ${cleaned}; thanks before the webhook: ${notYet}; webhook ${hook.status}; thanked: ${thanked}; About's thank-you: ${after.thanks}; "…${owned.slice(-30)}"`);
+      const markedAfter = await page.evaluate(() => sessionStorage.getItem('phonogeometry.purchasePending.v1') !== null);
+      check('buy: Stripe\'s Checkout, back at the page with the flag taken out, "processing" and no Buy until the signed webhook has landed, then thanked',
+        paidAt.length === 1 && /^https:\/\/checkout\.stripe\.com\/c\/pay\/cs_test_fake\d+$/.test(paidAt[0]) && returned && cleaned && !notYet
+          && / \| Payment received — processing$/.test(waiting) && !/\bBuy\b/.test(waiting) && markedWhileWaiting
+          && hook.status === 200 && thanked && after.thanks && / \| Owned$/.test(owned) && !/\bBuy\b/.test(owned) && !markedAfter,
+        `checkout ${paidAt.join(' ')}; back at ?purchase=success: ${returned}, flag taken out: ${cleaned}; before the webhook: thanks ${notYet}, "…${waiting.slice(-32)}", marked ${markedWhileWaiting}; webhook ${hook.status}; thanked: ${thanked}; About's thank-you: ${after.thanks}; "…${owned.slice(-30)}", marked ${markedAfter}`);
 
       // Sign out, and the thank-you goes with the account; sign in again, and it is back.
       await press('Sign out');
@@ -1272,6 +1279,25 @@ async function main() {
       check('delete account asks first, and deletes the account with its purchase',
         dialogs.length === 1 && /This deletes your account on this site, and your support with it/.test(dialogs[0]) && deleted && fresh && !freshAbout.thanks && /^Signed in as ada@example\.com \| Sign out \| Delete account \| Support this app · €4\.00 \| [^|]+ \| Buy$/.test(freshText),
         `asked: ${JSON.stringify(dialogs[0]?.slice(0, 60))}, signed out after: ${deleted}, signed in again: ${fresh}, thank-you: ${freshAbout.thanks}`);
+
+      // Buy again on the fresh account, and reload before the webhook: still "processing", no Buy,
+      // so a reload the page itself suggests cannot start a second Checkout. Then the webhook, and
+      // a reload shows the purchase.
+      const backAgain = page.waitForURL(`${appUrl}?purchase=success`, { waitUntil: 'load', timeout: 20000 }).then(() => true).catch(() => false);
+      await press('Buy');
+      const returnedAgain = await backAgain;
+      await until((u) => location.href === u && /processing$/.test(document.querySelector('#account-body')?.textContent || ''), appUrl);
+      await page.reload({ waitUntil: 'load' });
+      const redrawn = await until(() => (document.querySelector('#account-body')?.textContent || '').includes('Signed in as'));
+      const afterReload = await account();
+      const second = signedDelivery(fakes.paid(paidAt[1]));
+      const hookAgain = await fetch(`${appUrl}api/webhooks/stripe`, { method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': second.signature }, body: second.body });
+      await page.reload({ waitUntil: 'load' });
+      const ownedAgain = await until(() => (document.querySelector('#account-body')?.textContent || '').endsWith('Owned'));
+      const markedAtEnd = await page.evaluate(() => sessionStorage.getItem('phonogeometry.purchasePending.v1') !== null);
+      check('a reload between Checkout and the webhook still says "processing" and offers no Buy, and the next one after it shows Owned',
+        returnedAgain && paidAt.length === 2 && redrawn && / \| Payment received — processing$/.test(afterReload) && !/\bBuy\b/.test(afterReload) && hookAgain.status === 200 && ownedAgain && !markedAtEnd,
+        `back: ${returnedAgain}; after a reload: "…${afterReload.slice(-32)}"; webhook ${hookAgain.status}; owned after the next: ${ownedAgain}; marked: ${markedAtEnd}`);
 
       // A callback that is not the end of a sign-in this browser started: back at the page, told so.
       await page.goto(`${appUrl}api/auth/google/callback?code=forged&state=forged`, { waitUntil: 'load' });
