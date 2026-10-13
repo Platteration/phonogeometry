@@ -142,7 +142,7 @@ settings) is ever published. Nothing is built: the copy is the committed files a
 Everything still happens in the visitor's browser. The host only serves files, and the
 photographs, shots and meshes never leave the device.
 
-`.github/workflows/pages.yml` publishes that list to GitHub Pages: a push to `main` runs `npm test` and uploads those files as committed. Three things outside the files have to be in place first. Pages has to be set to deploy from Actions (Settings → Pages → Source: GitHub Actions). A `main` branch has to exist, and this repository does not have one yet. And the `github-pages` environment has to accept deployments from `main`: by default it admits the default branch, so the simplest arrangement is to make `main` the default (otherwise add it to the environment's deployment branches). Running the workflow by hand (Actions → Run workflow) is offered only once `pages.yml` is on the default branch.
+`.github/workflows/pages.yml` publishes that list to GitHub Pages: a push to `main` runs `npm test` and uploads those files as committed. Three things outside the files have to be in place first. Pages has to be set to deploy from Actions (Settings → Pages → Source: GitHub Actions). `main` has to carry this work: the branch exists, but at an older commit than this one (`fed2c5f`, 23 September 2026), and its one deploy so far built and uploaded the site and was then refused by GitHub because Pages is not enabled for the repository (`Failed to create deployment (status: 404)`). And the `github-pages` environment has to accept deployments from `main`: by default it admits the default branch, so the simplest arrangement is to make `main` the default (otherwise add it to the environment's deployment branches). Running the workflow by hand (Actions → Run workflow) is offered only once `pages.yml` is on the default branch.
 
 The app runs from the project's sub-path (`<user>.github.io/<repository>/`), installs, and works offline there. Online the service worker asks the network first, so a visit gets what the host is serving. An installed copy takes a deploy offline as a whole: the service worker's cache name (`VERSION` in `sw.js`) is a hash of the files it caches, so a deploy that changes any of them is a new worker, which downloads them all again and drops the old copy; `npm test` fails, printing the value to use, until `VERSION` matches the files.
 
@@ -165,6 +165,11 @@ the Apache and nginx settings serve the site's own files and answer 404 for ever
 `_redirects` does the same for the repository's files on Netlify; Cloudflare Pages has no 404
 rule, so there the folder is the only protection.
 
+The nginx settings ask for HTTP/2 on the `listen` lines (`listen 443 ssl http2;`), the form
+nginx 1.24, the version Ubuntu 24.04 ships, loads; the `http2 on;` directive is unknown before
+1.25.1 and stops the whole file loading there. From 1.25.1 nginx loads the `listen` form with a
+warning that it is deprecated.
+
 Apache reads `.htaccess` only where `AllowOverride All` lets it (Ubuntu's default for `/var/www`
 is `None`, under which the file is ignored without a word), and it needs mod_rewrite and
 mod_headers, which a stock Debian or Ubuntu Apache does not load: `a2enmod rewrite headers`.
@@ -172,9 +177,14 @@ Nothing in the file is optional, so a server without either module answers every
 500 and says why in its error log, rather than serving the site without its rules.
 
 **Response headers.** The same set is in `_headers`, `.htaccess` and `deploy/nginx.conf`, and
-`test/website.test.js` fails when one of them says something the others do not. Every source in
-the policy was measured in Chromium with the policy sent as a response header, at a sub-path,
-starting from `default-src 'none'`; the browser suite drives the whole app under it.
+`test/website.test.js` fails when one of them says something the others do not; `test/hosts.mjs`
+checks that nginx and Apache send them on every response, the not-found page included. Apache
+sends every one unconditionally, `Strict-Transport-Security` too, so that behind a proxy that
+ends TLS (whose `X-Forwarded-Proto: https` the redirect lets through) the site still carries it;
+a browser ignores that header on a plain `http://` response, and the only one Apache sends
+there is the redirect. Every source in the policy was measured in Chromium with the policy sent
+as a response header, at a sub-path, starting from `default-src 'none'`; the browser suite
+drives the whole app under it.
 
 | Header | Value | Why |
 | --- | --- | --- |
@@ -225,9 +235,12 @@ off, with a file that did not load, with a module that threw before the app star
 another site's frame, the visitor reads a short note saying so where the controls would have
 been, rather than a page of buttons that do nothing.
 
-**Security contact.** `.well-known/security.txt` points to this repository's private
-vulnerability report form and to `SECURITY.md`. Its `Expires` date (8 October 2027) is renewed
-every year; `npm test` fails once it has passed.
+**Security contact.** `.well-known/security.txt` lists two ways in, in order: this repository's
+private vulnerability report form, and its issues page for when that form is off (it is until
+the owner switches it on, under Private vulnerability reporting in the repository's security
+settings), where `SECURITY.md` asks for a private channel without the details. Its policy link
+is `SECURITY.md` as it is on `main`, the branch the Pages deploy publishes. Its `Expires` date
+(8 October 2027) is renewed every year; `npm test` fails once it has passed.
 
 **Launch checklist**, with `SITE` the https address:
 
@@ -250,7 +263,7 @@ or `Trusted Type` lines.
 npm test                  # unit tests and whole reconstructions on synthetic scenes (Node >= 22)
 npm run test:conventions  # the repository's shape against CONVENTIONS.md
 npm run check             # the gate before a push: both of the above
-npm run test:e2e          # the whole app in a real browser (needs Playwright; skips if absent)
+npm run test:e2e          # the whole app in a real browser, then the site in real nginx and Apache (each skips if absent)
 npm run test:all          # npm test, then the browser suite
 npm start                 # plain HTTP on localhost:8080 for desktop development (imports only)
 npm run icons             # regenerate the PWA icons
@@ -275,7 +288,15 @@ checks that a file changed on the host reaches the offline copy, shuts that serv
 a whole scan offline. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
-CI runs `npm test`, `npm run test:conventions` and the browser suite, and a separate job
+Last, `test/hosts.mjs` runs the hosting settings in the real servers: it loads
+`deploy/nginx.conf` into the nginx installed on the machine and the site's `.htaccess` into
+Apache, each serving the copied site with a checkout's files planted beside it, and checks that
+every file of the site answers 200, typed, with every header `_headers` gives it, that everything
+else gets the site's not-found page with the same headers, and that plain `http://` is
+redirected; Apache also runs behind a stand-in for a proxy that ends TLS. It skips itself where
+either server is missing, unless `CI` is set (GitHub sets it on every runner).
+CI runs `npm test`, `npm run test:conventions` and `npm run test:e2e` (the browser suite, then
+the host checks), and a separate job
 compares the vendored three.js with the package on the npm registry
 (`npm run verify:vendor`), which needs the network.
 

@@ -1,5 +1,8 @@
-# Phonogeometry. Report a vulnerability privately, as SECURITY.md asks: a public issue is the wrong place.
+# Phonogeometry. Report a vulnerability privately, as SECURITY.md asks: its details do not belong in a public issue.
+# The first contact is the repository's private report form. Where the repository does not offer it, the second is its
+# issues: open one asking for a private channel, and leave the details out of it.
 Contact: https://github.com/Platteration/phonogeometry/security/advisories/new
+Contact: https://github.com/Platteration/phonogeometry/issues
 Expires: 2027-10-08T00:00:00.000Z
 Preferred-Languages: en
-Policy: https://github.com/Platteration/phonogeometry/blob/HEAD/SECURITY.md
+Policy: https://github.com/Platteration/phonogeometry/blob/main/SECURITY.md

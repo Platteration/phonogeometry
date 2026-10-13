@@ -39,10 +39,12 @@ jobs:
 
       # The app has no dependencies and no lockfile, so Playwright is pinned here and
       # installed after the unit suite has run on the bare checkout, without touching
-      # package.json. --ignore-scripts because the only install script in that tree is
-      # skipped today by a field the package itself controls (fsevents' `os: ["darwin"]`),
-      # which is not a decision to delegate.
-      - run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.56.1
+      # package.json. --ignore-scripts so that no install script runs: 1.64.0's tree has none
+      # (playwright and playwright-core, no optional dependency), and one a later pin brings in
+      # is not a decision to delegate. 1.61.0 is the first release with a Chromium build for
+      # Ubuntu 26.04, which ubuntu-latest becomes from 2026-10-19: on an older one the install
+      # below fails there (test/ci.test.js holds the pin to it).
+      - run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.64.0
 
       - run: npx playwright install --with-deps chromium
 

@@ -38,14 +38,20 @@ function netlifyHeaders() {
   return rules;
 }
 
-/** Every `Header always set` in .htaccess, as { Header: value }. */
+/** Every `Header always set` in .htaccess, as { Header: value }. Each is unconditional: a
+ *  condition after the value (`env=HTTPS`, `expr=…`) sends the header on some responses only,
+ *  and `env=HTTPS` is set by mod_ssl alone, so behind a proxy that ends TLS the header it
+ *  carried, HSTS, went out on none. */
 function apacheHeaders() {
+  const conf = read('.htaccess');
   const out = {};
-  for (const m of read('.htaccess').matchAll(/^\s*Header\s+always\s+set\s+([A-Za-z-]+)\s+"([^"]*)"(?:\s+env=HTTPS)?\s*$/gm)) {
+  for (const m of conf.matchAll(/^\s*Header\s+always\s+set\s+([A-Za-z-]+)\s+"([^"]*)"\s*$/gm)) {
     assert.ok(!Object.hasOwn(out, m[1]), `.htaccess: ${m[1]} is set once`);
     out[m[1]] = m[2];
   }
-  assert.doesNotMatch(read('.htaccess'), /^\s*Header\s+(?!always\s+set\s)/m, '.htaccess sets every header with `Header always set`');
+  assert.doesNotMatch(conf, /^\s*Header\s+(?!always\s+set\s)/m, '.htaccess sets every header with `Header always set`');
+  const lines = conf.split('\n').filter((l) => /^\s*Header\b/.test(l));
+  assert.deepEqual(lines.filter((l) => !/^\s*Header\s+always\s+set\s+[A-Za-z-]+\s+"[^"]*"\s*$/.test(l)), [], '.htaccess: every header is set on every response, with nothing after its value');
   return out;
 }
 
@@ -333,16 +339,80 @@ test('Apache: the settings never make a module optional, and the README says whi
   assert.match(readme, /`a2enmod rewrite headers`/, 'README names the modules a stock Apache lacks');
 });
 
+/** deploy/nginx.conf's top-level server blocks, each as its text between the braces. */
+function nginxServers() {
+  const conf = read('deploy/nginx.conf').replace(/#[^\n]*/g, '');
+  const out = [];
+  for (const m of conf.matchAll(/^server\s*\{/gm)) {
+    let depth = 0;
+    for (let i = m.index + m[0].length - 1; i < conf.length; i++) {
+      if (conf[i] === '{') depth++;
+      else if (conf[i] === '}' && --depth === 0) { out.push(conf.slice(m.index + m[0].length, i)); break; }
+    }
+  }
+  return out;
+}
+/** A block's own directives, its nested blocks left out, one per entry and spaced singly. */
+const ownDirectives = (block) => {
+  let flat = block;
+  while (/\{[^{}]*\}/.test(flat)) flat = flat.replace(/[^;{}]*\{[^{}]*\}/g, ';');
+  return flat.split(';').map((d) => d.trim().replace(/\s+/g, ' ')).filter(Boolean);
+};
+
+// The README says the Apache and nginx settings redirect plain http and answer a missing
+// address with 404.html. The browser suite serves the site through its own stand-in for a
+// Netlify-style host, so neither shows there: these hold the lines that do it, and
+// test/hosts.mjs (in `npm run test:e2e`) runs both files in a real nginx and a real Apache.
+test('Apache and nginx send plain http to https and a missing address to the site\'s not-found page', () => {
+  const htaccess = read('.htaccess').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  const engine = htaccess.indexOf('RewriteEngine On');
+  const allowlist = htaccess.findIndex((l) => l.startsWith('RewriteRule !^('));
+  assert.ok(engine !== -1 && allowlist > engine, '.htaccess turns the rewrite engine on before its allowlist');
+  assert.deepEqual(htaccess.slice(engine + 1, allowlist), [
+    'RewriteCond %{HTTPS} !=on',
+    'RewriteCond %{HTTP:X-Forwarded-Proto} !=https',
+    'RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]',
+  ], '.htaccess redirects a request that came over plain http, and only that, to https, ahead of every other rule');
+  assert.deepEqual(htaccess.filter((l) => l.startsWith('ErrorDocument')).sort(), ['ErrorDocument 403 /404.html', 'ErrorDocument 404 /404.html'], '.htaccess answers a missing address and a refused one with the not-found page');
+
+  const servers = nginxServers();
+  assert.equal(servers.length, 2, 'nginx.conf has two servers: plain http, and https');
+  const [plain, tls] = servers.map(ownDirectives);
+  assert.deepEqual(plain, ['listen 80', 'listen [::]:80', 'server_name example.com', 'server_tokens off', 'return 301 https://$host$request_uri'], 'the plain http server only redirects, every address, to the same one over https');
+  assert.ok(!/\blocation\b/.test(servers[0]), 'the plain http server has no location of its own');
+  assert.ok(tls.includes('error_page 403 404 =404 /404.html'), 'the https server answers a missing address, a folder and a refused file with the not-found page');
+});
+
+// `http2 on;` is a directive from nginx 1.25.1. Before that (Ubuntu 24.04 ships 1.24, Debian 12
+// 1.22) it is unknown, and nginx refuses to load the whole file: measured with 1.24.0, `nginx
+// -t` fails with `unknown directive "http2"`. Asked for on the listen lines, as here, HTTP/2 is
+// on in every nginx since 1.9.5; from 1.25.1 that form is deprecated with a warning, not refused.
+test('nginx asks for HTTP/2 on the https listen lines, the form the nginx current distributions ship loads', () => {
+  const [, tls] = nginxServers().map(ownDirectives);
+  assert.deepEqual(tls.filter((d) => d.startsWith('listen ')), ['listen 443 ssl http2', 'listen [::]:443 ssl http2']);
+  assert.deepEqual(tls.filter((d) => /^http2\b/.test(d)), [], 'no `http2` directive, which nginx before 1.25.1 does not know');
+});
+
 test('security.txt names a contact, the policy and an expiry no more than a year away', () => {
   const fields = {};
   for (const line of read('.well-known/security.txt').split('\n')) {
     const m = line.match(/^([A-Za-z-]+): (.+)$/);
     if (m) (fields[m[1]] = fields[m[1]] || []).push(m[2]);
   }
-  // SECURITY.md asks for a private report, so the contact is the repository's private form.
-  assert.deepEqual(fields.Contact, ['https://github.com/Platteration/phonogeometry/security/advisories/new']);
-  assert.match(read('SECURITY.md'), /Report a vulnerability/);
-  assert.deepEqual(fields.Policy, ['https://github.com/Platteration/phonogeometry/blob/HEAD/SECURITY.md']);
+  // SECURITY.md asks for a private report, so the first contact is the repository's private
+  // form. That form is off until the owner switches it on (measured: the repository's
+  // private-vulnerability-reporting setting answers enabled: false), and with it off it is no
+  // way in at all, so the second is the issues page, where SECURITY.md asks for a private
+  // channel without the details.
+  assert.deepEqual(fields.Contact, ['https://github.com/Platteration/phonogeometry/security/advisories/new', 'https://github.com/Platteration/phonogeometry/issues']);
+  const policy = read('SECURITY.md').replace(/\s+/g, ' ');
+  assert.match(policy, /Report a vulnerability/);
+  assert.match(policy, /If that button is not there .*open an issue that says you have a security report and asks for a private channel, and leave the details out of it\./, 'SECURITY.md says what to do while the private form is off');
+  // The policy as it is on the branch the Pages deploy publishes, the one the published
+  // security.txt comes from; HEAD is the default branch, which may not carry SECURITY.md at all.
+  const [deployed] = read('.github/workflows/pages.yml').match(/^ {4}branches: \[(\w[\w./-]*)\]$/m)?.slice(1) ?? [];
+  assert.ok(deployed, 'pages.yml deploys from one branch');
+  assert.deepEqual(fields.Policy, [`https://github.com/Platteration/phonogeometry/blob/${deployed}/SECURITY.md`]);
   assert.deepEqual(fields['Preferred-Languages'], ['en']);
   assert.equal(fields.Expires.length, 1);
   const expires = Date.parse(fields.Expires[0]);

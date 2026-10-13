@@ -35,15 +35,25 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   own server and renders its own photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
   `REQUIRE_BROWSER=1` turns that skip into a failure, which is how CI runs it (the workflow
   installs a pinned Playwright with `npm install --no-save`, so the repository keeps no
-  dependencies).
+  dependencies; `test/ci.test.js` holds that pin at 1.61.0 or later, the first release with a
+  Chromium build for Ubuntu 26.04, which `ubuntu-latest` becomes from 2026-10-19 and on which
+  1.56.1's install stopped). After the browser suite, `test/hosts.mjs` runs `deploy/nginx.conf`
+  in the nginx installed here and the site's `.htaccess` in Apache, each serving the copied
+  site with a checkout's files planted in it, Apache over TLS and behind a stand-in for a
+  TLS-ending proxy: every site file 200 with `_headers`' headers, everything else the not-found
+  page with them, plain http a 301. Neither showed in any other suite: `http2 on;` stopped nginx
+  1.24 loading the file, and Apache's `env=HTTPS` dropped HSTS behind a proxy. It skips where a
+  server is missing unless `CI` is set (GitHub sets it on every runner).
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
   a secure context: a self-signed certificate blocks service worker registration outright, so
   the HTTPS dev server cannot exercise it. Headless Chromium via Playwright works with fake camera devices
   (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`).
-- `.github/workflows/pages.yml` publishes to GitHub Pages on a push to `main` (which does not
-  exist yet, and has to be a branch the `github-pages` environment accepts: by default the
-  default branch) or by hand (offered only once the file is on the default branch):
+- `.github/workflows/pages.yml` publishes to GitHub Pages on a push to `main` (which exists,
+  at `fed2c5f`, older than this work, and has to be a branch the `github-pages` environment
+  accepts: by default the default branch; its one deploy, on 2026-09-23, built the site and was
+  refused because Pages is not enabled for the repository) or by hand (offered only once the
+  file is on the default branch):
   `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
   stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence, plus
   `404.html`, `robots.txt` and `.well-known/security.txt`), no build step.
@@ -193,7 +203,13 @@ settings that host reads, into an empty folder. Nothing is built.
   `<IfModule>`: a stock Debian or Ubuntu Apache loads neither mod_rewrite nor mod_headers, and
   wrapped, the rules were skipped without a word, so a checkout served by mistake published
   `.git/` and `.certs/key.pem` with no headers (measured on Ubuntu's 2.4.58). Unwrapped, a
-  missing module is a 500 and a line in the error log; the website test holds it so.
+  missing module is a 500 and a line in the error log; the website test holds it so. Every
+  `Header` in `.htaccess` is unconditional, HSTS included: `env=HTTPS` is mod_ssl's alone, so
+  behind a TLS-ending proxy (whose `X-Forwarded-Proto: https` the redirect lets through) it
+  dropped HSTS. nginx asks for HTTP/2 with `listen 443 ssl http2;`, never `http2 on;`, which
+  nginx before 1.25.1 (Ubuntu 24.04 ships 1.24) does not know and refuses the whole file over.
+  The website test holds those lines, the https redirects and the not-found pages; `test/hosts.mjs`
+  runs both files in the real servers.
 - **Every source was measured** in Chromium with the policy sent as a header at a sub-path:
   `img-src data:` is the shot thumbnails (JPEG `data:` URLs); `connect-src 'self'` is the
   service worker (with `'none'` it registers and caches nothing, silently); `manifest-src
@@ -204,8 +220,9 @@ settings that host reads, into an empty folder. Nothing is built.
   reports it unrecognised; unlisted, it stays the browser's default (this origin).
 - **Hashes**: `script-src` carries the sha256 of the import map in `index.html` and `style-src`
   that of `404.html`'s `<style>`; the test recomputes both and prints the new value. Editing the
-  import map or that style means pasting the new hash into all five places (and the import map
-  is a shell file, so `VERSION` too).
+  import map or that style means pasting the new hash into all five places, and since
+  `index.html` carries both hashes in its `<meta>` and is a shell file, either edit changes
+  `VERSION` too.
 - **Trusted Types are enforced** (`require-trusted-types-for 'script'; trusted-types
   phonogeometry`). `new Worker()` and `serviceWorker.register()` take a TrustedScriptURL, so both
   go through `scriptURLs()` in `src/trust.js`, whose one policy vouches for exactly
@@ -220,7 +237,10 @@ settings that host reads, into an empty folder. Nothing is built.
   frame's storage is partitioned by the top-level site, so in a frame on a page of the same site
   (on a custom domain, any other subdomain of it) in every browser, and on any page in a browser
   that does not partition, the app held the visitor's shots and a steered click on a shot's x
-  deleted one.
+  deleted one. The browser suite stages that same-site case: its framer is `localhost` at
+  another port, as the site is (`127.0.0.1` would be another site, whose frame a partitioning
+  browser keeps away from the shots), and it reads the visitor's shot out of the database from
+  inside the frame before it counts the app showing none.
 - The shots database is the origin's, so on Pages every app the account publishes can write it.
   `loadAll` restores a record only through `cleanShot` in `src/storage.js` (`frames` a list, each
   frame an object), leaves out and counts the rest, and the restore toast says how many: one
@@ -234,7 +254,9 @@ settings that host reads, into an empty folder. Nothing is built.
 - On GitHub Pages only the `<meta>` applies, and only to the page: a worker takes its policy from
   the response that delivered its script, so there the reconstruction worker and the service
   worker run without one. `.well-known/security.txt` expires on 2027-10-08 and the website test
-  fails once it has: renew it, a year ahead at most.
+  fails once it has: renew it, a year ahead at most. Its contacts are the private report form,
+  then the issues page, since the form is off until the owner switches it on, and its policy
+  link is `SECURITY.md` on `main`, the branch the deploy publishes (the default branch has none).
 
 ## Code conventions
 

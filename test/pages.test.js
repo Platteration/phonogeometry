@@ -197,3 +197,23 @@ test('the deploy uploads the directory it assembled', () => {
   assert.ok(m, 'pages.yml uploads with actions/upload-pages-artifact, pinned to a commit, and names the path');
   assert.equal(m[1], dir);
 });
+
+// The assembled folder holds a dotfile, .well-known/security.txt, and what reaches the site is
+// what the upload action packs. actions/upload-pages-artifact v3, at the commit pinned here,
+// leaves out only .git and .github; v4 adds `--exclude=".[^/]*"`, and v5 does the same unless
+// `include-hidden-files: true` is given, so a bump of the pin alone (which Dependabot proposes,
+// and which passes every line of the shape above) would publish the site without its security
+// contact, with nothing failing. Read off the action's own action.yml at each tag.
+const UPLOAD_PAGES_ARTIFACT_V3 = '56afc609e74202658d3ffba0e8f6dda462b719fa';
+
+test('the upload packs the assembled folder\'s dotfiles, so security.txt is published', () => {
+  const { paths } = assembly();
+  assert.ok(paths.some((p) => p.split('/').some((part) => part.startsWith('.'))), 'the assembly carries a dotfile (.well-known/security.txt), which is why this matters');
+  const m = workflow.match(/^(\s+)- uses: actions\/upload-pages-artifact@([0-9a-f]{40})[^\n]*\n((?:\1 {2}[^\n]*\n)*)/m);
+  assert.ok(m, 'pages.yml uploads with actions/upload-pages-artifact, pinned to a commit');
+  const [, , sha, rest] = m;
+  if (sha !== UPLOAD_PAGES_ARTIFACT_V3) {
+    assert.match(rest, /^\s+include-hidden-files: true$/m,
+      `actions/upload-pages-artifact@${sha} is not v3 (${UPLOAD_PAGES_ARTIFACT_V3}): from v4 it leaves out every dotfile, .well-known/security.txt included, unless the step sets include-hidden-files: true (and the shape above lists that line)`);
+  }
+});

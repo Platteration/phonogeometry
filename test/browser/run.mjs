@@ -959,11 +959,14 @@ async function main() {
       }
 
       // GitHub Pages sends no headers, so nothing refuses the frame there. A frame's storage is
-      // partitioned by the top-level site, and the framer here is on the site's own host at
-      // another port, which is the same site — as any other subdomain of a custom domain is — so
-      // in every browser the frame opens the visitor's own database (Playwright's Chromium turns
-      // partitioning off as well, which is any site's case in a browser that does not partition).
-      // The visitor has a shot; the framing page steers a click onto its x in the frame.
+      // partitioned by the top-level site, and the framer here is on the site's own host name at
+      // another port (localhost, as the site is: 127.0.0.1 would be another site), which is the
+      // same site, as any other subdomain of a custom domain is. So the frame opens the visitor's
+      // own database in every browser, partitioning or not, and the check reads it from inside
+      // the frame rather than taking that on trust: Playwright's Chromium turns partitioning
+      // off, and there a framer on another site would stage the same thing, which a browser that
+      // partitions would not. The visitor has a shot; the framing page steers a click onto its x
+      // in the frame.
       {
         const pagesSite = await serveSite(siteDir, { headers: false });
         const framer = http.createServer((req, res) => {
@@ -971,29 +974,47 @@ async function main() {
           res.end(`<!doctype html><title>framer</title><iframe src="${pagesSite.url}?from=framer" width="400" height="700"></iframe>`);
         });
         await new Promise((resolve) => framer.listen(0, '127.0.0.1', resolve));
+        const framerUrl = `http://${new URL(pagesSite.url).hostname}:${framer.address().port}/`;
         const fc = await browser.newContext({ viewport: { width: 420, height: 860 }, serviceWorkers: 'block' });
         const own = await fc.newPage();
         await own.goto(pagesSite.url, { waitUntil: 'load' });
         await own.setInputFiles('#file-import', [path.join(objectDir, 'photo-0.png')]);
         await own.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length === 1, null, { timeout: 20000 }).catch(() => {});
         const p = await fc.newPage();
-        await p.goto(`http://127.0.0.1:${framer.address().port}/`, { waitUntil: 'load' });
+        await p.goto(framerUrl, { waitUntil: 'load' });
         await p.waitForTimeout(800);
         const frame = p.frames().find((f) => f.url().startsWith(pagesSite.url));
-        const inFrame = frame ? await frame.evaluate(() => ({
+        const inFrame = frame ? await frame.evaluate(async () => ({
           note: getComputedStyle(document.querySelector('#start-note')).display !== 'none' ? document.querySelector('#start-note').textContent : '',
           started: document.documentElement.classList.contains('started'),
           shots: document.querySelectorAll('#thumbs .shot').length,
+          // What the frame could have shown: the shots in the database it opens, read without
+          // creating one (a frame that sees none was staged on another site, not this one).
+          stored: (await indexedDB.databases()).some((d) => d.name === 'phonogeometry')
+            ? await new Promise((resolve) => {
+              const req = indexedDB.open('phonogeometry');
+              req.onerror = () => resolve(-1);
+              req.onsuccess = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('shots')) { db.close(); resolve(0); return; }
+                const count = db.transaction('shots').objectStore('shots').count();
+                count.onsuccess = () => { db.close(); resolve(count.result); };
+                count.onerror = () => { db.close(); resolve(-1); };
+              };
+            })
+            : 0,
         })) : null;
         const x = frame ? await frame.$('.shot-delete') : null;
-        if (x) await x.click({ force: true });
+        // If the app did run in the frame, the steered click is tried, and the check below fails
+        // on the x being there and on what it took, rather than the suite stopping on the click.
+        if (x) await x.click({ force: true, timeout: 5000 }).catch(() => {});
         await own.reload({ waitUntil: 'load' });
         await own.waitForTimeout(800);
         const kept = await own.$$eval('#thumbs .shot', (els) => els.length);
         check('on a host that sends no headers, the app does not run in another site\'s frame',
           !!inFrame && /does not run inside another site's page/.test(inFrame.note) && inFrame.note.endsWith(new URL(pagesSite.url).pathname)
-            && !inFrame.started && inFrame.shots === 0 && !x && kept === 1,
-          `in the frame: ${inFrame ? `note "${inFrame.note.slice(0, 60)}…${inFrame.note.slice(-16)}", started ${inFrame.started}, ${inFrame.shots} shots shown` : 'no frame'}; the visitor's shots afterwards: ${kept}`);
+            && !inFrame.started && inFrame.stored === 1 && inFrame.shots === 0 && !x && kept === 1,
+          `framed from ${framerUrl}; in the frame: ${inFrame ? `note "${inFrame.note.slice(0, 60)}…${inFrame.note.slice(-16)}", started ${inFrame.started}, ${inFrame.stored} shot(s) in its database, ${inFrame.shots} shown` : 'no frame'}; the visitor's shots afterwards: ${kept}`);
         await fc.close();
         await new Promise((resolve) => framer.close(resolve));
         await pagesSite.stop();

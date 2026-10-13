@@ -44,6 +44,10 @@ Header always set Referrer-Policy "no-referrer"
 Header always set Permissions-Policy "accelerometer=(), autoplay=(), browsing-topics=(), camera=(self), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), gamepad=(), geolocation=(), gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), otp-credentials=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(self), serial=(), storage-access=(), usb=(), window-management=(), xr-spatial-tracking=()"
 Header always set Cross-Origin-Opener-Policy "same-origin"
 Header always set Cross-Origin-Resource-Policy "same-origin"
-Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTPS
+# On every response, as every other header is. Not `env=HTTPS`: mod_ssl alone sets that, so
+# behind a proxy that ends TLS (the X-Forwarded-Proto the redirect lets through) the site went out
+# without it. A browser ignores this header on a plain http response, which is only ever the
+# redirect above.
+Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
 # no file name carries a version: revalidate every load (an unchanged file is a 304)
 Header always set Cache-Control "no-cache"
