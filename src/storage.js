@@ -41,16 +41,33 @@ function tx(db, mode, fn) {
  * not an object, stopped the shot list from drawing on every launch: the count stayed at 0, Build
  * stayed off, and every capture after it said "Capture failed" (an import failed silently) while
  * still saving the photograph it had just taken, so the visitor kept shooting into a list they
- * could not see, with nothing pointing at Clear. The fields inside a frame are not checked here: a photo the browser
- * cannot decode already costs only that frame at build time (decodeForWorker in app.js), the
- * label is only ever set as text, and the thumbnail is an <img> source the site's policy limits
- * to this site and data: URLs.
+ * could not see, with nothing pointing at Clear. A photo the browser cannot decode already costs
+ * only that frame at build time (decodeForWorker in app.js), so the rest of a frame is not
+ * checked here, but the two fields the shot list turns into text are: the label and the
+ * thumbnail, an <img> source the site's policy limits to this site and data: URLs. Setting text
+ * from an object whose `toString` is not a function throws (`{toString: 0}` survives the
+ * database's structured clone), and one such label stopped the shot list on every launch exactly
+ * as a missing list did. Either one that is not a string is shown as nothing.
  */
 export function cleanShot(record) {
   const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   if (!isObject(record) || !Array.isArray(record.frames)) return null;
-  const frames = record.frames.filter(isObject);
-  return frames.length ? { id: record.id, createdAt: record.createdAt, frames } : null;
+  const frames = record.frames.filter(isObject).map((f) => {
+    const frame = { ...f };
+    for (const name of ['label', 'thumbUrl']) if (Object.hasOwn(frame, name) && typeof frame[name] !== 'string') frame[name] = '';
+    return frame;
+  });
+  return frames.length ? { id: record.id, createdAt: dateOf(record), frames } : null;
+}
+
+/**
+ * When a record was written, or NaN when it does not say. Only a number is a date: saveShot
+ * always writes one, and anything else made the restore throw before it had restored anything —
+ * an object compared with the cutoff, a BigInt sorted beside a number — which lost every shot
+ * from the list, with nothing said, on every launch.
+ */
+function dateOf(record) {
+  return typeof record?.createdAt === 'number' ? record.createdAt : NaN;
 }
 
 export class ShotStore {
@@ -95,10 +112,10 @@ export class ShotStore {
   /**
    * Resolves `{shots, expired, unreadable}`: the shots worth restoring, oldest first, how many
    * were deleted for being older than MAX_AGE_MS, and how many were left out because they are
-   * not a shot the app can show (cleanShot). A photograph with no createdAt to judge is treated
-   * as old. An unreadable record is left on the disk, not deleted: it goes the way every record
-   * goes, when it is a day old or when the visitor presses Clear, and the caller says it was
-   * left out.
+   * not a shot the app can show (cleanShot). A photograph with no createdAt to judge (none, or
+   * one that is not a number: dateOf) is treated as old. An unreadable record is left on the
+   * disk, not deleted: it goes the way every record goes, when it is a day old or when the
+   * visitor presses Clear, and the caller says it was left out.
    *
    * Anything past MAX_AGE_MS is deleted here as well as left out: a record that is not offered
    * back to the user but stays on the disk is the worst of both. The count comes back so the
@@ -119,7 +136,7 @@ export class ShotStore {
       let expired = 0;
       let unreadable = 0;
       for (const r of all || []) {
-        if (!(r?.createdAt >= cutoff) && await this.deleteShot(r?.id)) { expired++; continue; }
+        if (!(dateOf(r) >= cutoff) && await this.deleteShot(r?.id)) { expired++; continue; }
         const shot = cleanShot(r);
         if (shot) shots.push(shot); else unreadable++;
       }

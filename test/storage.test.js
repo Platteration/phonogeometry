@@ -176,3 +176,60 @@ test('an unreadable record past the restore window is deleted with the rest, and
   assert.deepEqual(await store.loadAll(), { shots: [], expired: 1, unreadable: 0 });
   assert.equal(db.written.size, 0);
 });
+
+// saveShot always stamps a number. A date that is anything else made the comparison with the
+// cutoff throw (an object whose toString is not a function survives the database's structured
+// clone) or the sort throw (a BigInt beside a number), and the restore then came back empty:
+// every shot gone from the list, with nothing said, on every launch.
+test('a record whose date is not a number is undated, and the rest of the restore goes on', async () => {
+  const db = fakeDb();
+  useIndexedDb(db);
+  const store = new ShotStore();
+  const now = Date.now();
+  db.written.set('mine', { ...shot, id: 'mine', createdAt: now - 1000 });
+  db.written.set('date-object', { ...shot, id: 'date-object', createdAt: { toString: 0 } });
+  db.written.set('date-bigint', { ...shot, id: 'date-bigint', createdAt: 10n ** 20n });
+  db.written.set('date-string', { ...shot, id: 'date-string', createdAt: String(now) });
+
+  const loaded = await store.loadAll();
+  assert.deepEqual(loaded.shots.map((r) => r.id), ['mine']);
+  // Treated as a record with no date to judge, which is to say as old: deleted and counted.
+  assert.equal(loaded.expired, 3);
+  assert.deepEqual(Array.from(db.written.keys()), ['mine']);
+});
+
+test('a record kept because its delete was refused still sorts, whatever its date', async () => {
+  const db = fakeDb({ deleteFails: true });
+  useIndexedDb(db);
+  const store = new ShotStore();
+  db.written.set('today', { ...shot, id: 'today', createdAt: Date.now() - 1000 });
+  db.written.set('stuck', { ...shot, id: 'stuck', createdAt: 10n ** 20n });
+  const loaded = await store.loadAll();
+  assert.deepEqual(loaded.shots.map((r) => r.id).sort(), ['stuck', 'today']);
+  assert.equal(typeof loaded.shots.find((r) => r.id === 'stuck').createdAt, 'number');
+});
+
+// The shot list sets each frame's label and thumbnail as text. Text from an object whose
+// toString is not a function throws, and one such frame stopped the list on every launch.
+test('a frame whose label or thumbnail is not text keeps its place without them', async () => {
+  const db = fakeDb();
+  useIndexedDb(db);
+  const store = new ShotStore();
+  const hostile = { toString: 0 };
+  db.written.set('odd', {
+    id: 'odd', createdAt: Date.now(),
+    frames: [{ ...shot.frames[0], label: hostile, thumbUrl: hostile }, { ...shot.frames[0], label: 7, thumbUrl: ['data:,'] }],
+  });
+  const [restored] = (await store.loadAll()).shots;
+  assert.equal(restored.frames.length, 2, 'the frames stay: the photograph is what matters');
+  for (const f of restored.frames) {
+    assert.equal(f.label, '');
+    assert.equal(f.thumbUrl, '');
+    assert.equal(f.width, 2, 'the rest of the frame is as it was stored');
+  }
+  // What the shot list does with them, which threw before.
+  for (const f of restored.frames) assert.equal(`${f.label}${f.thumbUrl}`, '');
+  // A frame written by this app is untouched.
+  db.written.set('odd', { id: 'odd', createdAt: Date.now(), frames: [{ ...shot.frames[0], label: 'photo-1' }] });
+  assert.deepEqual((await store.loadAll()).shots[0].frames, [{ ...shot.frames[0], label: 'photo-1' }]);
+});

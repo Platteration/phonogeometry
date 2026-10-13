@@ -86,7 +86,7 @@ function headersFor(rules, sitePath) {
  * validators, so the no-cache _headers sends makes the browser fetch each one afresh: what the
  * host serves is what the worker is shown.
  */
-async function serveSite(dir) {
+async function serveSite(dir, { headers = true } = {}) {
   const requests = [];
   const rules = headerRules();
   let movedTo = null;
@@ -109,7 +109,8 @@ async function serveSite(dir) {
     const shown = file || path.join(dir, '404.html');
     res.writeHead(file ? 200 : 404, {
       'Content-Type': TYPES[path.extname(shown)] ?? 'application/octet-stream',
-      ...headersFor(rules, `/${file ? rel : '404.html'}`),
+      // Without them, as GitHub Pages serves it: the pages' <meta> is all there is.
+      ...(headers ? headersFor(rules, `/${file ? rel : '404.html'}`) : {}),
     });
     res.end(fs.readFileSync(shown));
   });
@@ -688,6 +689,51 @@ async function main() {
       await page.close();
     }
 
+    // ---- 2g. A field in a record that is not what this app writes ----
+    {
+      const page = await newPage({ viewport: { width: 420, height: 860 } });
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message));
+      // The visitor's own work: two photos.
+      await page.goto(BASE, { waitUntil: 'load' });
+      await page.setInputFiles('#file-import', [0, 1].map((i) => path.join(fixtures, 'object', `photo-${i}.png`)));
+      await page.waitForFunction(() => document.querySelector('#shot-count').textContent === '2', null, { timeout: 20000 });
+      await page.waitForTimeout(300);   // written: a save takes milliseconds
+      // Another page on the origin writes two records. One is dated with an object the comparison
+      // with the cutoff cannot read, which emptied the whole restore with nothing said; the other
+      // has a frame whose label and thumbnail cannot be set as text, which stopped the shot list
+      // on every launch. Neither value is exotic to the database: `{toString: 0}` survives its
+      // structured clone as it is.
+      await page.goto(`${BASE}404.html`, { waitUntil: 'load' });
+      await page.evaluate(() => new Promise((resolve, reject) => {
+        const req = indexedDB.open('phonogeometry', 1);
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          const t = req.result.transaction('shots', 'readwrite');
+          const odd = { toString: 0 };
+          t.objectStore('shots').put({ id: 'not-ours-date', createdAt: odd, frames: [{ label: 'x', thumbUrl: '' }] });
+          t.objectStore('shots').put({ id: 'not-ours-label', createdAt: Date.now(), frames: [{ label: odd, thumbUrl: odd }] });
+          t.oncomplete = () => { req.result.close(); resolve(); };
+          t.onerror = () => reject(t.error);
+        };
+      }));
+      await page.goto(BASE, { waitUntil: 'load' });
+      const said = await page.waitForFunction(() => {
+        const t = document.querySelector('#toast');
+        return t && !t.hidden && t.textContent ? t.textContent : null;
+      }, null, { timeout: 10000 }).then((h) => h.jsonValue()).catch(() => '');
+      const restored = await page.textContent('#shot-count');
+      const labels = await page.$$eval('#thumbs .thumb-label', (els) => els.map((e) => e.textContent));
+      await page.setInputFiles('#file-import', [path.join(fixtures, 'object', 'photo-2.png')]);
+      const listed = await page.waitForFunction(() => document.querySelector('#shot-count').textContent === '4'
+        && document.querySelectorAll('#thumbs .shot').length === 4, null, { timeout: 20000 }).then(() => true).catch(() => false);
+      check('a stored date or label this app did not write costs no other shot',
+        restored === '3' && [...labels].sort().join('|') === '|photo-0|photo-1' && /Restored 3 shots/.test(said) && /1 shot from more than a day ago was deleted/.test(said) && listed,
+        `restored ${restored} (${labels.map((l) => l || '—').join(', ')}), said: "${String(said).replace(/\s+/g, ' ').trim().slice(0, 90)}", the next import listed: ${listed}`);
+      check('no page errors around a stored field this app did not write', errors.length === 0, errors.slice(0, 2).join(' | '));
+      await page.close();
+    }
+
     // ---- 3. A scan that cannot work says so, where the user is looking ----
     {
       const page = await newPage({ viewport: { width: 420, height: 860 } });
@@ -910,6 +956,47 @@ async function main() {
         check('another site cannot frame the app', framed === null && refusals.length > 0, `${refusals.length} refusal(s) logged, app in frame: ${framed !== null}`);
         await fc.close();
         await new Promise((resolve) => framer.close(resolve));
+      }
+
+      // GitHub Pages sends no headers, so nothing refuses the frame there. A frame's storage is
+      // partitioned by the top-level site, and the framer here is on the site's own host at
+      // another port, which is the same site — as any other subdomain of a custom domain is — so
+      // in every browser the frame opens the visitor's own database (Playwright's Chromium turns
+      // partitioning off as well, which is any site's case in a browser that does not partition).
+      // The visitor has a shot; the framing page steers a click onto its x in the frame.
+      {
+        const pagesSite = await serveSite(siteDir, { headers: false });
+        const framer = http.createServer((req, res) => {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(`<!doctype html><title>framer</title><iframe src="${pagesSite.url}?from=framer" width="400" height="700"></iframe>`);
+        });
+        await new Promise((resolve) => framer.listen(0, '127.0.0.1', resolve));
+        const fc = await browser.newContext({ viewport: { width: 420, height: 860 }, serviceWorkers: 'block' });
+        const own = await fc.newPage();
+        await own.goto(pagesSite.url, { waitUntil: 'load' });
+        await own.setInputFiles('#file-import', [path.join(objectDir, 'photo-0.png')]);
+        await own.waitForFunction(() => document.querySelectorAll('#thumbs .shot').length === 1, null, { timeout: 20000 }).catch(() => {});
+        const p = await fc.newPage();
+        await p.goto(`http://127.0.0.1:${framer.address().port}/`, { waitUntil: 'load' });
+        await p.waitForTimeout(800);
+        const frame = p.frames().find((f) => f.url().startsWith(pagesSite.url));
+        const inFrame = frame ? await frame.evaluate(() => ({
+          note: getComputedStyle(document.querySelector('#start-note')).display !== 'none' ? document.querySelector('#start-note').textContent : '',
+          started: document.documentElement.classList.contains('started'),
+          shots: document.querySelectorAll('#thumbs .shot').length,
+        })) : null;
+        const x = frame ? await frame.$('.shot-delete') : null;
+        if (x) await x.click({ force: true });
+        await own.reload({ waitUntil: 'load' });
+        await own.waitForTimeout(800);
+        const kept = await own.$$eval('#thumbs .shot', (els) => els.length);
+        check('on a host that sends no headers, the app does not run in another site\'s frame',
+          !!inFrame && /does not run inside another site's page/.test(inFrame.note) && inFrame.note.endsWith(new URL(pagesSite.url).pathname)
+            && !inFrame.started && inFrame.shots === 0 && !x && kept === 1,
+          `in the frame: ${inFrame ? `note "${inFrame.note.slice(0, 60)}…${inFrame.note.slice(-16)}", started ${inFrame.started}, ${inFrame.shots} shots shown` : 'no frame'}; the visitor's shots afterwards: ${kept}`);
+        await fc.close();
+        await new Promise((resolve) => framer.close(resolve));
+        await pagesSite.stop();
       }
 
       // The safety net: no JavaScript, a module that does not load, one that throws while the

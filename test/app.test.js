@@ -75,8 +75,10 @@ function installFakePhone(lenses) {
 
 let instance = 0;
 /** Start the app against a fresh document, database and phone. */
-async function launchApp({ lenses = {}, records = [], stored = {} } = {}) {
+async function launchApp({ lenses = {}, records = [], stored = {}, framed = false } = {}) {
   const dom = installFakeDom({ stored });
+  // Inside another page's frame `top` is that page's window, not this one.
+  if (framed) Object.assign(dom.window, { self: dom.window, top: { another: 'page' } });
   const database = installFakeIndexedDb(records);
   const phone = installFakePhone(lenses);
   const createElement = dom.document.createElement.bind(dom.document);
@@ -142,6 +144,41 @@ test('a record the app cannot show is left out, said, and the rest of the restor
   assert.match(said, /Restored 1 shot from your previous session/);
   assert.match(said, /2 saved shots could not be read and were left out/);
   assert.equal(database.written.size, 3, 'left out of the list, not deleted from the disk');
+});
+
+// GitHub Pages cannot send frame-ancestors, so there any site can frame the page; in a browser
+// that does not partition a frame's storage the frame opens the visitor's own shots, and a
+// click steered onto a shot's x deletes it. The app does not start in a frame at all.
+test('inside another page\'s frame the app restores nothing and wires nothing', async () => {
+  const { $, document } = await launchApp({ framed: true, records: [shotRecord('fresh', hour)] });
+  assert.equal($('#shot-count').textContent, '', 'no shots restored into the frame');
+  assert.equal($('#thumbs').childNodes.length, 0, 'no shot, so no x to steer a click onto');
+  assert.equal(document.documentElement.classList.contains('started'), false, 'and the safety net is left to say why');
+
+  // The same launch outside a frame restores the shot, so the check above is the frame's doing.
+  const top = await launchApp({ records: [shotRecord('fresh', hour)] });
+  assert.equal(top.$('#shot-count').textContent, '1');
+});
+
+// The same, by a field rather than the list: one frame whose label cannot be set as text (an
+// object whose toString is not a function survives the database's structured clone) threw out
+// of the shot list on every launch, and one record whose date is not a number threw out of the
+// restore itself, which then restored nothing at all and said nothing.
+test('a stored label or date that is not what the app writes costs no other shot', async () => {
+  const hostile = { toString: 0 };
+  const { $, database } = await launchApp({
+    records: [
+      shotRecord('fresh', 2 * hour),
+      { id: 'odd-label', createdAt: Date.now() - hour, frames: [{ thumbUrl: hostile, width: 4, height: 4, label: hostile }] },
+      { id: 'odd-date', createdAt: hostile, frames: [{ thumbUrl: 'data:,', width: 4, height: 4, label: 'odd-date' }] },
+    ],
+  });
+  assert.equal($('#shot-count').textContent, '2', 'the shot with the odd label is listed, without it');
+  assert.deepEqual($('#thumbs').querySelectorAll('.thumb-label').map((n) => n.textContent), ['fresh', '']);
+  const said = $('#toast').textContent;
+  assert.match(said, /Restored 2 shots from your previous session/);
+  assert.match(said, /1 shot from more than a day ago was deleted/, 'a record with no date to judge goes as an old one does');
+  assert.deepEqual(Array.from(database.written.keys()).sort(), ['fresh', 'odd-label']);
 });
 
 test('a restore with nothing to say says nothing', async () => {

@@ -21,7 +21,8 @@ In scope: the code in this repository, including anything it does with input
 that comes from outside it (files, share links, imported data, network
 responses, user-supplied text rendered into a page), and the website it
 publishes: a way past the Content-Security-Policy or its Trusted Types, a way
-to frame the app on a host that sends headers, a file published that is not
+to frame the app on a host that sends headers or to make it run in another
+site's frame on one that does not (GitHub Pages), a file published that is not
 part of the site, or hosting settings (`_headers`, `_redirects`, `.htaccess`,
 `deploy/nginx.conf`) that are wrong or disagree with each other.
 

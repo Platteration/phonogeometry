@@ -928,6 +928,9 @@ function exportName(ext) { return `phonogeometry-${state.preset}-${new Date().to
 
 // ---------- Wiring ----------
 function init() {
+  // Not inside another page: nothing is wired up and nothing restored, so a frame on another
+  // site has no shots to show and no buttons to steer. src/guard.js shows why, and where to go.
+  if (window.top !== window.self) return;
   applyPrefs(loadPrefs());
   $('#about-version').textContent = APP_VERSION;   // the markup says "Version"; this is the number
   // Chromium offers an install prompt for a page with a manifest and a worker; Safari never

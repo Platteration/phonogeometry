@@ -165,6 +165,12 @@ the Apache and nginx settings serve the site's own files and answer 404 for ever
 `_redirects` does the same for the repository's files on Netlify; Cloudflare Pages has no 404
 rule, so there the folder is the only protection.
 
+Apache reads `.htaccess` only where `AllowOverride All` lets it (Ubuntu's default for `/var/www`
+is `None`, under which the file is ignored without a word), and it needs mod_rewrite and
+mod_headers, which a stock Debian or Ubuntu Apache does not load: `a2enmod rewrite headers`.
+Nothing in the file is optional, so a server without either module answers every request with a
+500 and says why in its error log, rather than serving the site without its rules.
+
 **Response headers.** The same set is in `_headers`, `.htaccess` and `deploy/nginx.conf`, and
 `test/website.test.js` fails when one of them says something the others do not. Every source in
 the policy was measured in Chromium with the policy sent as a response header, at a sub-path,
@@ -185,7 +191,9 @@ starting from `default-src 'none'`; the browser suite drives the whole app under
 **GitHub Pages sends no headers.** The page carries the same policy in a `<meta>` tag, and the
 referrer policy in another, so the scripts, styles, images and Trusted Types rules hold for the
 page there too. What a `<meta>` cannot do needs a host that sends headers (Netlify, Cloudflare
-Pages, Apache, nginx): `frame-ancestors`, so on Pages another site can frame the app; nosniff,
+Pages, Apache, nginx): `frame-ancestors`, so on Pages another site can put the page in a frame,
+where the app does not start (the note says it does not run inside another site's page and gives
+its address, so nothing in the frame can be clicked into deleting a shot); nosniff,
 the permissions, the cross-origin and HTTPS headers; and the workers' own policy, since a
 worker takes its policy from the response that delivered its script, not from the page, so on
 Pages the reconstruction worker and the service worker run without one. `upgrade-insecure-requests`
@@ -193,9 +201,10 @@ is left out of the `<meta>` on purpose, so that `npm start -- --host=0.0.0.0` st
 device over plain `http://`; Pages forces HTTPS by itself.
 
 **One origin per app.** A Pages project site lives under `platteration.github.io`, an origin it
-shares with every other app the account publishes, and storage, caches and service workers
-belong to the origin: a script injected into any one of those apps could read the shots this one
-keeps in IndexedDB. The app keeps its database, keys and caches named after itself and treats
+shares with every other app the account publishes, and storage, caches, service workers and
+permissions belong to the origin: a script injected into any one of those apps could read the
+shots this one keeps in IndexedDB, and once a visitor has allowed the cameras for good there, open
+them without asking. The app keeps its database, keys and caches named after itself and treats
 what it reads back as untrusted, but that limits the damage rather than preventing it. Give it
 an origin of its own: a custom domain or subdomain (Settings → Pages → Custom domain), or any
 host above on a domain of its own. Pages then redirects the old address, and an installed copy
@@ -212,9 +221,9 @@ is. The Apache setting names it from the document root (`ErrorDocument 404 /404.
 site in a sub-folder, put the folder in front.
 
 **If the page cannot start.** `src/guard.js` loads first and depends on nothing. With JavaScript
-off, with a file that did not load, or with a module that threw before the app started, the
-visitor reads a short note saying so where the controls would have been, rather than a page of
-buttons that do nothing.
+off, with a file that did not load, with a module that threw before the app started, or inside
+another site's frame, the visitor reads a short note saying so where the controls would have
+been, rather than a page of buttons that do nothing.
 
 **Security contact.** `.well-known/security.txt` points to this repository's private
 vulnerability report form and to `SECURITY.md`. Its `Expires` date (8 October 2027) is renewed

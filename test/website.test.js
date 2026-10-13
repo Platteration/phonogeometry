@@ -316,6 +316,23 @@ test('pointed at a checkout, every host config serves the site and answers 404 f
   }
 });
 
+// The rules above are only Apache's when it runs them. A stock Debian or Ubuntu Apache loads
+// neither mod_rewrite nor mod_headers, and every block of .htaccess used to sit in an
+// <IfModule>, so there it skipped them without a word: measured on Ubuntu's Apache 2.4.58 with
+// its default modules, a checkout served by mistake answered 200 for /.git/config and
+// /.certs/key.pem, with none of the headers and nothing in the error log. Unwrapped, the same
+// server answers 500 with "Invalid command 'RewriteEngine'" in the log until the modules are on.
+test('Apache: the settings never make a module optional, and the README says which they need', () => {
+  const directives = read('.htaccess').split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n');
+  assert.doesNotMatch(directives, /<\s*IfModule\b/i, '.htaccess wraps nothing in <IfModule>');
+  for (const directive of ['RewriteEngine On', 'RewriteRule !^(', 'Header always set Content-Security-Policy']) {
+    assert.ok(directives.split('\n').some((l) => l.startsWith(directive)), `.htaccess runs ${directive} unconditionally`);
+  }
+  const readme = read('README.md').replace(/\s+/g, ' ');
+  assert.match(readme, /`AllowOverride All`/, 'README says Apache reads .htaccess only under AllowOverride All');
+  assert.match(readme, /`a2enmod rewrite headers`/, 'README names the modules a stock Apache lacks');
+});
+
 test('security.txt names a contact, the policy and an expiry no more than a year away', () => {
   const fields = {};
   for (const line of read('.well-known/security.txt').split('\n')) {

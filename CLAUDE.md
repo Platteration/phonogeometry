@@ -189,7 +189,11 @@ settings that host reads, into an empty folder. Nothing is built.
   server still serves another device over plain http). `test/website.test.js` holds them equal,
   and walks every repository file through the nginx, Apache and Netlify rules (nginx and Apache
   allow a pattern of the site's paths; `_redirects` lists the repository's top-level entries, so
-  a new one goes there too). Change one, change all five.
+  a new one goes there too). Change one, change all five. Nothing in `.htaccess` sits in an
+  `<IfModule>`: a stock Debian or Ubuntu Apache loads neither mod_rewrite nor mod_headers, and
+  wrapped, the rules were skipped without a word, so a checkout served by mistake published
+  `.git/` and `.certs/key.pem` with no headers (measured on Ubuntu's 2.4.58). Unwrapped, a
+  missing module is a 500 and a line in the error log; the website test holds it so.
 - **Every source was measured** in Chromium with the policy sent as a header at a sub-path:
   `img-src data:` is the shot thumbnails (JPEG `data:` URLs); `connect-src 'self'` is the
   service worker (with `'none'` it registers and caches nothing, silently); `manifest-src
@@ -211,13 +215,22 @@ settings that host reads, into an empty folder. Nothing is built.
   JavaScript off, a site file that fails to load, a throw from one of the site's own scripts, or
   a load event with the app not started, `#start-note` shows and the controls are hidden.
   `init()` in `src/app.js` adds `started` (and removes `no-js`) as its last step; after that the
-  app reports its own failures.
+  app reports its own failures. Inside another page's frame the note shows too, and `init()`
+  returns before wiring or restoring anything: Pages cannot send `frame-ancestors`, and a
+  frame's storage is partitioned by the top-level site, so in a frame on a page of the same site
+  (on a custom domain, any other subdomain of it) in every browser, and on any page in a browser
+  that does not partition, the app held the visitor's shots and a steered click on a shot's x
+  deleted one.
 - The shots database is the origin's, so on Pages every app the account publishes can write it.
   `loadAll` restores a record only through `cleanShot` in `src/storage.js` (`frames` a list, each
   frame an object), leaves out and counts the rest, and the restore toast says how many: one
   record whose frames were not a list stopped the shot list on every launch, and every capture
   after it was saved but never shown. A left-out record stays on the disk for the day rule and
-  Clear, like any other.
+  Clear, like any other. The fields the shot list sets as text, a frame's `label` and
+  `thumbUrl`, are shown as nothing when they are not strings (text from `{toString: 0}`, which
+  the database stores as it is, throws: the same stopped list), and only a number is a
+  `createdAt` (`dateOf`): anything else is a record with no date, deleted as an old one is,
+  where an object there threw out of the restore and emptied the list, with nothing said.
 - On GitHub Pages only the `<meta>` applies, and only to the page: a worker takes its policy from
   the response that delivered its script, so there the reconstruction worker and the service
   worker run without one. `.well-known/security.txt` expires on 2027-10-08 and the website test
