@@ -15,7 +15,11 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeObjectScan, writeStandingStillScan } from './fixtures.mjs';
 import { fakePhoneCameras } from './fakeCameras.mjs';
-import { build as buildSite, siteFiles } from '../../tools/site.js';
+import { build as buildSite, siteFiles, EXTRA } from '../../tools/site.js';
+import catalogue from '../../server/catalogue.js';
+import { createNodeHandler } from '../../server/kit/node.js';
+import { createMemoryStore } from '../../server/kit/store.js';
+import { createFakes, envFor, signedDelivery } from '../apiFakes.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
@@ -90,6 +94,7 @@ async function serveSite(dir, { headers = true } = {}) {
   const requests = [];
   const rules = headerRules();
   let movedTo = null;
+  let api = null;
   const server = http.createServer((req, res) => {
     const { pathname, search } = new URL(req.url, 'http://localhost');
     // A site that has moved answers every address with a redirect to the same path there.
@@ -97,6 +102,14 @@ async function serveSite(dir, { headers = true } = {}) {
       requests.push({ path: pathname, status: 301 });
       res.writeHead(301, { Location: `${movedTo}${pathname.startsWith(SUB_PATH) ? pathname.slice(SUB_PATH.length) : ''}${search}` });
       return res.end();
+    }
+    // The site's API, where this host runs one (setApi): everything under its api/ goes to it, as
+    // Cloudflare Pages' _routes.json and nginx's proxy hand it over, the folder's api/config too.
+    // A function's answer carries its own headers, never the ones _headers gives the files.
+    if (api && pathname.startsWith(`${SUB_PATH}api/`)) {
+      res.on('finish', () => requests.push({ path: pathname, status: res.statusCode, api: true }));
+      api(req, res);
+      return;
     }
     let file = null;
     let rel = null;
@@ -119,6 +132,7 @@ async function serveSite(dir, { headers = true } = {}) {
     url: `http://localhost:${server.address().port}${SUB_PATH}`,
     requests,
     moveTo: (url) => { movedTo = url; },
+    setApi: (handler) => { api = handler; },
     stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }),
   };
 }
@@ -797,6 +811,19 @@ async function main() {
         sent === headersFor(headerRules(), '/index.html')['Content-Security-Policy'] && /\bstarted\b/.test(rootClass) && !/no-js|start-failed/.test(rootClass) && !noteShown,
         `policy sent: ${sent ? 'yes' : 'no'}, <html class="${rootClass}">, start note shown: ${noteShown}`);
 
+      // A host without the API (GitHub Pages, any static host) answers api/config with the
+      // folder's own file, which says nothing is on: one question, and nothing drawn.
+      for (let i = 0; i < 50 && !site.requests.some((r) => r.path === `${SUB_PATH}api/config`); i++) await page.waitForTimeout(100);
+      await page.waitForTimeout(300);
+      const accountOff = await page.evaluate(() => ({
+        section: document.querySelector('#account').hidden, privacy: !document.querySelector('#about-privacy').hidden,
+        account: document.querySelector('#about-privacy-account').hidden, thanks: document.querySelector('#about-thanks').hidden,
+      }));
+      const askedApi = site.requests.filter((r) => r.path.startsWith(`${SUB_PATH}api/`)).map((r) => `${r.path} ${r.status}`);
+      check('the site without an API: api/config says nothing is on, it is asked once, and no account or shop is drawn',
+        accountOff.section && accountOff.privacy && accountOff.account && accountOff.thanks && askedApi.join() === `${SUB_PATH}api/config 200`,
+        `asked ${askedApi.join(', ') || 'nothing'}; Account section hidden: ${accountOff.section}, About's sentence as it was: ${accountOff.privacy && accountOff.account}`);
+
       // The phone's own camera path (Chromium's fake device behind a real getUserMedia), which
       // is what the Permissions-Policy decides: with camera=() it is refused.
       await page.click('#btn-start-cameras');
@@ -864,7 +891,7 @@ async function main() {
           if (!hit) out.push(f);
         }
         return out;
-      }, ['./', ...siteFiles().filter((f) => !['sw.js', '404.html', 'robots.txt', '.well-known/security.txt', 'vendor/three/LICENSE'].includes(f))]);
+      }, ['./', ...siteFiles().filter((f) => !EXTRA.includes(f))]);
       check('the service worker takes the sub-path as its scope and caches the whole shell under the policy',
         scope === site.url && uncached.length === 0, `scope ${scope}, site ${site.url}, not cached: ${uncached.join(' ') || 'none'}`);
       const cdp = await ctx.newCDPSession(page);
@@ -1117,6 +1144,173 @@ async function main() {
         await mc.close();
         await new Promise((resolve) => home.close(resolve));
       }
+    }
+
+    // ---- 5. Sign in with Google and "Support this app", on a host that runs the API ----
+    // The built site again, under its headers at the sub-path, now with the kit answering its
+    // api/ on the same origin (as Cloudflare Pages' function or nginx's proxy would), Google and
+    // Stripe faked through the kit's `fetch` (test/apiFakes.js). The browser plays the visitor:
+    // Google's authorize page and Stripe's Checkout are top-level navigations, answered here by
+    // routes that send it back as each would (nothing reaches the network), and the test plays
+    // Stripe's webhook. The policy is the site's own, unchanged, and the run fails on any
+    // violation, console error or page error, on any request that leaves the site but those two,
+    // and on any api/ answer that came from the service worker rather than the network.
+    {
+      const apiDir = path.join(fixtures, 'site-api');
+      buildSite(apiDir, { host: 'cloudflare' });
+      const site = await serveSite(apiDir);
+      const appUrl = site.url;
+      const fakes = await createFakes();
+      const kitLog = [];
+      site.setApi(createNodeHandler({ catalogue, env: envFor(appUrl), store: createMemoryStore(), fetch: fakes.fetch, log: (level, message) => kitLog.push(`${level}: ${message}`) }));
+      const findings = [];
+      const away = [];
+      const viaWorker = [];
+      const dialogs = [];
+      const routed = [];
+      const ctx = await browser.newContext({ viewport: { width: 420, height: 860 } });
+      await watchPolicy(ctx, findings);
+      ctx.on('request', (r) => { const u = r.url(); if (!u.startsWith(appUrl) && !/^(data|blob):/.test(u)) away.push(u); });
+      // A request the worker answers is reported as answered by it; one it leaves to the browser is
+      // not. Not for a navigation the API redirects to the page, though: Chromium reports the
+      // worker's answer for the page, the redirect's end, under the API's address. So navigations
+      // are counted where they arrive instead, at the host (below).
+      ctx.on('response', (r) => { if (r.url().startsWith(`${appUrl}api/`) && r.request().resourceType() !== 'document' && r.fromServiceWorker()) viaWorker.push(r.url()); });
+      // Google's consent screen: a visitor who consents is sent straight back to the callback.
+      // Playwright routes a request but not the ones its redirects make, so the authorize URL is
+      // taken where the API redirects to it: the API's own answer to the sign-in start is fetched
+      // as it is (its sign-in cookie with it), the authorize URL in it is checked as Google checks
+      // it (fakes.consent), and the browser is sent on to the callback Google would send a
+      // consenting visitor to. It never asks Google for anything.
+      await ctx.route(`${appUrl}api/auth/google/start?*`, async (route) => {
+        const response = await route.fetch({ maxRedirects: 0 });
+        const authorize = response.headers().location || '';
+        routed.push(authorize);
+        await route.fulfill({ response, headers: { ...response.headers(), location: fakes.consent(authorize).href } });
+      });
+      // Stripe's Checkout: the visitor pays and is sent back to the success_url the kit gave it.
+      const paidAt = [];
+      await ctx.route('https://checkout.stripe.com/**', (route) => {
+        const url = route.request().url();
+        routed.push(url);
+        paidAt.push(url);
+        route.fulfill({ status: 302, headers: { location: fakes.sessions.get(new URL(url).pathname.split('/').pop()).get('success_url') } });
+      });
+      const page = await ctx.newPage();
+      page.on('dialog', (d) => { dialogs.push(d.message()); d.accept(); });
+      const account = () => page.$eval('#account-body', (e) => [...e.querySelectorAll('p, button')].map((x) => x.textContent.replace(/\s+/g, ' ').trim()).join(' | '));
+      const about = () => page.evaluate(() => ({
+        section: !document.querySelector('#account').hidden, local: !document.querySelector('#about-privacy').hidden,
+        withAccount: !document.querySelector('#about-privacy-account').hidden, thanks: !document.querySelector('#about-thanks').hidden,
+      }));
+      const press = async (label) => {
+        if (!(await page.evaluate(() => document.querySelector('#settings').open))) await page.click('#btn-settings');
+        await page.click(`#account-body button:text-is("${label}")`);
+      };
+      const until = (fn, arg, timeout = 15000) => page.waitForFunction(fn, arg, { timeout }).then(() => true).catch(() => false);
+      const signedInAs = (email) => until((e) => (document.querySelector('#account-body')?.textContent || '').includes(`Signed in as ${e}`), email);
+      const signInGoogle = async () => {
+        await press('Sign in with Google');
+        return signedInAs('ada@example.com');
+      };
+
+      await page.goto(appUrl, { waitUntil: 'load' });
+      await page.evaluate(() => Promise.race([navigator.serviceWorker.ready, new Promise((resolve) => setTimeout(resolve, 15000))]));
+      await page.reload({ waitUntil: 'load' });
+      const controlled = await page.evaluate(() => !!navigator.serviceWorker.controller);
+      await until(() => !document.querySelector('#account').hidden, undefined, 10000);
+      await page.click('#btn-settings');
+      const offered = await account();
+      const before = await about();
+      check('with the API on, Settings offers Sign in with Google and Support this app at Stripe\'s price, and About says what an account sends where',
+        controlled && before.section && !before.local && before.withAccount && !before.thanks
+          && /^Sign in with Google \| Support this app · €4\.00 \| A one-time payment towards Phonogeometry\. [^|]+ \| Sign in to buy$/.test(offered),
+        `service worker in control: ${controlled}; "${offered.slice(0, 70)}…${offered.slice(-16)}"; About: ${JSON.stringify(before)}`);
+
+      // Sign in: the start, Google (routed), the callback, all navigations through the worker's scope.
+      const signedIn = await signInGoogle();
+      const landed = page.url();
+      check('sign in: through Google\'s page and the callback, back on the page it was asked from, signed in',
+        signedIn && landed === appUrl && routed.length === 1 && routed[0].startsWith('https://accounts.google.com/o/oauth2/v2/auth?')
+          && new URL(routed[0]).searchParams.get('redirect_uri') === `${appUrl}api/auth/google/callback`,
+        `${signedIn ? 'signed in' : 'not signed in'}, landed on ${landed}, Google asked ${routed.length} time(s)`);
+
+      // Buy: api/checkout, then Stripe's Checkout (routed), then back at ?purchase=success.
+      const backAt = page.waitForURL(`${appUrl}?purchase=success`, { waitUntil: 'load', timeout: 20000 }).then(() => true).catch(() => false);
+      await press('Buy');
+      const returned = await backAt;
+      const cleaned = await until((u) => location.href === u && !document.querySelector('#account').hidden, appUrl);
+      const notYet = (await about()).thanks;
+      // Coming back from Checkout grants nothing: Stripe's signed webhook does, and the page,
+      // asking api/me every three seconds, draws it when it arrives.
+      const delivery = signedDelivery(fakes.paid(paidAt[0]));
+      const hook = await fetch(`${appUrl}api/webhooks/stripe`, { method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': delivery.signature }, body: delivery.body });
+      const thanked = await until(() => document.querySelector('#toast')?.textContent === 'Thank you — Support this app is unlocked.', undefined, 20000);
+      const after = await about();
+      const owned = await account();
+      check('buy: Stripe\'s Checkout, back at the page with the flag taken out, and thanked once the signed webhook has landed',
+        paidAt.length === 1 && /^https:\/\/checkout\.stripe\.com\/c\/pay\/cs_test_fake\d+$/.test(paidAt[0]) && returned && cleaned && !notYet && hook.status === 200 && thanked && after.thanks && / \| Owned$/.test(owned) && !/\bBuy\b/.test(owned),
+        `checkout ${paidAt.join(' ')}; back at ?purchase=success: ${returned}, flag taken out: ${cleaned}; thanks before the webhook: ${notYet}; webhook ${hook.status}; thanked: ${thanked}; About's thank-you: ${after.thanks}; "…${owned.slice(-30)}"`);
+
+      // Sign out, and the thank-you goes with the account; sign in again, and it is back.
+      await press('Sign out');
+      const out = await until(() => (document.querySelector('#account-body')?.textContent || '').startsWith('Sign in with Google'));
+      const outAbout = await about();
+      const again = await signInGoogle();
+      await until(() => !document.querySelector('#about-thanks').hidden);
+      const againAbout = await about();
+      check('sign out takes the account and its thank-you off the page, and signing in again brings both back',
+        out && !outAbout.thanks && again && againAbout.thanks, `signed out: ${out}, thank-you while out: ${outAbout.thanks}; signed in again: ${again}, thank-you: ${againAbout.thanks}`);
+
+      // Delete account: asked first, then the account and its purchase are gone.
+      await press('Delete account');
+      const deleted = await until(() => (document.querySelector('#account-body')?.textContent || '').startsWith('Sign in with Google'));
+      const fresh = await signInGoogle();
+      await page.waitForTimeout(500);
+      const freshAbout = await about();
+      const freshText = await account();
+      check('delete account asks first, and deletes the account with its purchase',
+        dialogs.length === 1 && /This deletes your account on this site, and your support with it/.test(dialogs[0]) && deleted && fresh && !freshAbout.thanks && /^Signed in as ada@example\.com \| Sign out \| Delete account \| Support this app · €4\.00 \| [^|]+ \| Buy$/.test(freshText),
+        `asked: ${JSON.stringify(dialogs[0]?.slice(0, 60))}, signed out after: ${deleted}, signed in again: ${fresh}, thank-you: ${freshAbout.thanks}`);
+
+      // A callback that is not the end of a sign-in this browser started: back at the page, told so.
+      await page.goto(`${appUrl}api/auth/google/callback?code=forged&state=forged`, { waitUntil: 'load' });
+      const toldFailed = await until(() => document.querySelector('#toast')?.textContent === "Sign-in didn't complete.");
+      check('a forged callback leaves the visitor where they were, told the sign-in did not complete, the flag out of the address',
+        toldFailed && page.url() === appUrl && kitLog.join('\n') === 'warn: kit (phonogeometry): sign-in failed (no valid sign-in cookie)', `told: ${toldFailed}, at ${page.url()}; kit log: ${kitLog.join(' | ')}`);
+
+      // The worker kept nothing of the API, and answered none of it.
+      const cachedApi = await page.evaluate(async () => {
+        const out = [];
+        for (const name of (await caches.keys()).filter((k) => k.startsWith('phonogeometry-'))) {
+          for (const req of await (await caches.open(name)).keys()) if (new URL(req.url).pathname.includes('/api/')) out.push(req.url);
+        }
+        return out;
+      });
+      const callbacks = site.requests.filter((r) => r.path === `${SUB_PATH}api/auth/google/callback`).length;
+      check('the service worker answered nothing under api/ and kept none of it, and every sign-in navigation reached the API', viaWorker.length === 0 && cachedApi.length === 0 && callbacks === 4,
+        `answered by the worker: ${viaWorker.join(' ') || 'none'}; cached: ${cachedApi.join(' ') || 'none'}; callbacks at the API: ${callbacks} of 4`);
+
+      const outside = site.requests.filter((r) => !r.path.startsWith(SUB_PATH) || r.status >= 400);
+      const unrouted = away.filter((u) => !paidAt.includes(u));
+      check('the account and the shop: the policy refused nothing, nothing threw or logged an error, and nothing left the site but Checkout, which the route answered',
+        findings.length === 0 && outside.length === 0 && unrouted.length === 0 && away.length === paidAt.length && fakes.unexpected.length === 0,
+        `${findings.slice(0, 3).join(' | ') || 'no findings'}; ${site.requests.length} requests, outside or failed: ${outside.map((r) => `${r.path} ${r.status}`).join(' ') || 'none'}; left the site: ${away.length} (${away.map((u) => new URL(u).host).join(', ') || 'none'}), Checkout routed ${paidAt.length}, Google's authorize URL taken from the API ${routed.length - paidAt.length} times`);
+
+      // Offline (the host gone as well: Playwright's offline mode does not reach the worker's own
+      // fetches), the app opens from the worker's copy, and a browser that says it is offline is
+      // not made to ask the API: no request, so no failed one in the console either.
+      const apiBefore = site.requests.filter((r) => r.api).length;
+      const findingsBefore = findings.length;
+      await site.stop();
+      await ctx.setOffline(true);
+      const offlineReload = await page.reload({ waitUntil: 'load', timeout: 25000 }).then(() => true).catch(() => false);
+      await page.waitForTimeout(1500);
+      const offlineAbout = offlineReload ? await about() : null;
+      check('offline, the app opens, asks the API nothing and draws no account, and nothing is logged',
+        offlineReload && !offlineAbout.section && offlineAbout.local && site.requests.filter((r) => r.api).length === apiBefore && findings.length === findingsBefore,
+        `reload: ${offlineReload}, Account section shown: ${offlineAbout?.section}, API requests: ${site.requests.filter((r) => r.api).length - apiBefore}; ${findings.slice(findingsBefore, findingsBefore + 2).join(' | ') || 'nothing logged'}`);
+      await ctx.close();
     }
   } finally {
     await browser.close();

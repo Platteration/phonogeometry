@@ -9,6 +9,12 @@
 # word, and a checkout served by mistake published .git/ and .certs/key.pem with none of the
 # headers below. Unwrapped, a missing module is a 500 for every request and a line in the
 # error log naming the directive it could not read.
+#
+# The site's API (sign in with Google and "Support this app", server/start.mjs) cannot be proxied
+# from here: mod_proxy is server configuration. In the virtual host, with mod_proxy and
+# mod_proxy_http: ProxyPass "/api/" "http://127.0.0.1:8788/api/", and the Strict-Transport-Security
+# header there, since a proxied answer never reads this file. Without that, the folder's
+# api/config answers that nothing is on, and the page draws no sign-in and no shop.
 
 Options -Indexes
 ServerSignature Off
@@ -35,7 +41,7 @@ RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 # configs, .git, .certs (the dev server's private key) and node_modules all answer 404, so a
 # server pointed at a checkout by mistake still publishes only the site; a folder answers 404
 # rather than a listing.
-RewriteRule !^(index\.html|404\.html|sw\.js|manifest\.webmanifest|styles\.css|robots\.txt|\.well-known/security\.txt|icons/icon-(192|512)\.png|src/((camera|mesh|pipeline|viewer|vision)/)?[A-Za-z]+\.js|vendor/three/(three\.module\.min\.js|OrbitControls\.js|LICENSE))?$ - [R=404,L]
+RewriteRule !^(index\.html|404\.html|sw\.js|manifest\.webmanifest|styles\.css|robots\.txt|\.well-known/security\.txt|api/config|icons/icon-(192|512)\.png|src/((camera|mesh|pipeline|viewer|vision)/)?[A-Za-z]+\.js|vendor/three/(three\.module\.min\.js|OrbitControls\.js|LICENSE))?$ - [R=404,L]
 
 Header always set Content-Security-Policy "default-src 'none'; script-src 'self' 'sha256-YZsq6qJLsf/5TaskaAzwZ3b+Wi32EerrwGMOBDVEtUc='; style-src 'self' 'sha256-k6jth54MHrYRc0rvI2w7ZQMS6jqHLr0Lm9hZLmXtrCE='; img-src 'self' data:; worker-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types phonogeometry; frame-ancestors 'none'; upgrade-insecure-requests"
 Header always set X-Content-Type-Options "nosniff"

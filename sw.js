@@ -10,10 +10,10 @@
 // the old cache goes on activate. A deploy that touches no shell file leaves it alone, and
 // nobody downloads three.js again for a README edit.
 const PREFIX = 'phonogeometry-';
-const VERSION = `${PREFIX}c9ac666a0feb`;
+const VERSION = `${PREFIX}ee6574580670`;
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
-  'src/guard.js', 'src/app.js', 'src/trust.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/install.js', 'src/camera/cameraManager.js',
+  'src/guard.js', 'src/app.js', 'src/trust.js', 'src/storage.js', 'src/prefs.js', 'src/version.js', 'src/install.js', 'src/account.js', 'src/camera/cameraManager.js',
   'src/camera/moveGuide.js', 'src/camera/captureGuide.js', 'src/camera/intrinsics.js', 'src/camera/exif.js',
   'src/pipeline/reconstruct.js', 'src/pipeline/worker.js',
   'src/vision/linalg.js', 'src/vision/image.js', 'src/vision/fast.js', 'src/vision/orb.js', 'src/vision/match.js',
@@ -21,6 +21,16 @@ const SHELL = [
   'src/mesh/tsdf.js', 'src/mesh/surfaceNets.js', 'src/mesh/meshUtils.js', 'src/mesh/exporters.js',
   'src/viewer/viewer.js', 'vendor/three/three.module.min.js', 'vendor/three/OrbitControls.js',
 ];
+
+// The site's API (sign in with Google and "Support this app", where the host runs server/kit),
+// beside this file: `api/` under the worker's own directory, which is the site's root. Nothing
+// under it is answered from the cache or written to it, and that holds for a navigation too: the
+// sign-in start and Google's redirect back to the callback are navigations in this worker's
+// scope, and answering one with the cached page (as every other navigation is answered when the
+// network fails) would swallow the sign-in. Left to the browser, an API request behaves exactly
+// as it would with no worker: the session cookie, the redirects and the API's own headers all
+// reach the page untouched.
+const API = new URL('api/', self.location.href).href;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -55,6 +65,7 @@ function lookup(req, options) {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET') return;
+  if (url.href.startsWith(API)) return;
   if (url.origin === location.origin) {
     // Offline, a link with a query string opens the cached page rather than failing: the host
     // answers it with the same file, and the cache holds that file once, without the query.

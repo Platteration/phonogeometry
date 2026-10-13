@@ -19,24 +19,29 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * Beside the shell: the service worker itself, three.js's licence (whose permission notice has
- * to travel with the copy), the page every host answers a missing address with, robots.txt and
- * the security contact (RFC 9116). The worker caches none of them.
+ * to travel with the copy), the page every host answers a missing address with, robots.txt, the
+ * security contact (RFC 9116), and api/config: the answer "no sign-in, no shop" (src/account.js)
+ * on a host that runs no API, so the page's one question there is answered rather than logged as
+ * a 404. Where the API runs (Cloudflare Pages' function, the Node process behind nginx's proxy)
+ * it answers that address itself, and the file is never served. The worker caches none of them.
+ * The API's own code (functions/, server/) is never published: a host runs it, it does not serve it.
  */
-export const EXTRA = ['sw.js', 'vendor/three/LICENSE', '404.html', 'robots.txt', '.well-known/security.txt'];
+export const EXTRA = ['sw.js', 'vendor/three/LICENSE', '404.html', 'robots.txt', '.well-known/security.txt', 'api/config'];
 
 /**
  * The settings file each header-capable host reads from the folder it publishes. GitHub Pages
  * reads none and would serve them as files, and nginx's lives in the server's own
  * configuration, so those two get the site alone. Netlify reads _headers and _redirects;
  * Cloudflare Pages reads _headers but takes no 404 rule from _redirects, so there the folder
- * holding nothing else is the protection; Apache never serves .htaccess in its default
- * configuration.
+ * holding nothing else is the protection, and _routes.json, which sends /api/* and nothing else
+ * to the API's function (functions/api/[[path]].js), so no static file invokes it; Apache never
+ * serves .htaccess in its default configuration.
  */
 export const HOST_FILES = {
   pages: [],
   nginx: [],
   netlify: ['_headers', '_redirects'],
-  cloudflare: ['_headers'],
+  cloudflare: ['_headers', '_routes.json'],
   apache: ['.htaccess'],
 };
 

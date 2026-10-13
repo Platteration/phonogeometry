@@ -26,7 +26,13 @@ publishes: a way past the Content-Security-Policy or its Trusted Types, a way
 to frame the app on a host that sends headers or to make it run in another
 site's frame on one that does not (GitHub Pages), a file published that is not
 part of the site, or hosting settings (`_headers`, `_redirects`, `.htaccess`,
-`deploy/nginx.conf`) that are wrong or disagree with each other.
+`deploy/nginx.conf`) that are wrong or disagree with each other. Also in scope: the website's
+optional API under `api/` (`server/`, `functions/`: sign in with Google and the "Support this
+app" payment, off until the owner configures it), such as a way to be granted a purchase
+without Stripe's signed webhook, to act as or see another visitor's account, to be sent off the
+site after signing in, or to make the service worker answer or keep anything under `api/`. The
+API is the shared kit in `server/kit/`, the same files in every app of this account; a finding
+in it is fixed there and copied to each.
 
 Out of scope: vulnerabilities in third-party dependencies that are already
 public and have an upstream fix, findings that require an attacker to already

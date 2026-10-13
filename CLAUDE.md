@@ -4,11 +4,14 @@ Read AGENTS.md first. It holds the working rules every coding agent follows in t
 
 Progressive web app that captures from every camera on a phone at once and reconstructs
 textured 3D meshes on-device. Plain ES modules, no build step, no runtime dependencies
-(three.js is vendored in `vendor/three`).
+(three.js is vendored in `vendor/three`). The website's optional API (sign in with Google and
+"Support this app", off until the owner sets it up: see Sign-in and support) is the shared kit in
+`server/kit/`, plain ES modules with no dependencies either.
 
 ## Commands
 
-- `npm test` runs the node:test suites in `test/` (synthetic scenes with ground truth).
+- `npm test` runs the node:test suites in `test/` (synthetic scenes with ground truth) and the
+  shared kit's own self-test, `server/kit/selftest.mjs`.
 - `npm run check` is the gate before a push: `npm test`, then `npm run test:conventions`.
 - `npm start` serves over HTTP on :8080 (desktop development, photo import only).
 - `npm run start:https` serves over HTTPS with a self-signed certificate (phones need a
@@ -26,7 +29,9 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   the repository's files are not published, framing, and the safety net. Then it checks that a
   file changed on the host reaches the worker's cache, and closes that server: Playwright's
   `setOffline` does not reach a service worker's own fetches, so a worker answering from the
-  network would pass with the host still up. `test/browser/fakeCameras.mjs` stands
+  network would pass with the host still up. Its last section serves the site again with the
+  API answering `api/` and goes through the account and Support this app under the same policy
+  (see Sign-in and support). `test/browser/fakeCameras.mjs` stands
   in a phone with three lenses and an adjustable limit on how many can stream at once, which
   is the only way to exercise the capture path: Chromium's own fake device provides one
   camera. Its lenses draw on canvases kept in memory (`willReadFrequently`): captured from a
@@ -42,8 +47,9 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   site with a checkout's files planted in it, Apache over TLS and behind a stand-in for a
   TLS-ending proxy: every site file 200 with `_headers`' headers, everything else the not-found
   page with them, plain http a 301. Neither showed in any other suite: `http2 on;` stopped nginx
-  1.24 loading the file, and Apache's `env=HTTPS` dropped HSTS behind a proxy. It skips where a
-  server is missing unless `CI` is set (GitHub sets it on every runner).
+  1.24 loading the file, and Apache's `env=HTTPS` dropped HSTS behind a proxy. It also runs the
+  API (`server/start.mjs`) behind nginx's `/api/` location and an Apache `ProxyPass`. It skips
+  where a server is missing unless `CI` is set (GitHub sets it on every runner).
   The GPU plane sweep check is a page, `test/browser/index.html`, opened through the dev
   server. Offline behaviour has to be tested over `http://localhost`, which browsers count as
   a secure context: a self-signed certificate blocks service worker registration outright, so
@@ -56,7 +62,7 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   file is on the default branch):
   `npm test`, then a `git archive HEAD` of exactly the files the app serves (the page, its
   stylesheet, manifest and icons, `sw.js`, `src/`, and `vendor/three` with its licence, plus
-  `404.html`, `robots.txt` and `.well-known/security.txt`), no build step.
+  `404.html`, `robots.txt`, `.well-known/security.txt` and `api/config`), no build step.
   `test/pages.test.js` holds that list equal to the worker's `SHELL` plus `EXTRA` in
   `tools/site.js` (the files beside the shell), and to `node tools/site.js --list`, so a module
   added to one and not the other fails `npm test`, and pins the
@@ -90,7 +96,11 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
 
 - `src/app.js` UI and flow; `src/camera/` device discovery, capture, intrinsics, EXIF;
   `src/storage.js` IndexedDB shot persistence; `src/guard.js` the safety net, `src/trust.js` the
-  Trusted Types policy (see Website).
+  Trusted Types policy (see Website); `src/account.js` the Account section and Support this app
+  (see Sign-in and support).
+- `server/kit/` the shared sign-in, shop and webhook kit; `server/catalogue.js` what the site
+  sells; `server/start.mjs` the API on a host of its own; `functions/api/[[path]].js` the API on
+  Cloudflare Pages. None of it is published as a file of the site.
 - `src/pipeline/reconstruct.js` orchestrates the pipeline; `worker.js` is the Web Worker entry.
 - The camera rig (`sfm.js`) ties frames captured in the same shot together: `rigKey` names the
   physical camera, `shotIndex` the moment. It fills gaps and merges a camera that shares no
@@ -183,15 +193,19 @@ app has one dark palette (`color-scheme: dark`) and no theme preference. There i
 four controls, each one click from its default. The About block's version is `APP_VERSION` in
 `src/version.js`, pinned to `package.json`; the `VERSION` in `sw.js` is the service worker's
 cache name, a hash of the shell files, and is not that. The shots are IndexedDB
-(`src/storage.js`), not a preference, and none of this touches them.
+(`src/storage.js`), not a preference, and none of this touches them. Nor is the account: the
+page keeps nothing about it (the API's session cookie is HttpOnly, and `api/me` is asked afresh
+on every load), so there is no new key.
 
 ## Website
 
 The app is also a website, on the art app's model: everything still happens in the browser,
-and the host only serves files and the headers around them. The site is `node tools/site.js
---list` (the worker's `SHELL` plus `EXTRA`: `sw.js`, three.js's licence, `404.html`,
-`robots.txt`, `.well-known/security.txt`); `tools/site.js <folder> --host=…` copies it, and the
-settings that host reads, into an empty folder. Nothing is built.
+and the host only serves files and the headers around them (and, where it runs the optional API,
+answers `api/`: see Sign-in and support). The site is `node tools/site.js --list` (the worker's
+`SHELL` plus `EXTRA`: `sw.js`, three.js's licence, `404.html`, `robots.txt`,
+`.well-known/security.txt`, `api/config`); `tools/site.js <folder> --host=…` copies it, and the
+settings that host reads (`--host=cloudflare` adds `_routes.json`), into an empty folder.
+Nothing is built.
 
 - **One policy, five places**: `_headers` (Netlify, Cloudflare Pages), `.htaccess`,
   `deploy/nginx.conf`, and the `<meta>` of `index.html` and `404.html`, which leaves out
@@ -199,7 +213,10 @@ settings that host reads, into an empty folder. Nothing is built.
   server still serves another device over plain http). `test/website.test.js` holds them equal,
   and walks every repository file through the nginx, Apache and Netlify rules (nginx and Apache
   allow a pattern of the site's paths; `_redirects` lists the repository's top-level entries, so
-  a new one goes there too). Change one, change all five. Nothing in `.htaccess` sits in an
+  a new one goes there too). Change one, change all five. No nginx location adds a header of its
+  own (one that did would drop all of the server block's there), but the API's, `location ^~
+  /api/`, whose one `add_header` is the server block's HSTS line as written there: the API sends
+  its own headers, and the site's would contradict them. Nothing in `.htaccess` sits in an
   `<IfModule>`: a stock Debian or Ubuntu Apache loads neither mod_rewrite nor mod_headers, and
   wrapped, the rules were skipped without a word, so a checkout served by mistake published
   `.git/` and `.certs/key.pem` with no headers (measured on Ubuntu's 2.4.58). Unwrapped, a
@@ -212,7 +229,9 @@ settings that host reads, into an empty folder. Nothing is built.
   runs both files in the real servers.
 - **Every source was measured** in Chromium with the policy sent as a header at a sub-path:
   `img-src data:` is the shot thumbnails (JPEG `data:` URLs); `connect-src 'self'` is the
-  service worker (with `'none'` it registers and caches nothing, silently); `manifest-src
+  service worker (with `'none'` it registers and caches nothing, silently) and the account's
+  requests to the site's own `api/` (Google and Stripe are top-level navigations, which the
+  policy does not govern, so it names neither); `manifest-src
   'self'`; `form-action 'none'` leaves the `<form method="dialog">` dialogs working;
   `camera=(self)` and `screen-wake-lock=(self)` are the two features the app uses (with `()`,
   `getUserMedia` and the build's wake lock are refused), and the muted previews play with
@@ -257,6 +276,58 @@ settings that host reads, into an empty folder. Nothing is built.
   fails once it has: renew it, a year ahead at most. Its contacts are the private report form,
   then the issues page, since the form is off until the owner switches it on, and its policy
   link is `SECURITY.md` on `main`, the branch the deploy publishes (the default branch has none).
+
+## Sign-in and support
+
+The owner asked every app of the account to be ready for sign in with Google, a shop and Stripe's
+webhooks: per-app functions on the site's own origin, Stripe Checkout, web first. This app sells
+one thing, "Support this app" (one-time, granting `supporter`), which changes nothing but a line
+of thanks in About. The specification is the kit's README (`server/kit/README.md`).
+
+- **The kit is shared and not ours to edit.** `server/kit/` is the canonical copy, byte for byte,
+  but for its eight `.d.ts` declaration files, which this repository does not carry: the
+  conventions test counts any tracked `.d.ts` as a TypeScript source that `npm run typecheck`
+  must reach, which needs `typescript` installed, so a lockfile and a bare `npm ci` in CI, which
+  `test/workflow.test.js` refuses (every install there carries `--ignore-scripts`) and which this
+  repository's no-dependency posture rules out. Nothing here reads them (they are types for the
+  TypeScript apps that import the kit). Copy them in once the shared conventions test stops
+  counting declaration files; until then `diff -r` against the canonical copy lists exactly those
+  eight. A change the kit needs is made to the canonical copy and copied to every app.
+  `npm test` runs its self-test here.
+- **Off until configured, and drawing nothing then.** `src/account.js` asks `api/config` once,
+  from `init()` after the frame check, and not at all when `navigator.onLine` is false (a request
+  bound to fail would be a console error on every offline load). A 404, a network error, a body
+  that is not the kit's shape, or sign-in off (the folder's own `api/config`, which equals the
+  kit's answer with nothing set, and is published so that a host with no API answers rather than
+  404s) leaves `#account` and About's account sentence hidden. Where it is on, Settings shows the
+  Account section and the product, About's privacy sentence is swapped for the one that says
+  what an account sends where, and a supporter reads the thank-you. Everything from the server is
+  read field by field and drawn with `createElement` and `textContent`; Buy follows only a
+  `https://checkout.stripe.com/` address; Delete account is confirmed with `window.confirm` (the
+  app's confirm), saying the support goes with it.
+- **The service worker leaves `api/` alone.** `sw.js` returns before `respondWith` for anything
+  under `api/` beside it (`API`, from its own address, so a sub-path deploy works): no cache
+  is opened, nothing is written, and the sign-in navigations (the start, Google's redirect back
+  to the callback) reach the API untouched. `test/sw.test.js` and `test/sw-subpath.test.js`
+  drive the handler; the browser suite checks no API answer came from the worker and none is in
+  its cache.
+- **Hosting.** Cloudflare Pages runs `functions/api/[[path]].js` (three lines into the kit's
+  `pagesHandler` with `server/catalogue.js`), with `_routes.json` (`--host=cloudflare`) sending it
+  `/api/*` alone and a KV namespace bound as `KIT_STORE`; `_headers` does not reach a function's
+  answer and `_redirects` does not apply to it, so the kit sends its own headers. Self-hosted,
+  `server/start.mjs` (the kit's Node adapter, 127.0.0.1:8788, records under `KIT_DATA_DIR`)
+  sits behind nginx's `location ^~ /api/` or an Apache virtual host's `ProxyPass` (`.htaccess`
+  cannot proxy). GitHub Pages and Netlify run nothing, and the folder's `api/config` answers.
+  `test/hosts.mjs` runs the API behind the real nginx and Apache.
+- **Tests.** `test/api.test.js` (the catalogue, the Pages entry over a fake KV, `server/start.mjs`
+  over a loopback socket, the static `api/config` equal to the kit's answer), `test/account.test.js`
+  (the client on a fake page for every answer), and section 5 of the browser suite: the whole
+  flow under the site's headers with the worker in control. Google and Stripe are faked through
+  the kit's `fetch` (`test/apiFakes.js`), never through a variable naming another host.
+  Playwright routes a request but not the ones its redirects make, so the suite takes Google's
+  authorize URL from the API's own redirect at the sign-in start and sends the browser on to the
+  callback; and Chromium reports a navigation the API redirects to the page (which the worker
+  answers) as the worker's, so navigations to `api/` are counted at the host instead.
 
 ## Code conventions
 

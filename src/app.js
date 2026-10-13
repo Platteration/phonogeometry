@@ -6,6 +6,7 @@ import { LENS_TYPES, HFOV_RANGE, saveLensOverride, intrinsicsFor } from './camer
 import { loadPrefs, savePrefs } from './prefs.js';
 import { APP_VERSION } from './version.js';
 import { wireInstallPrompt } from './install.js';
+import { startAccount } from './account.js';
 import { readExifFov } from './camera/exif.js';
 import { rgbaToGray, sharpness } from './vision/image.js';
 import { QUALITY, markSoftFrames } from './pipeline/reconstruct.js';
@@ -936,6 +937,19 @@ function init() {
   // Chromium offers an install prompt for a page with a manifest and a worker; Safari never
   // does, so the button is hidden until the offer arrives and stays hidden where none comes.
   wireInstallPrompt(window, $('#btn-install'));
+  // Sign in with Google and "Support this app", where the site runs its optional API; everywhere
+  // else (GitHub Pages, any static host, offline) it draws nothing at all (src/account.js).
+  startAccount({
+    doc: document,
+    fetch: typeof window.fetch === 'function' ? window.fetch.bind(window) : undefined,
+    location: window.location,
+    history: window.history,
+    online: () => navigator.onLine !== false,
+    confirm: (message) => confirm(message),
+    note: toast,
+    wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    els: { section: $('#account'), body: $('#account-body'), thanks: $('#about-thanks'), privacyLocal: $('#about-privacy'), privacy: $('#about-privacy-account') },
+  });
   $('#preset').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-preset]');
     if (!b) return;

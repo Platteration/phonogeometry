@@ -15,6 +15,14 @@
 // redirected to https. Apache is run over TLS, and behind a TLS-terminating proxy as well, which
 // is what the redirect's X-Forwarded-Proto condition is for.
 //
+// The site's API (server/start.mjs, sign in with Google and "Support this app") runs here too,
+// with a fake Google and a fake Stripe (test/apiFakes.js): nginx reaches it through
+// deploy/nginx.conf's `location ^~ /api/`, and Apache through the ProxyPass the README and
+// .htaccess give for the virtual host. Through each, everything under /api/ is the API's answer,
+// with the API's own headers and the site's Strict-Transport-Security, and none of the site's
+// other headers; and an Apache with no ProxyPass serves the folder's api/config, which says
+// nothing is on.
+//
 // Needs nginx, Apache as Debian and Ubuntu lay it out (/usr/sbin/apache2, its modules in
 // /usr/lib/apache2/modules), openssl and /etc/mime.types; GitHub's Ubuntu runner has them all.
 // Where one is missing this says so and passes, unless CI is set (GitHub sets it on every
@@ -30,6 +38,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build as buildSite, siteFiles } from '../tools/site.js';
+import { start as startApi } from '../server/start.mjs';
+import { createFakes, envFor } from './apiFakes.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODULES = '/usr/lib/apache2/modules';
@@ -43,7 +53,7 @@ function check(name, ok, detail = '') {
 
 const which = (name, fallback) => spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' }).stdout.trim() || (fs.existsSync(fallback) ? fallback : null);
 const NGINX = which('nginx', '/usr/sbin/nginx');
-const APACHE_MODULES = ['mpm_event', 'authz_core', 'mime', 'dir', 'rewrite', 'headers', 'ssl', 'socache_shmcb'];
+const APACHE_MODULES = ['mpm_event', 'authz_core', 'mime', 'dir', 'rewrite', 'headers', 'ssl', 'socache_shmcb', 'proxy', 'proxy_http'];
 const APACHE = APACHE_MODULES.every((m) => fs.existsSync(path.join(MODULES, `mod_${m}.so`))) ? which('apache2', '/usr/sbin/apache2') : null;
 const OPENSSL = which('openssl', '/usr/bin/openssl');
 const missing = [
@@ -131,6 +141,8 @@ fs.chmodSync(key, 0o644);
 
 /** Every file of the site, and the page at its root. */
 const SERVED = ['/', ...siteFiles().map((f) => `/${f}`)];
+/** What a host that proxies the API answers from the folder: everything but api/. */
+const STATIC = SERVED.filter((p) => !p.startsWith('/api/'));
 /** The planted files, the hosting configuration, the folders and addresses the site does not
  *  have: the not-found page, every one. */
 const REFUSED = [...Object.keys(PLANTED).map((f) => `/${f}`), '/.htaccess', '/src/', '/src/vision/', '/icons/', '/vendor/', '/vendor/three/', '/.well-known/', '/index.html/x', '/no/such/page'];
@@ -140,15 +152,16 @@ const TYPES = {
 };
 
 /** Every path of the site answers 200 with its headers, and everything else the not-found page
- *  with the same headers. `forbidden` may answer 403 (with that page) rather than 404. */
-async function serves(label, origin, headers = {}, { forbidden = [] } = {}) {
+ *  with the same headers. `forbidden` may answer 403 (with that page) rather than 404. `paths`
+ *  are the site's files this host serves from the folder (all of them, unless it proxies api/). */
+async function serves(label, origin, headers = {}, { forbidden = [], paths = SERVED } = {}) {
   const wrong = [];
-  for (const p of SERVED) {
+  for (const p of paths) {
     const r = await get(`${origin}${p}`, headers);
     const bad = wrongHeaders(r, p === '/' ? '/index.html' : p);
     if (r.status !== 200 || bad.length || (TYPES[p] && !TYPES[p].test(r.headers['content-type'] || ''))) wrong.push(`${p} ${r.status} ${r.headers['content-type']}${bad.length ? ` (${bad.join('; ')})` : ''}`);
   }
-  check(`${label}: every file of the site answers 200, typed, with every header _headers gives it`, wrong.length === 0, `${SERVED.length} paths${wrong.length ? `; wrong: ${wrong.join(' | ')}` : ''}`);
+  check(`${label}: every file of the site answers 200, typed, with every header _headers gives it`, wrong.length === 0, `${paths.length} paths${wrong.length ? `; wrong: ${wrong.join(' | ')}` : ''}`);
   const leaked = [];
   for (const p of REFUSED) {
     const r = await get(`${origin}${p}`, headers);
@@ -157,6 +170,66 @@ async function serves(label, origin, headers = {}, { forbidden = [] } = {}) {
     if (!status.includes(r.status) || !r.body.includes(NOT_FOUND) || bad.length) leaked.push(`${p} ${r.status}${bad.length ? ` (${bad.join('; ')})` : ''}`);
   }
   check(`${label}: a checkout's files, the host's settings, the folders and a missing page answer the site's not-found page, with the same headers`, leaked.length === 0, `${REFUSED.length} paths${leaked.length ? `; wrong: ${leaked.join(' | ')}` : ''}`);
+}
+
+/** One request with a method and a body, for the API's POST. */
+const send = (url, { method = 'GET', headers = {}, body } = {}) => new Promise((resolve, reject) => {
+  const req = (url.startsWith('https:') ? https : http).request(url, { method, headers, rejectUnauthorized: false, agent: false }, (res) => {
+    let text = '';
+    res.setEncoding('utf8');
+    res.on('data', (d) => { text += d; });
+    res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: text }));
+  });
+  req.on('error', reject);
+  req.setTimeout(10000, () => req.destroy(new Error(`${url}: no answer in 10 s`)));
+  req.end(body);
+});
+
+// The API, as server/start.mjs runs it on a host of its own: on loopback, its records in a data
+// directory of its own, configured as a deployment would be (its public address the proxy's),
+// and Google and Stripe faked through its `fetch`.
+const API_URL = 'https://phonogeometry.example/';
+const apiData = path.join(work, 'api-data');
+const fakes = await createFakes();
+const api = await startApi({ env: envFor(API_URL), dataDir: apiData, port: 0, fetch: fakes.fetch, log: () => {} });
+const apiPort = new URL(api.url).port;
+/** What the API says itself, every response: the site's headers are not its to send. */
+const KIT_HEADERS = {
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+  'cross-origin-resource-policy': 'same-origin',
+};
+const SITE_ONLY = ['x-frame-options', 'permissions-policy', 'cross-origin-opener-policy'];
+
+/** Through a proxy at `origin`, every address under /api/ is the API's answer, with its own
+ *  headers and the site's Strict-Transport-Security, and nothing else of the site's. */
+async function proxies(label, origin) {
+  const wrong = [];
+  const look = (what, r, status) => {
+    const bad = Object.entries(KIT_HEADERS).filter(([name, value]) => r.headers[name] !== value).map(([name]) => `${name}: ${r.headers[name]}`);
+    bad.push(...SITE_ONLY.filter((name) => r.headers[name] !== undefined).map((name) => `${name} sent`));
+    if (r.headers['strict-transport-security'] !== want('/index.html')['strict-transport-security']) bad.push(`strict-transport-security: ${r.headers['strict-transport-security']}`);
+    if (r.status !== status) bad.push(`status ${r.status}`);
+    if (bad.length) wrong.push(`${what}: ${bad.join('; ')}`);
+  };
+  const config = await get(`${origin}/api/config`);
+  look('GET /api/config', config, 200);
+  let products = [];
+  try { products = JSON.parse(config.body).shop.products.map((p) => `${p.id} ${p.price?.unit_amount} ${p.price?.currency}`); } catch { wrong.push(`config body ${config.body.slice(0, 60)}`); }
+  if (products.join() !== 'supporter 400 eur') wrong.push(`products: ${products.join()}`);
+  const started = await get(`${origin}/api/auth/google/start?return=%2F`);
+  look('GET /api/auth/google/start', started, 302);
+  if (!String(started.headers.location).startsWith('https://accounts.google.com/o/oauth2/v2/auth?')) wrong.push(`start went to ${started.headers.location}`);
+  if (!/^__Host-phonogeometry-oauth=[^;]+;.*Secure/.test(String(started.headers['set-cookie']?.[0]))) wrong.push(`start set ${started.headers['set-cookie']}`);
+  const buy = await send(`${origin}/api/checkout`, { method: 'POST', headers: { origin: 'https://phonogeometry.example', 'content-type': 'application/json' }, body: '{"product":"supporter"}' });
+  look('POST /api/checkout signed out', buy, 401);
+  for (const p of ['/api/.git/config', '/api/index.html', '/api/no/such/route']) {
+    const r = await get(`${origin}${p}`);
+    look(`GET ${p}`, r, 404);
+    if (r.body.includes(NOT_FOUND) || !/^application\/json/.test(r.headers['content-type'] || '')) wrong.push(`${p}: not the API's own 404`);
+  }
+  check(`${label}: everything under /api/ is the API's answer, with its own headers and the site's HSTS alone`, wrong.length === 0, wrong.length ? wrong.join(' | ') : 'config, the sign-in start, a checkout, three addresses it does not have');
 }
 
 const children = [];
@@ -192,6 +265,7 @@ async function nginx() {
   edit('  root /var/www/phonogeometry;\n', `  root ${dir};\n`);
   edit('/etc/letsencrypt/live/example.com/fullchain.pem', cert);
   edit('/etc/letsencrypt/live/example.com/privkey.pem', key);
+  edit('    proxy_pass http://127.0.0.1:8788;\n', `    proxy_pass http://127.0.0.1:${apiPort};\n`);
   const bad = edits.filter(Boolean);
   check('deploy/nginx.conf has the lines an install sets, once each', bad.length === 0, bad.join(', '));
   fs.writeFileSync(path.join(ndir, 'site.conf'), conf);
@@ -219,7 +293,8 @@ async function nginx() {
   const log = start(NGINX, [...args, '-g', 'daemon off;'], path.join(ndir, 'logs', 'error.log'));
   const origin = `https://127.0.0.1:${tls}`;
   await waitFor(`${origin}/`, log);
-  await serves('nginx', origin);
+  await serves('nginx', origin, {}, { paths: STATIC });
+  await proxies('nginx', origin);
   const redirect = await get(`http://127.0.0.1:${plain}/a/b?x=1`);
   check('nginx: plain http answers a 301 to the same address over https', redirect.status === 301 && redirect.headers.location === 'https://127.0.0.1/a/b?x=1', `${redirect.status} ${redirect.headers.location}`);
 }
@@ -227,9 +302,12 @@ async function nginx() {
 async function apache() {
   const adir = path.join(work, 'apache');
   fs.mkdirSync(adir, { recursive: true });
-  const [plain, tls] = [await freePort(), await freePort()];
+  const [plain, tls, proxied] = [await freePort(), await freePort(), await freePort()];
   // Apache with the modules .htaccess needs and AllowOverride All, as the README asks, and the
-  // site at the document root, as `node tools/site.js <folder> --host=apache` writes it.
+  // site at the document root, as `node tools/site.js <folder> --host=apache` writes it. A third
+  // virtual host carries the README's ProxyPass for the API, and its HSTS line (the README and
+  // .htaccess give both, with the API's port), which only the virtual host can: mod_proxy is
+  // server configuration, and a proxied answer never reads .htaccess.
   fs.writeFileSync(path.join(adir, 'httpd.conf'), [
     `ServerRoot ${adir}`,
     `DefaultRuntimeDir ${adir}`,
@@ -261,6 +339,14 @@ async function apache() {
     `  SSLCertificateFile ${cert}`,
     `  SSLCertificateKeyFile ${key}`,
     '</VirtualHost>',
+    `Listen 127.0.0.1:${proxied}`,
+    `<VirtualHost 127.0.0.1:${proxied}>`,
+    '  SSLEngine on',
+    `  SSLCertificateFile ${cert}`,
+    `  SSLCertificateKeyFile ${key}`,
+    `  ProxyPass "/api/" "http://127.0.0.1:${apiPort}/api/"`,
+    `  Header always set Strict-Transport-Security "${want('/index.html')['strict-transport-security']}"`,
+    '</VirtualHost>',
     '',
   ].join('\n'));
   const version = spawnSync(APACHE, ['-v'], { encoding: 'utf8' }).stdout.split('\n')[0].replace(/^Server version: /, '');
@@ -276,6 +362,12 @@ async function apache() {
   await serves('Apache behind a TLS-terminating proxy', `http://127.0.0.1:${plain}`, { 'X-Forwarded-Proto': 'https' }, { forbidden: ['/.htaccess'] });
   const redirect = await get(`http://127.0.0.1:${plain}/a/b?x=1`);
   check('Apache: plain http answers a 301 to the same address over https', redirect.status === 301 && redirect.headers.location === `https://127.0.0.1:${plain}/a/b?x=1`, `${redirect.status} ${redirect.headers.location}`);
+  // Without the ProxyPass (above), the folder's api/config was served as a file of the site and
+  // says nothing is on; with it, the API answers, and the rest of the site is as it was.
+  const off = await get(`https://127.0.0.1:${tls}/api/config`);
+  check('Apache without a ProxyPass: api/config is the folder\'s, saying nothing is on', off.status === 200 && off.body.trim() === '{"auth":{"google":false},"shop":{"products":[]}}', `${off.status} ${off.body.trim()}`);
+  await proxies('Apache with the README\'s ProxyPass', `https://127.0.0.1:${proxied}`);
+  await serves('Apache with the README\'s ProxyPass', `https://127.0.0.1:${proxied}`, {}, { forbidden: ['/.htaccess'], paths: STATIC });
   // the stock refusal of .htaccess (AH01630) is logged as an error and is not one
   const errors = log().split('\n').filter((l) => /:(error|crit|alert|emerg)\]/.test(l) && !/AH01630: client denied by server configuration: \S+\/\.htaccess$/.test(l));
   check('Apache logged no error while serving', errors.length === 0, errors.join(' | '));
@@ -288,6 +380,7 @@ try {
   console.error(e);
   check('the host checks ran to the end', false, String(e?.message ?? e));
 } finally {
+  await api.close();
   for (const child of children) child.kill('SIGTERM');
   await Promise.all(children.map((c) => (c.exitCode === null && c.signalCode === null ? new Promise((r) => c.once('exit', r)) : null)));
   fs.rmSync(work, { recursive: true, force: true });

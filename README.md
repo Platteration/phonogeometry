@@ -4,9 +4,12 @@ Turn every camera on your phone into a 3D scanner.
 
 Phonogeometry is a progressive web app that opens **all the cameras your phone exposes** (wide, ultra-wide, telephoto, front) and captures from them simultaneously. From a handful of shots taken while you move around, it reconstructs a **textured 3D mesh** of a room, a person or an object, entirely on the device, and exports it as GLB, PLY or OBJ.
 
-No app store, no server, no account: it runs in the phone's browser and works offline once
-loaded. That is tested, not assumed: with the network cut after the first visit, the app
-still opens, imports photos, reconstructs and exports.
+No app store, no server doing the work, nothing to sign up for: it runs in the phone's browser
+and works offline once loaded. That is tested, not assumed: with the network cut after the first
+visit, the app still opens, imports photos, reconstructs and exports. The photographs never
+leave the phone. Where the website runs its optional API, a visitor can also sign in with Google
+and support the app with a one-time payment, which changes nothing in the app (see
+[Sign in and support](#sign-in-and-support-optional)).
 
 <p align="center">
   <img src="docs/capture.png" width="30%" alt="Capture screen with live camera tiles" />
@@ -134,12 +137,14 @@ Some phones refuse to stream several rear cameras at the same time. Cameras that
 
 The app is also a website, and the website is the files the page loads and nothing else: the
 page and its not-found page, the stylesheet, every module under `src/`, the vendored three.js
-and its licence, the service worker, the manifest and icons, `robots.txt` and
-`.well-known/security.txt`. `node tools/site.js <folder>` copies them into an empty folder and
-`node tools/site.js --list` names them; the list is the service worker's shell plus those few
-files, so nothing else in the repository (notes, tests, tools, the dev server, the hosting
-settings) is ever published. Nothing is built: the copy is the committed files as they are.
-Everything still happens in the visitor's browser. The host only serves files, and the
+and its licence, the service worker, the manifest and icons, `robots.txt`,
+`.well-known/security.txt` and `api/config`, which tells the page that the host runs no API.
+`node tools/site.js <folder>` copies them into an empty folder and `node tools/site.js --list`
+names them; the list is the service worker's shell plus those few files, so nothing else in the
+repository (notes, tests, tools, the dev server, the API's code, the hosting settings) is ever
+published. Nothing is built: the copy is the committed files as they are. Everything still
+happens in the visitor's browser. The host only serves files (and, where it runs the optional
+API, answers `api/`: see [Sign in and support](#sign-in-and-support-optional)), and the
 photographs, shots and meshes never leave the device.
 
 `.github/workflows/pages.yml` publishes that list to GitHub Pages: a push to `main` runs `npm test` and uploads those files as committed. Three things outside the files have to be in place first. Pages has to be set to deploy from Actions (Settings → Pages → Source: GitHub Actions). `main` has to carry this work: the branch exists, but at an older commit than this one (`fed2c5f`, 23 September 2026), and its one deploy so far built and uploaded the site and was then refused by GitHub because Pages is not enabled for the repository (`Failed to create deployment (status: 404)`). And the `github-pages` environment has to accept deployments from `main`: by default it admits the default branch, so the simplest arrangement is to make `main` the default (otherwise add it to the environment's deployment branches). Running the workflow by hand (Actions → Run workflow) is offered only once `pages.yml` is on the default branch.
@@ -152,7 +157,7 @@ common ones, with the same headers in each:
 | Host | Copy the site with | Settings it reads |
 | --- | --- | --- |
 | Netlify | `node tools/site.js <folder> --host=netlify` | `_headers`, `_redirects` |
-| Cloudflare Pages | `node tools/site.js <folder> --host=cloudflare` | `_headers` |
+| Cloudflare Pages | `node tools/site.js <folder> --host=cloudflare` | `_headers`, and `_routes.json` for the API's function |
 | Apache | `node tools/site.js <folder> --host=apache` | `.htaccess` |
 | nginx | `node tools/site.js <folder>` | `deploy/nginx.conf`, copied into the server's configuration by hand |
 | GitHub Pages | the workflow | none: see below |
@@ -188,7 +193,7 @@ drives the whole app under it.
 
 | Header | Value | Why |
 | --- | --- | --- |
-| `Content-Security-Policy` | `default-src 'none'; script-src 'self' 'sha256-…'; style-src 'self' 'sha256-…'; img-src 'self' data:; worker-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types phonogeometry; frame-ancestors 'none'; upgrade-insecure-requests` | Only the site's own scripts run, and nothing inline or evaluated but the import map that names three.js, allowed by its hash; the style hash is the not-found page's inline style. `img-src data:` is the shot thumbnails, which are JPEG `data:` URLs kept with each shot. `connect-src 'self'` is the service worker fetching the site's own files: with `'none'` it registers and caches nothing, silently. The app itself makes no network request. Trusted Types make an HTML string sink a TypeError, so a camera label or a file name can only ever be text; the one named policy (`src/trust.js`) vouches for exactly two scripts, the reconstruction worker and `sw.js`. |
+| `Content-Security-Policy` | `default-src 'none'; script-src 'self' 'sha256-…'; style-src 'self' 'sha256-…'; img-src 'self' data:; worker-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types phonogeometry; frame-ancestors 'none'; upgrade-insecure-requests` | Only the site's own scripts run, and nothing inline or evaluated but the import map that names three.js, allowed by its hash; the style hash is the not-found page's inline style. `img-src data:` is the shot thumbnails, which are JPEG `data:` URLs kept with each shot. `connect-src 'self'` is the service worker fetching the site's own files (with `'none'` it registers and caches nothing, silently), and the page's requests to the site's own `api/` (whether it offers sign-in, and where it does, the account's own calls); nothing else is requested, and signing in and paying are top-level navigations to Google and Stripe, which the policy does not govern, so no script, frame or image of theirs is allowed or loaded. Trusted Types make an HTML string sink a TypeError, so a camera label or a file name can only ever be text; the one named policy (`src/trust.js`) vouches for exactly two scripts, the reconstruction worker and `sw.js`. |
 | `X-Content-Type-Options` | `nosniff` | A file is what its type says. |
 | `X-Frame-Options` | `DENY` | With `frame-ancestors 'none'`: no other site can frame the app and steer its buttons (clickjacking). |
 | `Referrer-Policy` | `no-referrer` | The one link out, to the source, tells GitHub nothing about where the app is hosted. |
@@ -251,11 +256,79 @@ curl -sI https://SITE/.git/HEAD | head -1                # 404
 curl -sI https://SITE/README.md | head -1                # 404
 curl -s  https://SITE/src/ | grep -c 'Page not found'    # 1: the not-found page, not a file list
 curl -sI https://SITE/.well-known/security.txt | head -1 # 200
+curl -s  https://SITE/api/config                         # {"auth":{"google":false},...} until the API is set up
 ```
 
 Then open the site on a phone, enable the cameras, take a few shots, build a mesh and download
 it, and check that the browser console shows no `Content Security Policy`, `Permissions policy`
 or `Trusted Type` lines.
+
+### Sign in and support (optional)
+
+The website can offer two more things, both off until the owner sets them up: **Sign in with
+Google**, and one product, **Support this app**, a one-time payment through Stripe Checkout that
+changes nothing in the app (a supporter reads "Thank you for supporting Phonogeometry." in
+About). They live in a small API on the site's own origin under `api/`: the shared kit, copied
+into `server/kit/` (its README is the full setup guide), with this app's catalogue in
+`server/catalogue.js`. The page asks `api/config` once when it starts (not when the browser says
+it is offline); only where that says sign-in is on does Settings show an Account section (Sign in
+with Google; then "Signed in as …", Sign out, Delete account) holding Support this app with its
+price and Buy, and only there does About's privacy sentence change, to say what an account sends
+where. Everywhere else (GitHub Pages, Netlify, any static host, a host whose API is not set up)
+the answer is "nothing on", from the site's own `api/config` file or from the API, and the app
+looks and behaves as it always has.
+
+- **What leaves the device**: nothing, unless the visitor signs in or buys. Signing in is a
+  visit to Google, which tells the site an account id and (if verified) the email; buying is a
+  visit to Stripe's Checkout, which handles the payment. The site keeps the account id, what
+  was bought and Stripe's customer id, and Delete account removes them (the payment itself
+  stays with Stripe). The photographs, shots and meshes never leave the device either way.
+- **What grants a purchase**: Stripe's signed webhook, and nothing the page says. The thank-you
+  line is drawn from `api/me`; a visitor who edits the page can show it to themselves without
+  paying, and since it unlocks nothing, there is nothing for that to take.
+- **The service worker** answers nothing under `api/` and keeps none of it: the sign-in start and
+  Google's redirect back are navigations in its scope, and it leaves them, like every API
+  request, to the browser.
+- Signing in and buying leave the page for Google's and Stripe's, as a reload does: the shots
+  are kept, a mesh built but not downloaded is not.
+
+**Hosting it.** Each host runs the same API (`server/kit/`) with the same catalogue:
+
+| Host | The API | Its settings |
+| --- | --- | --- |
+| Cloudflare Pages (the reference) | `functions/api/[[path]].js`, which Pages builds from the repository (build command `node tools/site.js site --host=cloudflare`, output directory `site`); `_routes.json`, which that folder holds, sends it `/api/*` and nothing else | a KV namespace bound as `KIT_STORE`; the variables below, encrypted |
+| nginx | `server/start.mjs` (`KIT_DATA_DIR=/var/lib/phonogeometry-api node server/start.mjs`), on 127.0.0.1:8788, one process per data directory, as its own user | `deploy/nginx.conf`'s `location ^~ /api/` proxies to it; the variables below in the process's environment |
+| Apache | `server/start.mjs`, as for nginx | `.htaccess` cannot proxy (mod_proxy is server configuration): in the virtual host, with mod_proxy and mod_proxy_http, `ProxyPass "/api/" "http://127.0.0.1:8788/api/"` and the `Strict-Transport-Security` line, since a proxied answer never reads `.htaccess` |
+| GitHub Pages, Netlify | none: they run no function, and the site's `api/config` says nothing is on | |
+
+`_headers` does not reach a function's answer on Cloudflare Pages, and `_redirects` does not
+apply to a request a function serves, so the API sends its own headers (its own
+`default-src 'none'` policy, `no-store`, `no-referrer`), and nginx's `/api/` location adds only
+the site's `Strict-Transport-Security`. Give the app an origin of its own (see "One origin per
+app" above) before turning sign-in on: the session cookie is the origin's, so every page on it
+could act as the signed-in visitor.
+
+**Setting it up** (the full checklist is in `server/kit/README.md`):
+
+1. Google Cloud: an OAuth consent screen (app name, support email, privacy policy URL, the
+   authorised domain), and an OAuth client of type Web application whose authorised redirect URI
+   is `APP_URL` + `api/auth/google/callback`. `openid email` needs no verification review.
+2. Stripe (test mode first, card `4242 4242 4242 4242`): a Product "Support this app" with a
+   one-time Price; a webhook endpoint at `APP_URL` + `api/webhooks/stripe` subscribed to
+   `checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+   `checkout.session.async_payment_failed`, `charge.refunded`, `charge.dispute.created`,
+   `customer.subscription.updated` and `customer.subscription.deleted`; a restricted key with
+   Checkout Sessions write, Prices read, Customer portal write and Customers write.
+3. The variables, never in the repository: `APP_URL` (the site's https address, with its
+   trailing slash), `SESSION_SECRET` (at least 32 random bytes, base64url), `GOOGLE_CLIENT_ID`,
+   `GOOGLE_CLIENT_SECRET`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and
+   `STRIPE_PRICE_SUPPORTER` (the Price's `price_…` id). Sign-in turns on with the first four and
+   a store (the KV binding, or `KIT_DATA_DIR`); the shop also needs the last three. A partial set
+   logs one line naming what is missing and leaves the feature off.
+
+Then `curl https://SITE/api/config` reports `{"auth":{"google":true},...}` with the product and
+its price, and the Account section appears in Settings. The App Store and Google Play are not
+covered: there is no native build.
 
 ## Development
 
@@ -269,7 +342,7 @@ npm start                 # plain HTTP on localhost:8080 for desktop development
 npm run icons             # regenerate the PWA icons
 ```
 
-The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence and focal-length recovery, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as full reconstructions.
+The tests render synthetic textured scenes with ground truth and check each stage (essential matrix and PnP recovery, bundle adjustment convergence and focal-length recovery, SfM pose accuracy, plane-sweep depth accuracy, TSDF/surface-nets geometry, exporter validity) as well as full reconstructions. `npm test` also runs the shared kit's own self-test (`server/kit/selftest.mjs`), the app's catalogue and both ways into the API with a fake Google and a fake Stripe handed to the kit through its `fetch` (`test/api.test.js`), the Account section on a fake page for every answer the API can give (`test/account.test.js`), and the service worker's refusal to touch `api/`.
 
 `npm run test:e2e` drives the real application in Chromium: it captures from the
 browser's fake camera, imports rendered photographs, checks that a blurred one is flagged and
@@ -285,7 +358,12 @@ checks that Trusted Types are enforced, that a missing address gets the site's 4
 the repository's own files are not published, that another site cannot frame the app, and that
 the safety net speaks with JavaScript off, a module missing and a module that throws; then it
 checks that a file changed on the host reaches the offline copy, shuts that server down and runs
-a whole scan offline. It skips itself with
+a whole scan offline. Then it serves the site again with the API answering its `api/` (Google and
+Stripe faked through the API's `fetch`, their pages answered by routes that send the browser back
+as each would) and goes through the account under the same policy, the service worker in
+control: sign in, buy, Stripe's signed webhook, the thank-you, sign out, sign in again, delete
+the account, a forged callback, then offline; it fails on any violation, console error, page
+error, request off the site but the routed Checkout, or API answer from the worker. It skips itself with
 a message if Playwright is not installed; set `REQUIRE_BROWSER=1` to make that a failure
 instead, which is what continuous integration does so the suite cannot pass by skipping.
 Last, `test/hosts.mjs` runs the hosting settings in the real servers: it loads
@@ -293,8 +371,12 @@ Last, `test/hosts.mjs` runs the hosting settings in the real servers: it loads
 Apache, each serving the copied site with a checkout's files planted beside it, and checks that
 every file of the site answers 200, typed, with every header `_headers` gives it, that everything
 else gets the site's not-found page with the same headers, and that plain `http://` is
-redirected; Apache also runs behind a stand-in for a proxy that ends TLS. It skips itself where
-either server is missing, unless `CI` is set (GitHub sets it on every runner).
+redirected; Apache also runs behind a stand-in for a proxy that ends TLS. The API runs there too
+(`server/start.mjs`, with the fakes): through nginx's `/api/` location and through Apache with
+the virtual host's `ProxyPass`, everything under `/api/` is the API's answer with its own headers
+and the site's HSTS alone, and an Apache without the `ProxyPass` serves the folder's
+`api/config`. It skips itself where either server is missing, unless `CI` is set (GitHub sets it
+on every runner).
 CI runs `npm test`, `npm run test:conventions` and `npm run test:e2e` (the browser suite, then
 the host checks), and a separate job
 compares the vendored three.js with the package on the npm registry
@@ -315,11 +397,16 @@ src/mesh/                            TSDF, surface nets, mesh utilities, exporte
 src/viewer/                          three.js viewer
 src/guard.js                         the safety net, loaded first: a note in place of the controls when the page cannot start
 src/trust.js                         the Trusted Types policy for the two scripts the app starts
+src/account.js                       sign in with Google and Support this app, drawn only where the site's API is on
 test/                                node:test suites and synthetic scene renderers
 server.js                            dev server (HTTP/HTTPS with self-signed certificate)
 sw.js, manifest.webmanifest, icons/  PWA
 tools/site.js                        the website: the files it publishes, copied into a folder for a host
 404.html, robots.txt, .well-known/   the rest of the website
+api/config                           the website's answer where no API runs: nothing on
+server/kit/                          the shared sign-in, shop and webhook kit (see its README.md)
+server/catalogue.js, server/start.mjs  what the site sells, and the API on a host of its own
+functions/api/[[path]].js, _routes.json  the API on Cloudflare Pages
 _headers, _redirects, .htaccess,     Netlify and Cloudflare Pages, Netlify, Apache and nginx settings:
 deploy/nginx.conf                    one set of headers
 ```

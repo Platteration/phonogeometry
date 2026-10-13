@@ -55,18 +55,25 @@ function apacheHeaders() {
   return out;
 }
 
-/** Every `add_header` in deploy/nginx.conf, as { Header: value }. Each must carry `always`, or
- *  nginx leaves it off the 404 page and every other error response. */
+/** The API's location in deploy/nginx.conf: `location ^~ /api/ { … }`, the one location allowed
+ *  an add_header of its own (see nginxApiLocation's test). */
+const API_LOCATION = /^\s*location \^~ \/api\/ \{([^}]*)\}/m;
+
+/** Every `add_header` in deploy/nginx.conf's server blocks, as { Header: value }. Each must carry
+ *  `always`, or nginx leaves it off the 404 page and every other error response. The API's
+ *  location is read apart: it is the one place a location adds a header (its own HSTS line). */
 function nginxHeaders() {
   const conf = read('deploy/nginx.conf');
+  const api = conf.match(API_LOCATION);
+  const site = api ? conf.replace(api[0], '') : conf;
   const out = {};
-  for (const m of conf.matchAll(/^\s*add_header\s+([A-Za-z-]+)\s+"([^"]*)"\s+always;\s*$/gm)) {
+  for (const m of site.matchAll(/^\s*add_header\s+([A-Za-z-]+)\s+"([^"]*)"\s+always;\s*$/gm)) {
     assert.ok(!Object.hasOwn(out, m[1]), `nginx.conf: ${m[1]} is set once`);
     out[m[1]] = m[2];
   }
-  assert.equal([...conf.matchAll(/^\s*add_header\b/gm)].length, Object.keys(out).length, 'nginx.conf: every add_header is quoted and `always`');
+  assert.equal([...site.matchAll(/^\s*add_header\b/gm)].length, Object.keys(out).length, 'nginx.conf: every add_header is quoted and `always`');
   // nginx drops the server's add_header lines from a location that sets one of its own.
-  assert.doesNotMatch(conf.slice(conf.indexOf('location')), /location[^{]*\{[^}]*add_header/, 'nginx.conf: no location sets headers of its own');
+  assert.doesNotMatch(site.slice(site.indexOf('location')), /location[^{]*\{[^}]*add_header/, 'nginx.conf: no location but the API\'s sets headers of its own');
   return out;
 }
 
@@ -122,7 +129,9 @@ test('the policy starts from nothing and allows only what the app loads', () => 
   assert.deepEqual(POLICY['frame-ancestors'], ["'none'"], 'no other site may frame the app (clickjacking)');
   assert.deepEqual(POLICY['upgrade-insecure-requests'], []);
   // The service worker's own fetches (its install, its refresh) are connect-src: with 'none'
-  // it installs and caches nothing. Nothing else in the app talks to the network.
+  // it installs and caches nothing. The only other requests are the account's, to the site's own
+  // api/ (src/account.js), on a host that runs it; Google and Stripe are top-level navigations,
+  // which the policy does not govern, and nothing of theirs is loaded into the page.
   assert.deepEqual(POLICY['connect-src'], ["'self'"]);
   assert.deepEqual(POLICY['worker-src'], ["'self'"], 'the reconstruction worker and the service worker, both the site\'s own files');
   // The icons, and the shot thumbnails, which are JPEG data: URLs kept with each shot.
@@ -236,8 +245,8 @@ test('the site is the shell, the worker and the files every site has, and nothin
   for (const f of ['index.html', '404.html', 'sw.js', 'manifest.webmanifest', 'robots.txt', '.well-known/security.txt', 'src/guard.js', 'src/trust.js']) {
     assert.ok(files.includes(f), `the site has ${f}`);
   }
-  const NOT_SITE = /(^|\/)(README|CLAUDE|AGENTS|CONVENTIONS|REVIEW|SECURITY|SECURITY-AUDIT)\.md$|^(test|tools|deploy|docs|node_modules|\.github|\.claude|\.certs)\/|^(_headers|_redirects|\.htaccess|package(-lock)?\.json|server\.js|LICENSE)$/;
-  assert.deepEqual(files.filter((f) => NOT_SITE.test(f)), [], 'no notes, tests, tools, dev server or hosting settings');
+  const NOT_SITE = /(^|\/)(README|CLAUDE|AGENTS|CONVENTIONS|REVIEW|SECURITY|SECURITY-AUDIT)\.md$|^(test|tools|deploy|docs|node_modules|server|functions|\.github|\.claude|\.certs)\/|^(_headers|_redirects|_routes\.json|\.htaccess|package(-lock)?\.json|server\.js|LICENSE)$/;
+  assert.deepEqual(files.filter((f) => NOT_SITE.test(f)), [], 'no notes, tests, tools, dev server, API code or hosting settings');
   assert.deepEqual(files.filter((f) => f.split('/').some((part) => part.startsWith('.')) && f !== '.well-known/security.txt'), [], 'no dotfile but the security contact');
 });
 
@@ -264,19 +273,23 @@ test('tools/site.js copies the site, and the settings file each host reads, into
   }
 });
 
-/** Whether nginx serves a path, read the way nginx picks a location: exact, then regex, then
- *  the longest prefix. */
-function nginxServes(urlPath) {
+/** What nginx does with a path, read the way nginx picks a location: an exact match, else the
+ *  longest prefix if it carries `^~`, else the first regex, else the longest prefix. 'proxied'
+ *  (to the API), 'served' (from the folder) or 'refused' (404). */
+function nginxAnswers(urlPath) {
   const conf = read('deploy/nginx.conf');
   const server = conf.slice(conf.indexOf('listen 443'));
-  const blocks = [...server.matchAll(/location\s+(=|~)?\s*(\S+)\s*\{([^}]*(?:\{[^}]*\}[^}]*)?)\}/g)].map((m) => ({ kind: m[1] || 'prefix', match: m[2], body: m[3] }));
+  const blocks = [...server.matchAll(/location\s+(=|~|\^~)?\s*(\S+)\s*\{([^}]*(?:\{[^}]*\}[^}]*)?)\}/g)].map((m) => ({ kind: m[1] || 'prefix', match: m[2], body: m[3] }));
   const exact = blocks.find((b) => b.kind === '=' && b.match === urlPath);
+  const longest = blocks.filter((b) => (b.kind === 'prefix' || b.kind === '^~') && urlPath.startsWith(b.match)).sort((a, b) => b.match.length - a.match.length)[0];
   const regex = blocks.find((b) => b.kind === '~' && new RegExp(b.match).test(urlPath));
-  const prefix = blocks.filter((b) => b.kind === 'prefix' && urlPath.startsWith(b.match)).sort((a, b) => b.match.length - a.match.length)[0];
-  const block = exact || regex || prefix;
+  const block = exact || (longest?.kind === '^~' ? longest : null) || regex || longest;
   assert.ok(block, `nginx.conf has a location for ${urlPath}`);
-  return !/\breturn\s+404\b/.test(block.body);
+  if (/\bproxy_pass\b/.test(block.body)) return 'proxied';
+  return /\breturn\s+404\b/.test(block.body) ? 'refused' : 'served';
 }
+/** Whether nginx answers a path with something other than its 404: a file, or the API. */
+const nginxServes = (urlPath) => nginxAnswers(urlPath) !== 'refused';
 function apacheServes(relPath) {
   const rule = read('.htaccess').match(/^\s*RewriteRule\s+!(\S+)\s+-\s+\[R=404,L\]\s*$/m);
   assert.ok(rule, '.htaccess refuses everything outside an allowlist');
@@ -320,6 +333,48 @@ test('pointed at a checkout, every host config serves the site and answers 404 f
     assert.equal(nginxServes(`/${dir}`), false, `nginx answers 404 for the folder /${dir}`);
     assert.equal(apacheServes(dir), false, `Apache answers 404 for the folder /${dir}`);
   }
+});
+
+// The site's API (server/start.mjs, the kit's Node adapter) listens on loopback, and nginx hands
+// it everything under /api/ on the site's own origin. `^~` is what makes that location win over
+// the regular expression that serves the site's files (and over the dotfile refusals), and its
+// proxy_pass names no URI, so the path reaches the API as the browser wrote it. A location with
+// an add_header of its own inherits none of the server block's, which is the point here: the API
+// sends its own headers (its own policy, no-store, no-referrer), and the site's would contradict
+// them, a browser reading the last of two Referrer-Policy values. So it repeats exactly one, the
+// server's Strict-Transport-Security, and no other location may add a header (nginxHeaders).
+test('nginx hands /api/ to the API on loopback, with the server\'s HSTS line and none of the site\'s other headers', () => {
+  const conf = read('deploy/nginx.conf');
+  const [plain, tls] = nginxServers();
+  const api = conf.match(API_LOCATION);
+  assert.ok(api, 'nginx.conf has `location ^~ /api/`');
+  assert.equal(conf.match(new RegExp(API_LOCATION.source, 'gm')).length, 1, 'once');
+  assert.ok(tls.includes('location ^~ /api/ {') && !plain.includes('/api/'), 'inside the https server; plain http only redirects');
+  const lines = api[1].split('\n').map((l) => l.replace(/#.*$/, '').trim()).filter(Boolean);
+  assert.ok(lines.every((l) => l.endsWith(';')), 'one directive a line');
+  const directives = lines.map((l) => l.slice(0, -1).replace(/\s+/g, ' '));
+  assert.deepEqual(directives, [
+    'proxy_pass http://127.0.0.1:8788',
+    'proxy_http_version 1.1',
+    'proxy_set_header Connection ""',
+    'client_max_body_size 1m',
+    'proxy_read_timeout 30s',
+    `add_header Strict-Transport-Security "${HEADERS['Strict-Transport-Security']}" always`,
+  ], 'the proxy to 127.0.0.1:8788 with no URI, and the server block\'s HSTS line as it is written there');
+  for (const p of ['/api/config', '/api/me', '/api/auth/google/start', '/api/auth/google/callback', '/api/webhooks/stripe', '/api/no/such/route', '/api/.git/config', '/api/index.html']) {
+    assert.equal(nginxAnswers(p), 'proxied', `${p} goes to the API, neither served from the folder nor refused`);
+  }
+  for (const p of ['/api', '/apix', '/src/api/x.js', '/index.html']) assert.notEqual(nginxAnswers(p), 'proxied', `${p} is not the API's`);
+});
+
+test('the API is run by a host, never published by one, and Cloudflare Pages runs it for /api/* alone', () => {
+  assert.deepEqual(Object.entries(site.HOST_FILES).filter(([, files]) => files.includes('_routes.json')).map(([host]) => host), ['cloudflare']);
+  assert.deepEqual(JSON.parse(read('_routes.json')), { version: 1, include: ['/api/*'], exclude: [] });
+  assert.deepEqual(site.siteFiles().filter((f) => /^(server|functions)\//.test(f) || f === '_routes.json'), []);
+  assert.deepEqual(site.siteFiles().filter((f) => f.startsWith('api/')), ['api/config'], 'the one answer a host without the API gives');
+  const htaccess = read('.htaccess');
+  assert.match(htaccess, /^# mod_proxy_http: ProxyPass "\/api\/" "http:\/\/127\.0\.0\.1:8788\/api\/", and the Strict-Transport-Security$/m, '.htaccess says how Apache proxies the API, which it cannot do itself');
+  assert.equal(apacheServes('api/config'), true, 'without that, Apache serves the static api/config');
 });
 
 // The rules above are only Apache's when it runs them. A stock Debian or Ubuntu Apache loads

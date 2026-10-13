@@ -246,6 +246,45 @@ test('a navigation the host redirects is passed on, not answered from the cache'
   assert.equal(await cache.get(`${ORIGIN}/`).text(), 'the old build', 'and the redirect is not written over the cached page');
 });
 
+// The site's API (sign in with Google and "Support this app", where the host runs server/kit)
+// sits under api/ beside the worker. The sign-in start and Google's redirect back to the callback
+// are navigations in the worker's scope, and a navigation the network fails is answered here with
+// the cached page: done to the callback, that would swallow the sign-in (its code, its cookies).
+// And nothing the API says may be kept, or a signed-out page could be shown an old account. So
+// the worker leaves every api/ request to the browser, as if it were not there.
+test('nothing under api/ is answered or kept by the worker, the sign-in navigations included', async () => {
+  cache.set(`${ORIGIN}/`, new Response('cached page', { status: 200 }));
+  cache.set(`${ORIGIN}/index.html`, new Response('cached index', { status: 200 }));
+  networkAnswer = async () => { throw new TypeError('Failed to fetch'); };
+  for (const [url, mode] of [
+    [`${ORIGIN}/api/config`, 'cors'],
+    [`${ORIGIN}/api/me`, 'cors'],
+    [`${ORIGIN}/api/auth/google/start?return=%2F`, 'navigate'],
+    [`${ORIGIN}/api/auth/google/callback?code=c1&state=s1`, 'navigate'],
+    [`${ORIGIN}/api/`, 'navigate'],
+    [`${ORIGIN}/api/no/such/route`, 'cors'],
+  ]) {
+    assert.equal(get(url, { mode }), null, `${url} (${mode}) goes to the network untouched`);
+  }
+  for (const method of ['POST', 'DELETE']) {
+    const event = { request: { method, url: `${ORIGIN}/api/checkout`, mode: 'cors' }, responded: null, respondWith(p) { this.responded = p; }, waitUntil(p) { extended.push(p); } };
+    listeners.fetch(event);
+    assert.equal(event.responded, null, `${method} api/checkout goes to the network untouched`);
+  }
+  await settled();
+  assert.deepEqual(opened, [], 'no cache is so much as opened for them');
+  assert.deepEqual([...cache.keys()], [`${ORIGIN}/`, `${ORIGIN}/index.html`]);
+});
+
+test('an address that only begins like api/ is still the worker\'s to answer', async () => {
+  cache.set(`${ORIGIN}/`, new Response('cached page', { status: 200 }));
+  networkAnswer = async () => { throw new TypeError('Failed to fetch'); };
+  for (const url of [`${ORIGIN}/api`, `${ORIGIN}/apis/x`, `${ORIGIN}/src/api/x.js`, `${ORIGIN}/?next=/api/me`]) {
+    assert.ok(get(url, { mode: 'navigate' }), `${url} is answered by the worker`);
+  }
+  assert.equal(await (await get(`${ORIGIN}/?next=/api/me`, { mode: 'navigate' })).text(), 'cached page');
+});
+
 // The runtime refresh above only rewrites what a visitor happens to fetch, so on its own a
 // deploy would leave an installed copy half old and half new offline. What moves the whole
 // shell is a new cache name, and a name typed by hand was left alone by three commits that
