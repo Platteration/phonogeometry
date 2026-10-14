@@ -9,64 +9,31 @@
 // a location keeps serving what it read for up to a minute, so any record that two kinds of
 // request rewrite whole can have a stale copy written over a revoke. Sign-in and sign-out touch
 // only the session records; the user record is the index of the visitor's purchase records and
-// their Stripe customer, written by the webhook and by account deletion alone.
+// their Stripe customer, written by the webhook, by account deletion, and by Buy or Manage
+// subscription only to forget a customer Stripe says it no longer has.
 
 import { base64url, fromBase64url, fromUtf8, hex, hmacSha256, hmacVerify, randomBytes, randomId, safeEqual, sha256, utf8 } from './crypto.js';
-import { HttpError, clearCookie, createRouter, csrfRefusal, failure, isRecord, json, noContent, parseCookies, readBytes, readJson, redirect, serializeCookie } from './http.js';
+import { HttpError, clearCookie, createRouter, csrfRefusal, failure, isRecord, json, noContent, parseCookies, readBytes, readJson, redirect, serializeCookie, timeoutSignal } from './http.js';
 import { AuthError, authorizeUrl, createKeyCache, exchangeCode, pkcePair, verifyIdToken } from './google.js';
-import { StripeError, createCheckoutSession, createPortalSession, getPrice, keyMode, parseEvent, verifySignature } from './stripe.js';
+import { StripeError, createCheckoutSession, createPortalSession, getCheckoutSession, getPrice, parseEvent, verifySignature } from './stripe.js';
+import { ID, readConfig, safeReturnPath, validateCatalogue } from './config.js';
+
+// What is configured (the catalogue, the environment, the return path) lives in config.js, which
+// a server that keeps its own accounts imports without this file; every name there is here too.
+export { ID, priceVariable, readConfig, safeReturnPath, validateCatalogue } from './config.js';
 
 /** @typedef {import('./store.js').Store} Store */
 /** @typedef {import('./google.js').Fetch} Fetch */
 /** @typedef {import('./google.js').KeySource} KeySource */
 /** @typedef {import('./stripe.js').PriceInfo} PriceInfo */
 /** @typedef {import('./stripe.js').StripeEvent} StripeEvent */
+/** @typedef {import('./config.js').Product} Product */
+/** @typedef {import('./config.js').Catalogue} Catalogue */
+/** @typedef {import('./config.js').SignIn} SignIn */
+/** @typedef {import('./config.js').Shop} Shop */
+/** @typedef {import('./config.js').Config} Config */
 /** @typedef {(level: 'warn' | 'error', message: string) => void} Log */
 
-/**
- * @typedef {object} Product
- * @property {string} id matches ^[a-z][a-z0-9-]{0,31}$; its price is STRIPE_PRICE_<ID>
- * @property {string} name
- * @property {string} description
- * @property {'payment' | 'subscription'} mode
- * @property {string} grants the entitlement id a purchase unlocks
- */
-
-/**
- * @typedef {object} Catalogue
- * @property {string} app matches ^[a-z][a-z0-9-]{0,31}$; names the cookies and tags the payments
- * @property {string} name
- * @property {readonly Product[]} products
- */
-
-/**
- * @typedef {object} SignIn
- * @property {URL} appUrl
- * @property {Uint8Array} secret SESSION_SECRET's bytes
- * @property {string} clientId
- * @property {string} clientSecret
- */
-
-/**
- * @typedef {object} Shop
- * @property {string} key STRIPE_SECRET_KEY
- * @property {'live' | 'test'} mode told by the key's prefix
- * @property {string} webhookSecret
- * @property {Map<string, string>} prices product id → Stripe Price id
- */
-
-/**
- * @typedef {object} Config
- * @property {URL | null} appUrl
- * @property {SignIn | null} signIn
- * @property {Shop | null} shop
- * @property {'live' | 'test'} records the Stripe mode whose purchase records the kit reads and
- *   writes: the key's, or live when no well-formed key is set. A test-mode purchase is never
- *   read under a live key, and a test-mode customer id never sent to one.
- * @property {string | null} warning one line naming what is missing or malformed, never a value
- */
-
-export const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const USER = /^google:[A-Za-z0-9_-]{1,255}$/;
 const CUSTOMER = /^cus_[0-9A-Za-z_]{1,250}$/;
 const PAYMENT_INTENT = /^pi_[0-9A-Za-z_]{1,250}$/;
@@ -82,6 +49,25 @@ const OAUTH_TTL = 600;
 const EVENT_TTL = 30 * 86_400;
 /** How long a Checkout Session stays payable: Stripe's floor is 30 minutes, its default 24 hours. */
 const CHECKOUT_TTL = 3_600;
+/**
+ * Presses that read the same state within one of these windows of the clock send Stripe the
+ * same request under the same Idempotency-Key, and are given one Checkout Session wherever they
+ * are handled (see POST checkout). A session expires CHECKOUT_TTL after its window began, so 55
+ * to 60 minutes after it is made.
+ */
+const CHECKOUT_WINDOW_MS = 5 * 60_000;
+/**
+ * How long a session whose delayed payment failed is remembered as failed: past a window (and KV's
+ * minute), after which no press can share the key of the press that made it.
+ */
+const FAILED_TTL = 3_600;
+/**
+ * How long the Checkout Session a visitor was last given for a product is remembered, so that a
+ * second Buy reaches it, or the purchase made with it, rather than a second session: as long as
+ * Stripe keeps an event, which outlasts its retries and a delayed payment (sooner only when that
+ * payment fails, or the account is deleted).
+ */
+const PENDING_TTL = 30 * 86_400;
 const TOMBSTONE_TTL = 90 * 86_400;
 const RATE_TTL = 2 * 3_600;
 const HOUR_MS = 3_600_000;
@@ -90,248 +76,15 @@ const PORTALS_PER_HOUR = 10;
 const MAX_SESSIONS = 20;
 const WEBHOOK_CAP = 512 * 1024;
 const REQUEST_CAP = 4 * 1024;
-const MAX_RETURN = 1024;
 const PRICE_TTL_MS = HOUR_MS;
 const PRICE_RETRY_MS = 60_000;
+/** How long `GET config` waits for a price Stripe has not given yet before answering without it. */
+const PRICE_WAIT_MS = 2_500;
 const ACTIVE = new Set(['active', 'trialing']);
 /** A subscription in one of these is over: Stripe changes nothing about it afterwards. */
 const TERMINAL = new Set(['canceled', 'incomplete_expired']);
 /** @type {readonly ('live' | 'test')[]} */
 const MODES = Object.freeze(['live', 'test']);
-
-// ---------------------------------------------------------------------------------------------
-// The catalogue and the environment
-
-/**
- * @param {unknown} value
- * @param {number} min
- * @param {number} max
- * @returns {value is string}
- */
-function isText(value, min, max) {
-  if (typeof value !== 'string' || value.length < min || value.length > max) return false;
-  for (let i = 0; i < value.length; i += 1) {
-    const code = value.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f) return false;
-  }
-  return true;
-}
-
-/**
- * @param {Record<string, unknown>} value
- * @param {string[]} allowed
- * @param {string} where
- */
-function onlyKeys(value, allowed, where) {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) throw new TypeError(`catalogue: ${where} has an unknown field "${key}"`);
-  }
-}
-
-/**
- * Checks the app's catalogue and returns a frozen copy. A malformed catalogue is a
- * programming error, so it throws (TypeError) rather than turning a feature off.
- * @param {unknown} input
- * @returns {Catalogue}
- */
-export function validateCatalogue(input) {
-  if (!isRecord(input)) throw new TypeError('catalogue: an object { app, name, products }');
-  onlyKeys(input, ['app', 'name', 'products'], 'the catalogue');
-  if (typeof input.app !== 'string' || !ID.test(input.app)) throw new TypeError('catalogue: app must match ^[a-z][a-z0-9-]{0,31}$');
-  if (!isText(input.name, 1, 100)) throw new TypeError('catalogue: name is 1-100 characters of text');
-  if (!Array.isArray(input.products) || input.products.length > 50) throw new TypeError('catalogue: products is an array of at most 50');
-  const seen = new Set();
-  /** @type {Product[]} */
-  const products = input.products.map((raw, index) => {
-    const where = `products[${index}]`;
-    if (!isRecord(raw)) throw new TypeError(`catalogue: ${where} is an object`);
-    onlyKeys(raw, ['id', 'name', 'description', 'mode', 'grants'], where);
-    const { id, name, description, mode, grants } = raw;
-    if (typeof id !== 'string' || !ID.test(id)) throw new TypeError(`catalogue: ${where}.id must match ^[a-z][a-z0-9-]{0,31}$`);
-    if (seen.has(id)) throw new TypeError(`catalogue: ${where}.id "${id}" appears twice`);
-    seen.add(id);
-    if (!isText(name, 1, 100)) throw new TypeError(`catalogue: ${where}.name is 1-100 characters of text`);
-    if (!isText(description, 0, 500)) throw new TypeError(`catalogue: ${where}.description is at most 500 characters of text`);
-    if (mode !== 'payment' && mode !== 'subscription') throw new TypeError(`catalogue: ${where}.mode is "payment" or "subscription"`);
-    if (typeof grants !== 'string' || !ID.test(grants)) throw new TypeError(`catalogue: ${where}.grants must match ^[a-z][a-z0-9-]{0,31}$`);
-    return Object.freeze({ id, name, description, mode, grants });
-  });
-  return Object.freeze({ app: input.app, name: input.name, products: Object.freeze(products) });
-}
-
-/**
- * The environment variable that holds a product's Stripe Price id: `pro` → STRIPE_PRICE_PRO,
- * `pack-a` → STRIPE_PRICE_PACK_A. Product ids have no underscore, so no two collide.
- * @param {string} productId
- * @returns {string}
- */
-export function priceVariable(productId) {
-  return `STRIPE_PRICE_${productId.toUpperCase().replaceAll('-', '_')}`;
-}
-
-/**
- * APP_URL as a URL when it is canonical, ends in `/`, carries no query, fragment or
- * credentials, and is https (http only for localhost, where browsers still keep Secure cookies).
- * @param {string} text
- * @returns {URL | null}
- */
-function parseAppUrl(text) {
-  let url;
-  try {
-    url = new globalThis.URL(text);
-  } catch {
-    return null;
-  }
-  if (url.href !== text || !url.pathname.endsWith('/') || url.search || url.hash || url.username || url.password) return null;
-  const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) return null;
-  return url;
-}
-
-const SIGN_IN_VARIABLES = ['APP_URL', 'SESSION_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'];
-const SHOP_VARIABLES = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'];
-
-/**
- * Reads the environment into what is on and what is off. A feature is on only when
- * everything it needs is present and well formed: sign-in needs APP_URL, SESSION_SECRET and
- * both Google values (and a store); the shop needs sign-in, the Stripe key, the webhook
- * secret and a price for at least one product. A partial configuration produces one warning
- * naming what is missing or malformed, never a value; no configuration at all produces none.
- * @param {Record<string, unknown>} env
- * @param {Catalogue} catalogue
- * @param {{ store: boolean }} has
- * @returns {Config}
- */
-export function readConfig(env, catalogue, has) {
-  /** @param {string} name */
-  const raw = (name) => {
-    const value = Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined;
-    return typeof value === 'string' && value !== '' ? value : undefined;
-  };
-  /** @type {string[]} */
-  const missing = [];
-  /** @type {string[]} */
-  const malformed = [];
-  /**
-   * @template T
-   * @param {string} name
-   * @param {(value: string) => T | null} parse
-   * @returns {T | null}
-   */
-  const read = (name, parse) => {
-    const value = raw(name);
-    if (value === undefined) {
-      missing.push(name);
-      return null;
-    }
-    const parsed = parse(value);
-    if (parsed === null) malformed.push(name);
-    return parsed;
-  };
-  const appUrl = read('APP_URL', parseAppUrl);
-  const secret = read('SESSION_SECRET', (value) => {
-    const bytes = fromBase64url(value);
-    return bytes && bytes.length >= 32 ? bytes : null;
-  });
-  const clientId = read('GOOGLE_CLIENT_ID', (value) => (/^[0-9A-Za-z_.-]{1,200}\.apps\.googleusercontent\.com$/.test(value) ? value : null));
-  const clientSecret = read('GOOGLE_CLIENT_SECRET', (value) => (/^[\x21-\x7e]{10,200}$/.test(value) ? value : null));
-  const signInProblems = [...missing.map((n) => `missing ${n}`), ...malformed.map((n) => `malformed ${n}`)];
-  if (!has.store) signInProblems.push('no store (KIT_STORE)');
-  const signInTouched = SIGN_IN_VARIABLES.some((name) => raw(name) !== undefined);
-  /** @type {SignIn | null} */
-  const signIn = appUrl && secret && clientId && clientSecret && has.store ? { appUrl, secret, clientId, clientSecret } : null;
-
-  missing.length = 0;
-  malformed.length = 0;
-  const key = read('STRIPE_SECRET_KEY', (value) => (keyMode(value) ? value : null));
-  const webhookSecret = read('STRIPE_WEBHOOK_SECRET', (value) => (/^whsec_[0-9A-Za-z+/=_-]{10,200}$/.test(value) ? value : null));
-  /** @type {Map<string, string>} */
-  const prices = new Map();
-  /** @type {string[]} */
-  const unpriced = [];
-  for (const product of catalogue.products) {
-    const name = priceVariable(product.id);
-    const value = raw(name);
-    if (value !== undefined && /^price_[0-9A-Za-z_]{1,200}$/.test(value)) prices.set(product.id, value);
-    else {
-      if (value !== undefined) malformed.push(name);
-      unpriced.push(product.id);
-    }
-  }
-  const shopTouched =
-    SHOP_VARIABLES.some((name) => raw(name) !== undefined) || catalogue.products.some((product) => raw(priceVariable(product.id)) !== undefined);
-  const mode = key ? keyMode(key) : null;
-  /** @type {Shop | null} */
-  const shop = signIn && key && mode && webhookSecret && prices.size > 0 ? { key, mode, webhookSecret, prices } : null;
-  const records = mode ?? 'live';
-
-  /** @type {string[]} */
-  const notes = [];
-  if (signInTouched && !signIn) notes.push(`sign-in is off (${signInProblems.join(', ')})`);
-  if (shopTouched && !shop) {
-    const why = [...missing.map((n) => `missing ${n}`), ...malformed.map((n) => `malformed ${n}`)];
-    if (!signIn) why.unshift('sign-in is off');
-    if (prices.size === 0) why.push(catalogue.products.length ? 'no product has a price' : 'the catalogue sells nothing');
-    notes.push(`the shop is off (${[...new Set(why)].join(', ')})`);
-  } else if (shop && unpriced.length > 0) {
-    const bad = malformed.filter((name) => name.startsWith('STRIPE_PRICE_'));
-    notes.push(`not sold, no usable price: ${unpriced.join(', ')}${bad.length ? ` (malformed ${bad.join(', ')})` : ''}`);
-  }
-  return { appUrl, signIn, shop, records, warning: notes.length ? `kit (${catalogue.app}): ${notes.join('; ')}` : null };
-}
-
-/**
- * Where to send the browser after signing in: a path under the site, or the site's root.
- * The path must start with exactly one `/`, hold no backslash and no control character, both
- * as given and once percent-decoded, resolve (dot segments and all) under APP_URL's path, and
- * not lie under `api/`. Anything else becomes the root. A string that passes the first checks
- * is a path-absolute reference, which the URL parser resolves against the base's host whatever
- * follows (the URL parser drops tabs and newlines, which is why control characters are refused
- * first), and the caller writes APP_URL's origin in front of what this returns: so there is no
- * separate origin check to make.
- *
- * The result travels in the sealed oauth cookie, and a browser drops a cookie over 4096 bytes,
- * which fails the sign-in. The URL parser percent-encodes what it serialises, so one character
- * of the input can become up to twelve bytes of the result (`é` is `%C3%A9`): it is the result,
- * not the input, whose length is held to MAX_RETURN. At that length the cookie stays near 1,700
- * bytes.
- * @param {unknown} value
- * @param {URL} appUrl
- * @returns {string}
- */
-export function safeReturnPath(value, appUrl) {
-  const root = appUrl.pathname;
-  if (typeof value !== 'string' || !isPlainPath(value)) return root;
-  let decoded;
-  try {
-    decoded = decodeURIComponent(value);
-  } catch {
-    return root;
-  }
-  if (!isPlainPath(decoded)) return root;
-  let target;
-  try {
-    target = new globalThis.URL(value, appUrl.origin);
-  } catch {
-    return root;
-  }
-  if (!target.pathname.startsWith(root) || target.pathname.startsWith(`${root}api/`)) return root;
-  const path = `${target.pathname}${target.search}${target.hash}`;
-  return path.length > MAX_RETURN ? root : path;
-}
-
-/**
- * @param {string} path
- * @returns {boolean}
- */
-function isPlainPath(path) {
-  if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) return false;
-  for (let i = 0; i < path.length; i += 1) {
-    const code = path.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f) return false;
-  }
-  return true;
-}
 
 // ---------------------------------------------------------------------------------------------
 // Records
@@ -410,6 +163,21 @@ function stillCharging(raw, user) {
 }
 
 /**
+ * The entitlement of a subscription of `user` that will still charge them, or null. Buy asks this
+ * of a subscription that grants nothing now (past due, unpaid, paused or incomplete: once its
+ * invoice is paid, or it is resumed, it is active again and charges every period), and refuses
+ * that entitlement while there is one (409 `subscription_active`): a second purchase sold beside
+ * it would charge too once it recovers.
+ * @param {string} name the record's name
+ * @param {unknown} raw the record
+ * @param {string} user
+ * @returns {string | null}
+ */
+function charging(name, raw, user) {
+  return name.startsWith('subscription:') && stillCharging(raw, user) ? matching(recordOf(raw).grants, ID) : null;
+}
+
+/**
  * What a subscription record remembers of the subscription's own state: its status, the time
  * of the event that set it, and whether it ends with the current period.
  * @param {Record<string, unknown>} held
@@ -424,10 +192,12 @@ function subscriptionState(held) {
 }
 
 /**
- * How long the state of a subscription whose account was deleted is kept: with no expiry
- * while the subscription can still change (one set to end with its period may run on for a
- * year, and its last event must still find it), and for as long as Stripe may resend an older
- * event once it is over.
+ * How long a subscription's record is kept, whether it names its account or (once that was
+ * deleted) no one: with no expiry while the subscription can still change (one set to end with
+ * its period may run on for a year, and its last event must still find it), and for as long as
+ * Stripe may resend an older event once it is over. So a record that names no one does not
+ * outlive the subscription by more than that, and neither does one that names an account, a
+ * record written back after the account's deletion included (see Limits in the README).
  * @param {Record<string, unknown>} state
  * @returns {{ ttl?: number }}
  */
@@ -472,11 +242,20 @@ function errorName(error) {
  * @property {() => number} [now] milliseconds since the epoch
  * @property {Log} [log]
  * @property {number} [timeoutMs] per upstream call; 10 s
+ * @property {number} [priceWaitMs] how long `GET config` waits for a price lookup before it
+ *   answers without that price (the lookup goes on, and fills the price in); 2.5 s
+ */
+
+/**
+ * @typedef {object} HostContext what the host offers the request beyond the request itself
+ * @property {(promise: Promise<unknown>) => void} [waitUntil] keeps work the answer does not wait
+ *   for alive after the answer has gone (Cloudflare's `context.waitUntil`); a long-lived process
+ *   needs none
  */
 
 /**
  * @typedef {object} App
- * @property {(request: Request) => Promise<Response>} handle never throws
+ * @property {(request: Request, context?: HostContext) => Promise<Response>} handle never throws
  * @property {{ signIn: boolean, shop: boolean }} features
  */
 
@@ -493,6 +272,7 @@ export function createApp(options) {
   const now = options.now ?? (() => Date.now());
   const log = options.log ?? (() => {});
   const timeoutMs = options.timeoutMs ?? 10_000;
+  const priceWaitMs = options.priceWaitMs ?? PRICE_WAIT_MS;
   const store = options.store ?? null;
   const config = readConfig(options.env ?? {}, catalogue, { store: store !== null });
   if (config.warning) log('warn', config.warning);
@@ -500,7 +280,10 @@ export function createApp(options) {
   const base = config.appUrl ? config.appUrl.pathname : null;
   const router = createRouter();
 
-  router.on('GET', 'config', () => getConfig());
+  /** The host's `waitUntil` for each request handle() was given one with. */
+  /** @type {WeakMap<Request, (promise: Promise<unknown>) => void>} */
+  const waitUntils = new WeakMap();
+  router.on('GET', 'config', (request) => getConfig(waitUntils.get(request)));
 
   /** @type {Map<string, Promise<unknown>>} */
   const locks = new Map();
@@ -530,6 +313,29 @@ export function createApp(options) {
     }
   };
 
+  /**
+   * Runs `task` holding every lock in `keys`, taken one after another in sorted order. Locks are
+   * taken in one order everywhere: a pending checkout's marker, then a user record, then purchase
+   * records, and no task holding a purchase record's lock waits for another lock. So no two tasks
+   * can each hold what the other waits for.
+   * @template T
+   * @param {string[]} keys
+   * @param {() => Promise<T>} task
+   * @returns {Promise<T>}
+   */
+  const lockAll = (keys, task) => {
+    const sorted = [...new Set(keys)].sort();
+    /**
+     * @param {number} index
+     * @returns {Promise<T>}
+     */
+    const from = (index) => {
+      const key = sorted[index];
+      return key === undefined ? task() : lock(key, () => from(index + 1));
+    };
+    return from(0);
+  };
+
   // Every key the kit writes starts with the app's id, so two apps given one KV namespace (or
   // one data directory) keep apart; a purchase record also carries the Stripe mode it was
   // written under, so a test-mode purchase is not read under a live key.
@@ -549,10 +355,18 @@ export function createApp(options) {
    * @param {'live' | 'test'} [mode]
    */
   const userKey = (user, mode) => shopKey(`user:${user}`, mode);
+  /**
+   * The Checkout Session a visitor was given for a product, while its webhook has not said how
+   * it ended (see POST checkout).
+   * @param {string} user
+   * @param {string} product
+   * @param {'live' | 'test'} [mode]
+   */
+  const pendingKey = (user, product, mode) => shopKey(`checkout:${user}:${product}`, mode);
 
   /** @type {Map<string, { value: PriceInfo | null, known: boolean, until: number }>} */
   const priceCache = new Map();
-  /** @type {Map<string, Promise<{ value: PriceInfo | null, known: boolean }>>} */
+  /** @type {Map<string, { lookup: Promise<{ value: PriceInfo | null, known: boolean }>, since: number }>} */
   const pricePending = new Map();
 
   const shop = config.shop;
@@ -561,6 +375,9 @@ export function createApp(options) {
    * `known` says whether Stripe answered: a price it answered with that is not usable (no fixed
    * amount, inactive, or not of the product's kind) means the product is not sold, while a
    * lookup that failed lists the product without a price and leaves the judgement to Checkout.
+   * Requests made while a lookup is under way share it. One that has run past its own time
+   * limit is not waited on again: a new one starts, so a lookup the host stopped short (a
+   * Function's work cut off once its answer went out) cannot hold every later one.
    * @param {Product} product
    * @returns {Promise<{ value: PriceInfo | null, known: boolean }>}
    */
@@ -570,8 +387,9 @@ export function createApp(options) {
     const cached = priceCache.get(product.id);
     if (cached && cached.until > now()) return cached;
     let pending = pricePending.get(product.id);
-    if (!pending) {
-      pending = (async () => {
+    if (!pending || pending.since + timeoutMs < now()) {
+      const since = now();
+      const lookup = (async () => {
         try {
           const value = await getPrice({ fetch, key: shop.key, price, mode: product.mode, timeoutMs });
           if (!value) log('warn', `kit (${catalogue.app}): ${product.id} is not sold: its price is not usable (inactive, no fixed amount, or not ${product.mode === 'payment' ? 'one-time' : 'recurring'})`);
@@ -586,24 +404,44 @@ export function createApp(options) {
           pricePending.delete(product.id);
         }
       })();
+      pending = { lookup, since };
       pricePending.set(product.id, pending);
     }
-    return pending;
+    return pending.lookup;
   };
 
-  async function getConfig() {
+  /**
+   * The products on sale, each with its price when Stripe has given it. The page asks this
+   * once, before it draws, so it does not wait on Stripe for longer than priceWaitMs: a price
+   * not known by then is left out of this answer, which is then not to be cached, and its lookup
+   * goes on (under the host's `waitUntil`, where it has one) and fills the price in for the next.
+   * @param {(promise: Promise<unknown>) => void} [waitUntil]
+   */
+  async function getConfig(waitUntil) {
     /** @type {Record<string, unknown>[]} */
     const listed = [];
+    let late = false;
     if (shop) {
       const sold = catalogue.products.filter((product) => shop.prices.has(product.id));
-      const found = await Promise.all(sold.map(priceOf));
+      const lookups = sold.map(priceOf);
+      /** @type {({ value: PriceInfo | null, known: boolean } | null)[]} */
+      let found;
+      if (sold.every((product) => (priceCache.get(product.id)?.until ?? 0) > now())) found = await Promise.all(lookups);
+      else {
+        const signal = timeoutSignal(priceWaitMs);
+        /** @type {Promise<null>} */
+        const timer = new Promise((resolve) => signal.addEventListener('abort', () => resolve(null), { once: true }));
+        found = await Promise.all(lookups.map((lookup) => Promise.race([lookup, timer])));
+        late = found.includes(null);
+        if (late && waitUntil) waitUntil(Promise.allSettled(lookups));
+      }
       sold.forEach((product, index) => {
         const price = found[index];
         if (price?.known && !price.value) return;
         listed.push({ id: product.id, name: product.name, description: product.description, mode: product.mode, ...(price?.value ? { price: price.value } : {}) });
       });
     }
-    return json(200, { auth: { google: config.signIn !== null }, shop: { products: listed } }, { cache: 'public, max-age=60' });
+    return json(200, { auth: { google: config.signIn !== null }, shop: { products: listed } }, { cache: late ? 'no-store' : 'public, max-age=60' });
   }
 
   if (config.signIn && store) {
@@ -761,9 +599,10 @@ export function createApp(options) {
     // -- what a user holds, read from the purchase records
 
     /**
-     * The user's record in the configured mode and the entitlements its purchase records give.
+     * The user's record in the configured mode, the entitlements its purchase records give, and
+     * those of its subscriptions that will still charge (see charging).
      * @param {string} user
-     * @returns {Promise<{ record: UserRecord, held: Set<string> }>}
+     * @returns {Promise<{ record: UserRecord, held: Set<string>, charged: Set<string> }>}
      */
     const holdings = async (user) => {
       const record = readUserRecord(await store.get(userKey(user)));
@@ -771,11 +610,15 @@ export function createApp(options) {
       const found = await Promise.all(names.map((name) => store.get(shopKey(name))));
       /** @type {Set<string>} */
       const held = new Set();
+      /** @type {Set<string>} */
+      const charged = new Set();
       names.forEach((name, index) => {
         const grants = liveGrant(name, found[index], user);
         if (grants) held.add(grants);
+        const charges = charging(name, found[index], user);
+        if (charges) charged.add(charges);
       });
-      return { record, held };
+      return { record, held, charged };
     };
 
     // -- sign-in
@@ -842,42 +685,62 @@ export function createApp(options) {
       const session = await currentSession(request);
       if (!session) return failure(401, 'unauthorized');
       const user = session.user;
-      return lock(userKey(user), async () => {
-        // A subscription that will charge again keeps the only copy of the Stripe customer,
-        // which is what Manage subscription needs: the visitor cancels first (at the period's
-        // end is enough), then deletes. Both Stripe modes are checked, as both are deleted: a
-        // namespace shared by Preview (a test key) and Production (a live key) holds both.
-        /** @type {Map<'live' | 'test', UserRecord>} */
-        const records = new Map();
-        for (const mode of MODES) records.set(mode, readUserRecord(await store.get(userKey(user, mode))));
-        for (const [mode, record] of records) {
-          for (const name of record.refs) {
-            if (name.startsWith('subscription:') && stillCharging(await store.get(shopKey(name, mode)), user)) return failure(409, 'subscription_active');
-          }
-        }
-        const index = readSessionIndex(await store.get(indexKey(user)));
-        for (const hash of new Set([...index.keys(), session.hash])) await store.delete(sessionKey(hash));
-        await store.delete(indexKey(user));
-        for (const [mode, record] of records) {
-          for (const name of record.refs) {
-            const key = shopKey(name, mode);
-            const held = recordOf(await store.get(key));
-            if (held.user !== user) continue;
-            // A subscription keeps its own state and the time of the deletion, with no one named
-            // (its Stripe customer neither), until it is over and then for as long as Stripe may
-            // resend an older event about it. Only an event created after the deletion that says
-            // it will charge again, with no end date, makes it theirs again (onSubscription): no
-            // event about it from before the deletion, retried by Stripe in whatever order, and
-            // not its last one, can grant it again or write the account back.
-            if (name.startsWith('subscription:')) {
-              const state = { ...subscriptionState(held), deletedAt: Math.floor(now() / 1000) };
-              await store.put(key, state, keptFor(state));
-            } else await store.delete(key);
-          }
-          await store.delete(userKey(user, mode));
-        }
-        return noContent({ cookies: [clearCookie(sessionCookie)] });
-      });
+      // Every record this deletes or rewrites is read and written under its own lock, as the
+      // webhook writes it, in the one order locks are taken: the pending checkouts' markers, the
+      // user record, then its purchase records. Within one process (the Node adapter, one
+      // isolate) an event about one of them handled meanwhile is applied wholly before the
+      // deletion reads that record or wholly after it was rewritten naming no one, and the
+      // webhook adds a purchase to the user record only while the purchase still names the user
+      // (addRef), so it cannot write the account back. No lock spans two isolates or two KV
+      // locations: a Buy handled elsewhere at the same moment is not waited for (see Deleting an
+      // account and Limits in the README). The markers are those of every product the catalogue
+      // lists, sold or not, and with the shop off too: one written while the shop was on names
+      // the account.
+      const markers = MODES.flatMap((mode) => catalogue.products.map((product) => pendingKey(user, product.id, mode)));
+      return lockAll(markers, () =>
+        lock(userKey(user), async () => {
+          /** @type {Map<'live' | 'test', UserRecord>} */
+          const records = new Map();
+          for (const mode of MODES) records.set(mode, readUserRecord(await store.get(userKey(user, mode))));
+          const purchases = [...records].flatMap(([mode, record]) => [...record.refs].map((name) => shopKey(name, mode)));
+          return lockAll(purchases, async () => {
+            // A subscription that will charge again keeps the only copy of the Stripe customer,
+            // which is what Manage subscription needs: the visitor cancels first (at the period's
+            // end is enough), then deletes. Both Stripe modes are checked, as both are deleted: a
+            // namespace shared by Preview (a test key) and Production (a live key) holds both.
+            for (const [mode, record] of records) {
+              for (const name of record.refs) {
+                if (name.startsWith('subscription:') && stillCharging(await store.get(shopKey(name, mode)), user)) return failure(409, 'subscription_active');
+              }
+            }
+            const index = readSessionIndex(await store.get(indexKey(user)));
+            for (const hash of new Set([...index.keys(), session.hash])) await store.delete(sessionKey(hash));
+            await store.delete(indexKey(user));
+            for (const [mode, record] of records) {
+              for (const name of record.refs) {
+                const key = shopKey(name, mode);
+                const held = recordOf(await store.get(key));
+                if (held.user !== user) continue;
+                // A subscription keeps its own state and the time of the deletion, with no one
+                // named (its Stripe customer neither), until it is over and then for as long as
+                // Stripe may resend an older event about it. Only an event created after the
+                // deletion that says it will charge again, with no end date, makes it theirs again
+                // (onSubscription): no event about it from before the deletion, retried by Stripe
+                // in whatever order, and not its last one, can grant it again or write the account
+                // back.
+                if (name.startsWith('subscription:')) {
+                  const state = { ...subscriptionState(held), deletedAt: Math.floor(now() / 1000) };
+                  await store.put(key, state, keptFor(state));
+                } else await store.delete(key);
+              }
+              await store.delete(userKey(user, mode));
+            }
+            // The Checkout Sessions remembered for a second Buy name the account in their keys.
+            for (const key of markers) if ((await store.get(key)) !== null) await store.delete(key);
+            return noContent({ cookies: [clearCookie(sessionCookie)] });
+          });
+        }),
+      );
     });
 
     if (shop) {
@@ -906,6 +769,107 @@ export function createApp(options) {
           return null;
         });
 
+      /**
+       * Whether Stripe refused a call because it no longer knows the customer sent with it (one
+       * deleted in the dashboard, or with all of test mode's data).
+       * @param {unknown} error
+       * @returns {boolean}
+       */
+      const missingCustomer = (error) => error instanceof StripeError && error.status === 400 && error.code === 'resource_missing' && error.param === 'customer';
+
+      /**
+       * What the owner's log says of a failed Stripe call: its status, and Stripe's error code
+       * and the parameter it names when it gave them (identifiers, never its message).
+       * @param {StripeError} error
+       * @returns {string}
+       */
+      const stripeFailure = (error) => `Stripe ${error.status}${error.code ? ` ${error.code}` : ''}${error.param ? ` on ${error.param}` : ''}`;
+
+      /**
+       * Forgets a Stripe customer Stripe no longer knows: from the user record, and from every
+       * subscription record of the user that names it, each under its own lock (the user
+       * record's first, as everywhere). Kept, it was sent with every later Checkout and portal
+       * session, and each failed. The log names the field, never the customer.
+       * @param {string} user
+       * @param {string} customer
+       */
+      const forgetCustomer = (user, customer) =>
+        lock(userKey(user), async () => {
+          log('warn', `kit (${catalogue.app}): Stripe no longer knows the customer kept for an account (customer): it is forgotten, and the next checkout lets Stripe make a new one`);
+          const record = readUserRecord(await store.get(userKey(user)));
+          if (record.customer === customer) {
+            record.customer = null;
+            await store.put(userKey(user), writeUserRecord(record));
+          }
+          for (const name of [...record.refs].filter((ref) => ref.startsWith('subscription:')).sort()) {
+            const key = shopKey(name);
+            await lock(key, async () => {
+              const held = { ...recordOf(await store.get(key)) };
+              if (held.customer !== customer) return;
+              delete held.customer;
+              await store.put(key, held, keptFor(held));
+            });
+          }
+        });
+
+      /**
+       * The Checkout Session a visitor was last given for a product, as its marker holds it: its
+       * id, and its address, which is null once its delayed payment failed (see settlePending).
+       * @param {unknown} raw
+       * @returns {{ id: string, url: string | null } | null}
+       */
+      const readPending = (raw) => {
+        const held = recordOf(raw);
+        const id = matching(held.id, CHECKOUT_SESSION);
+        if (!id) return null;
+        if (held.failed === true) return { id, url: null };
+        return typeof held.url === 'string' && held.url.startsWith('https://') ? { id, url: held.url } : null;
+      };
+
+      /**
+       * What Stripe says of a Checkout Session the kit made: null when it has no such session
+       * (nothing can be paid on it).
+       * @param {string} id
+       */
+      const checkoutState = async (id) => {
+        try {
+          return await getCheckoutSession({ fetch, key: shop.key, id, timeoutMs });
+        } catch (error) {
+          if (error instanceof StripeError && error.status === 404) return null;
+          throw error;
+        }
+      };
+
+      /**
+       * Why a Buy is refused once the Checkout Session the visitor was given for `product` has
+       * been paid (Stripe reports it complete), decided from the purchase record its webhook
+       * writes, under the name the webhook gives it: `payment_pending` while there is none (the
+       * webhook has not arrived, or not where this request is handled), `already_owned` while it
+       * grants, `subscription_active` while its subscription grants nothing and will still
+       * charge; null once it was refunded, disputed or has ended, when a new session may be made.
+       * The marker is kept after the webhook for this reason: on KV the location handling the
+       * visitor's requests can serve, for a minute, a user record its page read before the
+       * webhook, which does not list the purchase; this record does, from the first time that
+       * location reads it after the webhook (a read made earlier, by a Buy pressed before the
+       * webhook, is served for a minute too, and answers payment_pending meanwhile). No answer
+       * here is a sale.
+       * @param {string} user
+       * @param {Product} product
+       * @param {string} id the session's id
+       * @param {{ paymentIntent: string | null, subscription: string | null }} state what Stripe says of it
+       * @returns {Promise<'payment_pending' | 'already_owned' | 'subscription_active' | null>}
+       */
+      const afterPayment = async (user, product, id, state) => {
+        const ref = product.mode === 'subscription' ? matching(state.subscription, SUBSCRIPTION) : (matching(state.paymentIntent, PAYMENT_INTENT) ?? id);
+        if (!ref) return 'payment_pending';
+        const name = `${product.mode === 'subscription' ? 'subscription' : 'payment'}:${ref}`;
+        const raw = await store.get(shopKey(name));
+        if (raw === null) return 'payment_pending';
+        if (liveGrant(name, raw, user)) return 'already_owned';
+        if (charging(name, raw, user)) return 'subscription_active';
+        return null;
+      };
+
       router.on('POST', 'checkout', async (request) => {
         const refused = csrfRefusal(request, origin, { body: true });
         if (refused) return refused;
@@ -918,33 +882,87 @@ export function createApp(options) {
         if (!product || !price) return failure(404, 'not_found');
         const priced = await priceOf(product);
         if (priced.known && !priced.value) return failure(404, 'not_found');
-        const { record, held } = await holdings(session.user);
-        if (held.has(product.grants)) return failure(409, 'already_owned');
-        const hour = Math.floor(now() / HOUR_MS);
-        const limited = await rateLimited(shopKey(`ratelimit:${session.user}:${hour}`), CHECKOUTS_PER_HOUR);
-        if (limited) return limited;
-        try {
-          const created = await createCheckoutSession({
-            fetch,
-            key: shop.key,
-            app: catalogue.app,
-            mode: product.mode,
-            price,
-            user: session.user,
-            product: product.id,
-            ...(record.customer ? { customer: record.customer } : {}),
-            successUrl: `${signIn.appUrl.href}?purchase=success`,
-            cancelUrl: `${signIn.appUrl.href}?purchase=cancelled`,
-            expiresAt: Math.floor(now() / 1000) + CHECKOUT_TTL,
-            idempotencyKey: `kit-checkout-${randomId(24)}`,
-            timeoutMs,
-          });
-          return json(200, { url: created.url });
-        } catch (error) {
-          if (!(error instanceof StripeError)) throw error;
-          log('error', `kit (${catalogue.app}): checkout failed (Stripe ${error.status})`);
-          return failure(502, 'upstream_unavailable');
-        }
+        const user = session.user;
+        const marker = pendingKey(user, product.id);
+        // One Checkout Session per visitor and product: a second Buy (another tab, the page back
+        // from Checkout before the webhook, a reload) reaches the same session while it is open,
+        // and once it is paid is refused for as long as the purchase made with it is still
+        // pending, granting or charging (afterPayment), so the two cannot both be paid. A new
+        // session is made only once the last one expired unpaid, its delayed payment failed, or
+        // what it bought was refunded or has ended. Under the marker's lock, so two presses at
+        // once in one process make one session; presses this lock does not reach (another
+        // isolate, another location) share the session through the Idempotency-Key below.
+        return lock(marker, async () => {
+          // The sign-in was read before the body and the price; a deletion that ran meanwhile
+          // ended it, and has let go of every marker, so nothing is made for that account.
+          if ((await currentSession(request))?.user !== user) return failure(401, 'unauthorized');
+          const { record, held, charged } = await holdings(user);
+          if (held.has(product.grants)) return failure(409, 'already_owned');
+          // Not held, yet a subscription to it will still charge (past due, unpaid, paused):
+          // once paid or resumed it is active again, so Manage subscription, not a second sale.
+          if (charged.has(product.grants)) return failure(409, 'subscription_active');
+          const pending = readPending(await store.get(marker));
+          const hour = Math.floor(now() / HOUR_MS);
+          const limited = await rateLimited(shopKey(`ratelimit:${user}:${hour}`), CHECKOUTS_PER_HOUR);
+          if (limited) return limited;
+          try {
+            if (pending?.url) {
+              const state = await checkoutState(pending.id);
+              if (state?.status === 'open') return json(200, { url: state.url ?? pending.url });
+              if (state?.status === 'complete') {
+                const refused = await afterPayment(user, product, pending.id, state);
+                if (refused) return failure(409, refused);
+              }
+            }
+            // The request and its Idempotency-Key are a function of what this press read: the
+            // sign-in, the session remembered (or none), the customer, and the window of the
+            // clock it falls in (whose start fixes expires_at, so the request is the same). Every
+            // press that read the same within one window, wherever it is handled, sends Stripe
+            // the same, and Stripe gives each the session the first one made (or, while that one
+            // is still being made, refuses it: a 502, and no session). Stripe keeps a key's answer
+            // for a day at least, an error included, so a press that read the same is answered the
+            // same until the window ends. A deleted account's next sign-in, or a session whose
+            // delayed payment failed (kept as failed), is a state no earlier press read.
+            const opened = Math.floor(now() / CHECKOUT_WINDOW_MS) * CHECKOUT_WINDOW_MS;
+            /** @param {string | null} customer */
+            const create = async (customer) => {
+              const sale = {
+                app: catalogue.app,
+                mode: product.mode,
+                price,
+                user,
+                product: product.id,
+                ...(customer ? { customer } : {}),
+                successUrl: `${signIn.appUrl.href}?purchase=success`,
+                cancelUrl: `${signIn.appUrl.href}?purchase=cancelled`,
+                expiresAt: opened / 1000 + CHECKOUT_TTL,
+              };
+              const read = JSON.stringify([shop.mode, session.hash, pending?.id ?? null, sale]);
+              return createCheckoutSession({ fetch, key: shop.key, ...sale, idempotencyKey: `kit-checkout-${base64url(await sha256(read))}`, timeoutMs });
+            };
+            let created;
+            try {
+              created = await create(record.customer);
+            } catch (error) {
+              // A customer Stripe no longer knows is forgotten, and the session made without it.
+              if (!record.customer || !missingCustomer(error)) throw error;
+              await forgetCustomer(user, record.customer);
+              created = await create(null);
+            }
+            try {
+              await store.put(marker, { id: created.id, url: created.url }, { ttl: PENDING_TTL });
+            } catch (error) {
+              // KV takes one write a second to a key: a press handled at once by another isolate,
+              // and given this same session, may have written it first. Anything else is a 500.
+              if (readPending(await store.get(marker))?.id !== created.id) throw error;
+            }
+            return json(200, { url: created.url });
+          } catch (error) {
+            if (!(error instanceof StripeError)) throw error;
+            log('error', `kit (${catalogue.app}): checkout failed (${stripeFailure(error)})`);
+            return failure(502, 'upstream_unavailable');
+          }
+        });
       });
 
       /**
@@ -952,9 +970,12 @@ export function createApp(options) {
        * user's subscriptions that will still charge them, else the one the user record keeps.
        * Checkout makes a new customer when it is given none, and the user record learns the
        * customer only from a webhook, so two subscriptions bought before the first one's webhook
-       * arrived (two Buy tabs) belong to two customers, and a portal shows one customer's. Each
-       * still charging is reached in turn, as the one before it is set to end, so the 409 from
-       * Delete account always has a Manage subscription that reaches a subscription it counted.
+       * arrived belong to two customers (two Buy presses in two locations within KV's minute, or
+       * one bought from the dashboard), and a portal shows one customer's. Each still charging in
+       * the configured Stripe mode is reached in turn, as the one before it is set to end, so a
+       * 409 from Delete account for a subscription of that mode has a Manage subscription that
+       * reaches it. One of the other mode, on a namespace Preview and Production share, is
+       * reached from the deployment whose key is of its mode (README, Deleting an account).
        * @param {string} user
        * @returns {Promise<string | null>}
        */
@@ -990,7 +1011,13 @@ export function createApp(options) {
           return json(200, { url: created.url });
         } catch (error) {
           if (!(error instanceof StripeError)) throw error;
-          log('error', `kit (${catalogue.app}): portal failed (Stripe ${error.status})`);
+          // A customer Stripe no longer knows has no portal: it is forgotten, and the visitor
+          // told there is nothing to manage (the next press reaches any other there is).
+          if (missingCustomer(error)) {
+            await forgetCustomer(session.user, customer);
+            return failure(404, 'not_found');
+          }
+          log('error', `kit (${catalogue.app}): portal failed (${stripeFailure(error)})`);
           return failure(502, 'upstream_unavailable');
         }
       });
@@ -1019,12 +1046,38 @@ export function createApp(options) {
        */
       const addRef = (user, name, customer) =>
         lock(userKey(user), async () => {
+          // Taken once the purchase record's own lock is released, never inside it (see lockAll),
+          // so it reads the record again: a deletion that ran in between rewrote it naming no one,
+          // and the account is not written back.
+          if (recordOf(await store.get(shopKey(name))).user !== user) return;
           const record = readUserRecord(await store.get(userKey(user)));
           if (record.refs.has(name) && (customer === null || record.customer !== null)) return;
           record.refs.add(name);
           if (customer && !record.customer) record.customer = customer;
           await store.put(userKey(user), writeUserRecord(record));
         });
+
+      /**
+       * Lets go of the Checkout Session remembered for a visitor's product (POST checkout) once
+       * its delayed payment failed: nothing was paid, and the visitor may pay another way. Its id
+       * is kept, marked failed, for FAILED_TTL: the next Buy then reads a state no earlier press
+       * read, and makes a new session under a key of its own, where reading none would share the
+       * key of the press that made this one, and Stripe would give this one back. Only the
+       * session the marker names: a newer one is still the visitor's to pay. A session that was
+       * paid stays remembered (see afterPayment).
+       * @param {string} user
+       * @param {string} product
+       * @param {unknown} id the session's id
+       */
+      const settlePending = async (user, product, id) => {
+        const failed = matching(id, CHECKOUT_SESSION);
+        if (failed === null) return;
+        const marker = pendingKey(user, product);
+        await lock(marker, async () => {
+          const held = readPending(await store.get(marker));
+          if (held?.id === failed) await store.put(marker, { id: failed, failed: true }, { ttl: FAILED_TTL });
+        });
+      };
 
       /** @param {Record<string, unknown>} session a checkout.session */
       const onCheckoutPaid = async (session) => {
@@ -1039,18 +1092,21 @@ export function createApp(options) {
         if (!id) return;
         const name = `${product.mode === 'subscription' ? 'subscription' : 'payment'}:${id}`;
         const key = shopKey(name);
-        await lock(key, async () => {
+        const recorded = await lock(key, async () => {
           const raw = await store.get(key);
           const held = recordOf(raw);
           // A record that names someone else, or a subscription kept after its account was
           // deleted, is left as it is.
-          if (raw !== null && held.user !== user && (held.user !== undefined || product.mode === 'subscription')) return;
+          if (raw !== null && held.user !== user && (held.user !== undefined || product.mode === 'subscription')) return false;
           // A subscription keeps its own customer, which the user record may not hold (see
           // portalCustomer).
           const kept = product.mode === 'subscription' ? { ...(customer ? { customer } : {}), ...subscriptionState(held) } : held.revoked === true ? { revoked: true } : {};
-          await store.put(key, { user, product: product.id, grants: product.grants, ...kept });
-          await addRef(user, name, customer);
+          await store.put(key, { user, product: product.id, grants: product.grants, ...kept }, product.mode === 'subscription' ? keptFor(kept) : undefined);
+          return true;
         });
+        if (recorded) await addRef(user, name, customer);
+        // The session the visitor was given stays remembered: a second Buy reads this record
+        // through it (afterPayment), wherever the user record has not caught up yet.
       };
 
       /**
@@ -1085,15 +1141,15 @@ export function createApp(options) {
         if (meta.app !== undefined && meta.app !== catalogue.app) return;
         const name = `subscription:${id}`;
         const key = shopKey(name);
-        await lock(key, async () => {
+        const owned = await lock(key, async () => {
           const raw = await store.get(key);
           const held = recordOf(raw);
           const heldStatus = typeof held.status === 'string' ? held.status : null;
           const heldAt = typeof held.eventAt === 'number' ? held.eventAt : null;
           // Once cancelled or expired, nothing about a subscription changes again.
-          if (heldStatus !== null && TERMINAL.has(heldStatus)) return;
+          if (heldStatus !== null && TERMINAL.has(heldStatus)) return null;
           // An older event is stale; one from the same second does not undo a revoke.
-          if (heldAt !== null && (created < heldAt || (created === heldAt && ACTIVE.has(status) && heldStatus !== null && !ACTIVE.has(heldStatus)))) return;
+          if (heldAt !== null && (created < heldAt || (created === heldAt && ACTIVE.has(status) && heldStatus !== null && !ACTIVE.has(heldStatus)))) return null;
           const state = { status, eventAt: created, ...(subscription.cancel_at_period_end === true ? { ending: true } : {}) };
           const target = purchaseOf(meta);
           const named = target && target.product.mode === 'subscription' ? { user: target.user, product: target.product.id, grants: target.product.grants } : null;
@@ -1121,18 +1177,21 @@ export function createApp(options) {
               else if (charges) log('warn', `kit (${catalogue.app}): subscription ${id} of a deleted account may charge again, and no event says it was renewed after the deletion: check it in the Stripe dashboard, and cancel or refund it if it will`);
               // Its account was deleted: keep the state, name no one.
               await store.put(key, deletedAt === null ? state : { ...state, deletedAt }, keptFor(state));
-              return;
+              return null;
             }
           }
           const heldUser = matching(held.user, USER);
           const heldGrants = matching(held.grants, ID);
           const owner = heldUser && heldGrants ? { user: heldUser, product: held.product, grants: heldGrants } : named;
-          if (!owner) return;
+          if (!owner) return null;
           // The subscription's own customer: two bought before the first one's webhook arrived
-          // belong to two (see portalCustomer).
-          await store.put(key, { ...owner, ...(customer ? { customer } : {}), ...state });
-          await addRef(owner.user, name, customer);
+          // belong to two (see portalCustomer). Once it is over, the record goes when a nameless
+          // one would (keptFor).
+          await store.put(key, { ...owner, ...(customer ? { customer } : {}), ...state }, keptFor(state));
+          return { user: owner.user, customer };
         });
+        // The user record's lock is taken once this record's is released (see addRef).
+        if (owned) await addRef(owned.user, name, owned.customer);
       };
 
       /**
@@ -1156,8 +1215,13 @@ export function createApp(options) {
           case 'checkout.session.async_payment_succeeded':
             await onCheckoutPaid(object);
             return true;
-          case 'checkout.session.async_payment_failed':
+          case 'checkout.session.async_payment_failed': {
+            // Nothing was paid: the session remembered for a second Buy is let go (kept as failed),
+            // so the visitor can pay another way.
+            const target = purchaseOf(object.metadata);
+            if (target) await settlePending(target.user, target.product.id, object.id);
             return true;
+          }
           case 'charge.refunded':
             if (fullyRefunded(object)) await onPaymentReversed(object.payment_intent);
             return true;
@@ -1201,8 +1265,9 @@ export function createApp(options) {
 
   return {
     features: { signIn: config.signIn !== null && store !== null, shop: config.shop !== null && store !== null },
-    async handle(request) {
+    async handle(request, context) {
       try {
+        if (context && typeof context.waitUntil === 'function') waitUntils.set(request, context.waitUntil);
         const url = new globalThis.URL(request.url);
         const route = routeOf(url.pathname);
         if (route === null) return failure(404, 'not_found');

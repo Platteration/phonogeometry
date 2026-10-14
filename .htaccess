@@ -5,6 +5,8 @@
 #
 # Apache reads this file only where `AllowOverride All` lets it, and it needs mod_rewrite and
 # mod_headers, which a stock Debian or Ubuntu Apache does not load (`a2enmod rewrite headers`).
+# `ServerTokens Prod`, which keeps the version out of the Server header, is server configuration
+# too: this file cannot set it.
 # Nothing here is wrapped in <IfModule>: wrapped, a missing module skipped its block without a
 # word, and a checkout served by mistake published .git/ and .certs/key.pem with none of the
 # headers below. Unwrapped, a missing module is a 500 for every request and a line in the

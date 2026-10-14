@@ -11,17 +11,55 @@ export const API_BASE = 'https://api.stripe.com/v1';
 /** Seconds a webhook's timestamp may be from now, either way. */
 export const TOLERANCE_SECONDS = 300;
 const RESPONSE_CAP = 1024 * 1024;
+/** What is read of an error's body for its code and param; the rest is not needed. */
+const ERROR_CAP = 64 * 1024;
 const MAX_SIGNATURES = 8;
+/** Stripe's error codes are identifiers (`resource_missing`), as are the params they name. */
+const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const ERROR_PARAM = /^[a-z][a-z0-9_]{0,63}(?:\[[a-z0-9_]{1,64}\]){0,4}$/;
 
 /** @typedef {(input: string, init?: RequestInit) => Promise<Response>} Fetch */
 
-/** A failed Stripe call. `status` is Stripe's HTTP status, or 0 when none arrived. */
+/**
+ * A failed Stripe call. `status` is Stripe's HTTP status, or 0 when none arrived. `code` and
+ * `param` are Stripe's error code (`resource_missing`) and the parameter it names (`customer`),
+ * when its answer carried them as identifiers, else null: they say what failed and may be
+ * logged, unlike Stripe's message, which is never read.
+ */
 export class StripeError extends Error {
-  /** @param {number} status */
-  constructor(status) {
+  /**
+   * @param {number} status
+   * @param {{ code?: string | null, param?: string | null }} [detail]
+   */
+  constructor(status, detail = {}) {
     super(`stripe call failed (${status})`);
     this.name = 'StripeError';
     this.status = status;
+    /** @type {string | null} */
+    this.code = detail.code ?? null;
+    /** @type {string | null} */
+    this.param = detail.param ?? null;
+  }
+}
+
+/**
+ * Stripe's error code and the parameter it names, from the body of an answer that is not a
+ * success, when they are identifiers; nothing else of the body is kept.
+ * @param {Response} response
+ * @returns {Promise<{ code: string | null, param: string | null }>}
+ */
+async function errorDetail(response) {
+  try {
+    const text = fromUtf8(await readBytes(response, ERROR_CAP));
+    const data = text === null ? null : JSON.parse(text);
+    const error = isRecord(data) && isRecord(data.error) ? data.error : {};
+    return {
+      code: typeof error.code === 'string' && ERROR_CODE.test(error.code) ? error.code : null,
+      param: typeof error.param === 'string' && ERROR_PARAM.test(error.param) ? error.param : null,
+    };
+  } catch {
+    await response.body?.cancel().catch(() => {});
+    return { code: null, param: null };
   }
 }
 
@@ -84,10 +122,7 @@ async function request({ fetch, key, method, path, params, idempotencyKey, timeo
       throw new StripeError(0);
     }
   }
-  if (response.status !== 200) {
-    await response.body?.cancel().catch(() => {});
-    throw new StripeError(response.status);
-  }
+  if (response.status !== 200) throw new StripeError(response.status, await errorDetail(response));
   let data;
   try {
     const text = fromUtf8(await readBytes(response, RESPONSE_CAP));
@@ -161,6 +196,26 @@ export async function createCheckoutSession(options) {
   const data = await request({ fetch, key, method: 'POST', path: '/checkout/sessions', params, idempotencyKey, timeoutMs });
   if (typeof data.id !== 'string' || typeof data.url !== 'string' || !data.url.startsWith('https://')) throw new StripeError(200);
   return { id: data.id, url: data.url };
+}
+
+/**
+ * A Checkout Session's state: `open` (it can still be paid), `complete` (it was paid, or a
+ * delayed payment is on its way) or `expired` (it can no longer be paid), its URL while it is
+ * open, and the ids of the PaymentIntent (payment mode) and the Subscription (subscription
+ * mode) it made, when Stripe names them: what the webhook records the purchase under.
+ * @param {{ fetch: Fetch, key: string, id: string, timeoutMs?: number }} options
+ * @returns {Promise<{ status: 'open' | 'complete' | 'expired', url: string | null, paymentIntent: string | null, subscription: string | null }>}
+ */
+export async function getCheckoutSession({ fetch, key, id, timeoutMs = 10_000 }) {
+  const data = await request({ fetch, key, method: 'GET', path: `/checkout/sessions/${encodeURIComponent(id)}`, timeoutMs });
+  const status = data.status;
+  if (status !== 'open' && status !== 'complete' && status !== 'expired') throw new StripeError(200);
+  return {
+    status,
+    url: typeof data.url === 'string' && data.url.startsWith('https://') ? data.url : null,
+    paymentIntent: typeof data.payment_intent === 'string' ? data.payment_intent : null,
+    subscription: typeof data.subscription === 'string' ? data.subscription : null,
+  };
 }
 
 /**

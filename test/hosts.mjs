@@ -12,7 +12,9 @@
 // checkout's files planted in it (a server pointed at the wrong folder), and checks that every
 // file of the site answers 200, typed, with every header _headers gives it; that every other
 // address answers the site's own not-found page with the same headers; and that plain http is
-// redirected to https. Apache is run over TLS, and behind a TLS-terminating proxy as well, which
+// redirected to https, and that no answer's Server header names a version (nginx's
+// `server_tokens off`, and the `ServerTokens Prod` the README gives Apache's server
+// configuration). Apache is run over TLS, and behind a TLS-terminating proxy as well, which
 // is what the redirect's X-Forwarded-Proto condition is for.
 //
 // The site's API (server/start.mjs, sign in with Google and "Support this app") runs here too,
@@ -175,6 +177,14 @@ async function serves(label, origin, headers = {}, { forbidden = [], paths = SER
   check(`${label}: a checkout's files, the host's settings, the folders and a missing page answer the site's not-found page, with the same headers`, leaked.length === 0, `${REFUSED.length} paths${leaked.length ? `; wrong: ${leaked.join(' | ')}` : ''}`);
 }
 
+/** The site's page and its not-found page say which server answered and nothing more: no
+ *  version, no system (nginx's `server_tokens off`, the README's `ServerTokens Prod`). */
+async function namesNoVersion(label, origin, name) {
+  const seen = [];
+  for (const p of ['/', '/no/such/page']) seen.push(`${p} ${(await get(`${origin}${p}`)).headers.server}`);
+  check(`${label}: the Server header names no version`, seen.every((s) => s.endsWith(` ${name}`)), seen.join(', '));
+}
+
 /** One request with a method and a body, for the API's POST. */
 const send = (url, { method = 'GET', headers = {}, body } = {}) => new Promise((resolve, reject) => {
   const req = (url.startsWith('https:') ? https : http).request(url, { method, headers, rejectUnauthorized: false, agent: false }, (res) => {
@@ -302,6 +312,7 @@ async function nginx() {
   const origin = `https://127.0.0.1:${tls}`;
   await waitFor(`${origin}/`, log);
   await serves('nginx', origin, {}, { paths: STATIC });
+  await namesNoVersion('nginx', origin, 'nginx');
   await proxies('nginx', origin);
   const redirect = await get(`http://127.0.0.1:${plain}/a/b?x=1`);
   check('nginx: plain http answers a 301 to the same address over https', redirect.status === 301 && redirect.headers.location === 'https://127.0.0.1/a/b?x=1', `${redirect.status} ${redirect.headers.location}`);
@@ -348,6 +359,8 @@ async function apache() {
     `ErrorLog ${path.join(adir, 'error.log')}`,
     'LogLevel warn',
     'ServerName localhost',
+    // the README's line for the server configuration: the Server header names no version
+    'ServerTokens Prod',
     ...(asRoot ? ['User www-data', 'Group www-data'] : []),
     ...APACHE_MODULES.map((m) => `LoadModule ${m}_module ${path.join(MODULES, `mod_${m}.so`)}`),
     'TypesConfig /etc/mime.types',
@@ -390,6 +403,7 @@ async function apache() {
   await waitFor(`https://127.0.0.1:${tls}/`, log);
 
   await serves('Apache over https', `https://127.0.0.1:${tls}`, {}, { forbidden: ['/.htaccess'] });
+  await namesNoVersion('Apache', `https://127.0.0.1:${tls}`, 'Apache');
   // Behind a proxy that ended TLS: this Apache speaks plain http, and the proxy says the visitor
   // used https, so the redirect lets the request through and the site is served from here.
   await serves('Apache behind a TLS-terminating proxy', `http://127.0.0.1:${plain}`, { 'X-Forwarded-Proto': 'https' }, { forbidden: ['/.htaccess'] });

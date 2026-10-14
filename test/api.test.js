@@ -281,6 +281,34 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
     assert.ok(fs.readdirSync(dataDir).every((name) => /^[0-9a-f]{64}\.json$/.test(name)));
   });
 
+  // The page holds Buy back after Checkout (src/account.js, README "Between paying and the
+  // webhook"), but another tab, or a reload once that hold has lapsed, offers it again: the API
+  // answers that press itself. What the README says of it, held here with this app's catalogue.
+  test('a second Buy before the webhook is given the same Checkout, and once it is paid is refused, never a second payment', async () => {
+    const visitor = browser();
+    await visitor.signIn({ sub: '3003', email: 'lin@example.com' });
+    const buy = () => visitor.send('POST', 'api/checkout', { json: { product: 'supporter' } });
+    const first = await buy();
+    assert.equal(first.status, 200);
+    const { url } = await first.json();
+    const made = fakes.sessions.size;
+    const again = await buy();
+    assert.equal(again.status, 200);
+    assert.equal((await again.json()).url, url, 'while it is open, the same Checkout is given again');
+    const event = fakes.paid(url);
+    const paid = await buy();
+    assert.equal(paid.status, 409, 'once it is paid and before the webhook, a press is refused');
+    assert.deepEqual(await paid.json(), { error: 'payment_pending' });
+    assert.equal(fakes.sessions.size, made, 'and no second Checkout was made');
+    assert.deepEqual((await visitor.me()).entitlements, [], 'refusing grants nothing: only the webhook does');
+    assert.equal((await webhook(signedDelivery(event))).status, 200);
+    assert.deepEqual((await visitor.me()).entitlements, ['supporter']);
+    const owned = await buy();
+    assert.equal(owned.status, 409);
+    assert.deepEqual(await owned.json(), { error: 'already_owned' });
+    assert.deepEqual(fakes.unexpected, []);
+  });
+
   test('refuses a write from another origin, and one without an Origin', async () => {
     const visitor = browser();
     await visitor.signIn({ sub: '2002', email: 'grace@example.com' });

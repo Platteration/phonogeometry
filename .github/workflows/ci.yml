@@ -24,12 +24,12 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
 
@@ -41,9 +41,10 @@ jobs:
       # installed after the unit suite has run on the bare checkout, without touching
       # package.json. --ignore-scripts so that no install script runs: 1.64.0's tree has none
       # (playwright and playwright-core, no optional dependency), and one a later pin brings in
-      # is not a decision to delegate. 1.61.0 is the first release with a Chromium build for
-      # Ubuntu 26.04, which ubuntu-latest becomes from 2026-10-19: on an older one the install
-      # below fails there (test/ci.test.js holds the pin to it).
+      # is not a decision to delegate. The job runs on a named release, ubuntu-24.04, never
+      # ubuntu-latest, which GitHub moves to Ubuntu 26.04 from 2026-10-19 (CONVENTIONS.md, "CI");
+      # test/ci.test.js holds the pin to a release with a Chromium build for the one runs-on
+      # names (1.45.0 or later for 24.04, 1.61.0 or later for 26.04).
       - run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.64.0
 
       - run: npx playwright install --with-deps chromium
@@ -56,12 +57,12 @@ jobs:
           REQUIRE_BROWSER: '1'
 
   vendor:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
 

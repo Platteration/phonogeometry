@@ -410,12 +410,19 @@ The same gaps recur in every repository; fixing them once as a template and copy
 
 Recorded after the security audit and the cohesion pass; the numbering above is kept
 because other findings in this file cite it. The items are not edited: this file is a
-record of what was found, and this block is a record of what was done about it. The
-block is shared text, the same in every repository and pinned by the conventions test;
-a note about one repository belongs in that repository's own status section.
+record of what was found, and this block is a record of what was done about it, each later
+step added under its item with its date. The block is shared text, the same in every
+repository and pinned by the conventions test; a note about one repository belongs in that
+repository's own status section.
 
 1. Done: every workflow sets `permissions: contents: read` (security audit).
 2. Done: every `uses:` is pinned to a commit SHA with the tag in a comment (security audit).
+   Raised (2026-10-14): every official action is at a major whose runtime is Node 24
+   (checkout and setup-node v5, setup-python v6, upload-artifact v6, upload-pages-artifact
+   and deploy-pages v5, or later); GitHub warned on every run that the v4 pins ran on Node 20.
+   The test reads the major from the tag comment and refuses every commit a tag of a Node 20
+   major points at, whatever its comment says; third-party actions follow the same rule by
+   hand (collectcollect's Docker actions moved to their Node 24 majors).
 3. Done: `.github/dependabot.yml` in every repository that has a manifest (tradetrade gets
    one with its first code).
 4. Open, by decision: no `npm audit` step. Unactioned advisories only turn CI red;
@@ -434,11 +441,27 @@ a note about one repository belongs in that repository's own status section.
    which GitHub runs from the default branch only: once `main` is the default (item 10),
    an advisory published against an unchanged tree turns `audit` red within a week
    without a push, and Dependabot's security updates reach this code as well.
+   Changed (2026-10-14): from October the audit job was red in all seven Expo repositories
+   on braces `<=3.0.3` (GHSA-vfj7-8cjw-p6xm) and node-forge `<=1.4.0` (GHSA-86w9-cpqp-85rv),
+   which arrive through Expo's and React Native's build and test tooling (micromatch in Metro's,
+   Expo's and Jest's file maps; `@expo/cli`'s code signing) and had no patched release, so a
+   red audit there was no news. The job now runs the shared gate, `.github/audit/npm-audit.mjs`:
+   the same audit, failing on everything at high or above except what
+   `.github/audit/accepted.json` accepts, each entry at the severity npm rated it, with a reason,
+   a route from every direct dependency that reaches the package and an expiry at most 90 days
+   out, and failing again once a release outside the range is published in the major installed.
+   The seven Expo repositories accept those two; the other npm repositories accept nothing.
 5. Done: `npm ci || npm install` appears nowhere.
 6. Half: abientnoiser and simplacad have lockfiles and `npm ci`; selfreportle and
    phonogeometry deliberately keep none and install Playwright at a pinned version with
    `--no-save --no-package-lock --ignore-scripts` (there are no dependencies to track).
+   (2026-10-14) The two carry the shared kit whole, declarations included, without
+   TypeScript: a declaration file is no longer a source the type check must reach.
 7. Not verifiable from the tree: a repository setting, still recommended.
+   (2026-10-14) So is private vulnerability reporting, which SECURITY.md asks reporters to
+   use and which is off in every repository checked; until the owner turns it on, each
+   security.txt lists the issues page, after the form where it lists one, and SECURITY.md says
+   to open an issue that says only that there is a report.
 8. Done: every repository has an MIT `LICENSE` and a `license` field.
 9. Done: every repository has `SECURITY.md`.
 10. Decided (2026-09-23): `main` is created from `claude/repo-review-security-baiyud`
@@ -447,18 +470,36 @@ a note about one repository belongs in that repository's own status section.
     settings for the owner, which the tree can neither make nor check. Until `main` is the
     default, nothing runs CI's weekly schedule, since GitHub runs a schedule only from the
     default branch's workflow file, and a Pages workflow can be run by hand only where the
-    default branch already carries one.
+    default branch already carries one. (2026-10-14) Each security.txt names SECURITY.md on
+    `main`, the branch the site is published from.
 11. Done (2026-09-23): drawdraw is on Expo SDK 57 like the other Expo apps, and in
     TypeScript like them: strict, with `noUncheckedIndexedAccess`, and `npm run typecheck`
     in `check` and in CI. Node is pinned to 22 in every npm repository through `.nvmrc`.
 12. Open: a shared package is presented, not implemented. The twins' configuration and
     settings changes land as one identical diff in both, and each carries the other's tests.
+13. Done (2026-10-14): every job of every workflow runs on `ubuntu-24.04`, named, where it
+    ran on `ubuntu-latest`, which is Ubuntu 26.04 from 2026-10-19 and has no Chromium for
+    Playwright 1.56 there. Moving the image is one change, in every repository at once.
+14. Done (2026-10-14): every app is also a website, with its hosting layer, a measured
+    policy written in every place a host reads it, a safety net, and host configs the shared
+    test holds to what a real nginx and Apache were found to need (CONVENTIONS.md,
+    "Website"). tradetrade, an app on Next since, sets its headers in code and has its
+    security.txt; the rest of the layer comes with its next change.
+15. Done (2026-10-14): sign in with Google, a Stripe Checkout shop and its signed webhook,
+    from one shared kit, web first and off until the owner sets the keys. Thirteen
+    repositories carry the kit byte for byte, at the hash the conventions test pins, and run
+    its self-test in `npm test`; randostats ports the Google part to Python; tradetrade
+    carries none.
+16. Done (2026-10-14): AGENTS.md's working rules are one text in every repository, pinned
+    by hash like this block.
 
 The workflow below is the shape every npm repository's `ci.yml` now follows; the exact
 form is in `CONVENTIONS.md`. The audit is not a step of `check` but a job of its own
-(item 4), `check` also runs `npm run test:conventions`, and the triggers add
-`workflow_dispatch` and a weekly `schedule:`. The Python repository runs `ruff check .`,
-`pytest -q` and its own conventions test.
+(item 4) that runs the shared gate, `check` also runs `npm run test:conventions`, every job
+runs on `ubuntu-24.04` (item 13), every official action is pinned at its Node 24 major, not
+the v4 the sample shows (item 2), and the triggers add `workflow_dispatch` and a weekly
+`schedule:`. The Python repository runs `ruff check .`, `pytest -q` and its own conventions
+test.
 
 ### A hardened workflow to copy
 

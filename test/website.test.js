@@ -400,6 +400,7 @@ test('Apache: the settings never make a module optional, and the README says whi
   const readme = read('README.md').replace(/\s+/g, ' ');
   assert.match(readme, /`AllowOverride All`/, 'README says Apache reads .htaccess only under AllowOverride All');
   assert.match(readme, /`a2enmod rewrite headers`/, 'README names the modules a stock Apache lacks');
+  assert.match(readme, /`ServerTokens Prod` in the server configuration/, 'README says the server configuration sets ServerTokens Prod, which no .htaccess can');
 });
 
 /** deploy/nginx.conf's top-level server blocks, each as its text between the braces. */

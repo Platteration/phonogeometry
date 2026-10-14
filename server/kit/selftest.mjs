@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import process from 'node:process';
 import { after, before, describe, test } from 'node:test';
-import { clearTimeout, setImmediate, setTimeout } from 'node:timers';
+import { clearInterval, clearTimeout, setImmediate, setInterval, setTimeout } from 'node:timers';
 import { fileURLToPath } from 'node:url';
 
 import { createApp, priceVariable, safeReturnPath, validateCatalogue } from './app.js';
@@ -26,7 +26,7 @@ import { AuthError, createKeyCache, verifyIdToken } from './google.js';
 import { API_HEADERS, parseCookies, readBytes } from './http.js';
 import { createFileStore, serve } from './node.js';
 import { createMemoryStore } from './store.js';
-import { flattenParams, parseSignatureHeader, verifySignature } from './stripe.js';
+import { StripeError, flattenParams, getPrice, parseSignatureHeader, verifySignature } from './stripe.js';
 
 // The web globals this file uses, named once, so that it lints under a configuration that
 // declares no environment at all (the strictest in the fleet).
@@ -174,11 +174,52 @@ function createWorld() {
     pricesFail: false,
     /** @type {'ok' | 'error' | 'drop-once'} */
     checkout: 'ok',
+    /** @type {{ status: number, error: Record<string, unknown> } | null} what Stripe refuses the next Checkout Session with */
+    checkoutRefusal: null,
     /** @type {URLSearchParams[]} */
     sessions: [],
     /** @type {URLSearchParams[]} */
     portals: [],
     sessionSeq: 0,
+    /**
+     * Each Checkout Session made, as Stripe keeps it: open until paid (`pay`) or past its
+     * expires_at, when Stripe reports it expired; once paid, the PaymentIntent (payment mode) or
+     * the Subscription (subscription mode) it made.
+     * @type {Map<string, { status: 'open' | 'complete', expires: number, url: string, mode: string, paymentIntent: string | null, subscription: string | null }>}
+     */
+    checkouts: new Map(),
+    /** @type {'ok' | number} how Stripe answers a Checkout Session lookup: as it keeps them, or with that status */
+    sessionLookup: /** @type {'ok' | number} */ ('ok'),
+    /**
+     * What Stripe keeps of each Checkout Session request by its Idempotency-Key (its "Idempotent
+     * requests"): the request's form and, once it has run, its answer, an error included, which a
+     * later request with that key and the same form is given again (`replays` counts them). While
+     * the first is still running, another with its key is refused, 409 `idempotency_key_in_use`,
+     * and nothing of that is kept; another form under a key already used is refused, 400.
+     * @type {Map<string, { form: string, answer: { status: number, body: Record<string, unknown> } | null }>}
+     */
+    idempotency: new Map(),
+    replays: 0,
+    /** @type {(() => Promise<unknown>) | null} awaited while a Checkout Session is being made, once its key is taken */
+    making: /** @type {(() => Promise<unknown>) | null} */ (null),
+    /** @type {Set<string>} customers Stripe no longer knows (deleted in the dashboard) */
+    deletedCustomers: new Set(),
+    /**
+     * The visitor pays the Checkout Session the kit last gave them (or `id`): cs_test_<n> makes
+     * pi_test<n> (payment mode) or sub_test<n> (subscription mode), unless `made` says otherwise
+     * (a free checkout makes no PaymentIntent).
+     * @param {string} [id]
+     * @param {{ paymentIntent?: string | null, subscription?: string | null }} [made]
+     */
+    pay: (id, made = {}) => {
+      const key = id ?? [...world.checkouts.keys()].at(-1) ?? '';
+      const session = world.checkouts.get(key);
+      assert.ok(session && session.status === 'open', 'an open session to pay');
+      session.status = 'complete';
+      const n = key.slice('cs_test_'.length);
+      session.paymentIntent = made.paymentIntent !== undefined ? made.paymentIntent : session.mode === 'payment' ? `pi_test${n}` : null;
+      session.subscription = made.subscription !== undefined ? made.subscription : session.mode === 'subscription' ? `sub_test${n}` : null;
+    },
     now: () => world.clock,
     /**
      * @param {string} url
@@ -259,31 +300,85 @@ function createWorld() {
   }
 
   /**
+   * Stripe making a Checkout Session from `body`: its answer, as kept under the request's key.
+   * @param {string | null} customer
+   * @param {string} body
+   * @returns {{ status: number, body: Record<string, unknown> }}
+   */
+  function makeCheckout(customer, body) {
+    if (world.checkout === 'error') return { status: 500, body: { error: { message: 'CANARY-checkout-text' } } };
+    if (customer && world.deletedCustomers.has(customer)) {
+      return { status: 400, body: { error: { type: 'invalid_request_error', code: 'resource_missing', param: 'customer', message: `CANARY-No such customer: '${customer}'` } } };
+    }
+    if (world.checkoutRefusal) return { status: world.checkoutRefusal.status, body: { error: world.checkoutRefusal.error } };
+    const form = new URLSearchParams(body);
+    world.sessions.push(form);
+    world.sessionSeq += 1;
+    const id = `cs_test_${world.sessionSeq}`;
+    const url = `https://checkout.stripe.com/c/pay/${id}`;
+    world.checkouts.set(id, { status: 'open', expires: Number(form.get('expires_at')) * 1000, url, mode: form.get('mode') ?? '', paymentIntent: null, subscription: null });
+    return { status: 200, body: { id, object: 'checkout.session', url } };
+  }
+
+  /**
    * @param {string} path
    * @param {string} method
    * @param {Headers} headers
    * @param {string} body
-   * @returns {Response}
+   * @returns {Promise<Response>}
    */
-  function stripeEndpoint(path, method, headers, body) {
+  async function stripeEndpoint(path, method, headers, body) {
     if (method === 'GET' && path.startsWith('/prices/')) {
       if (world.pricesFail) return Response.json({ error: { message: 'CANARY-price-text' } }, { status: 500 });
       const price = world.prices.get(decodeURIComponent(path.slice('/prices/'.length)));
       return price ? Response.json(price) : Response.json({ error: { message: 'No such price' } }, { status: 404 });
     }
+    // What Stripe answers a call naming a customer it does not know (deleted, or of the other mode).
+    const customer = method === 'POST' ? new URLSearchParams(body).get('customer') : null;
+    const noSuchCustomer = () =>
+      Response.json({ error: { type: 'invalid_request_error', code: 'resource_missing', param: 'customer', message: `CANARY-No such customer: '${customer}'` } }, { status: 400 });
     if (method === 'POST' && path === '/checkout/sessions') {
       assert.equal(headers.get('content-type'), 'application/x-www-form-urlencoded');
-      assert.match(headers.get('idempotency-key') ?? '', /^kit-checkout-[A-Za-z0-9_-]{32}$/);
-      if (world.checkout === 'error') return Response.json({ error: { message: 'CANARY-checkout-text' } }, { status: 500 });
+      const key = headers.get('idempotency-key') ?? '';
+      assert.match(key, /^kit-checkout-[A-Za-z0-9_-]{43}$/);
       if (world.checkout === 'drop-once') {
+        // Lost on the way: Stripe never saw it, and keeps nothing under its key.
         world.checkout = 'ok';
         throw new TypeError('connection reset');
       }
-      world.sessions.push(new URLSearchParams(body));
-      world.sessionSeq += 1;
-      return Response.json({ id: `cs_test_${world.sessionSeq}`, object: 'checkout.session', url: `https://checkout.stripe.com/c/pay/cs_test_${world.sessionSeq}` });
+      const kept = world.idempotency.get(key);
+      if (kept) {
+        if (kept.form !== body) return Response.json({ error: { type: 'idempotency_error', message: 'CANARY-another request under this key' } }, { status: 400 });
+        if (!kept.answer) return Response.json({ error: { type: 'idempotency_error', code: 'idempotency_key_in_use', message: 'CANARY-in use' } }, { status: 409 });
+        world.replays += 1;
+        return Response.json(kept.answer.body, { status: kept.answer.status });
+      }
+      /** @type {{ form: string, answer: { status: number, body: Record<string, unknown> } | null }} */
+      const entry = { form: body, answer: null };
+      world.idempotency.set(key, entry);
+      if (world.making) await world.making();
+      entry.answer = makeCheckout(customer, body);
+      return Response.json(entry.answer.body, { status: entry.answer.status });
+    }
+    if (method === 'GET' && path.startsWith('/checkout/sessions/')) {
+      if (world.sessionLookup !== 'ok') return Response.json({ error: { message: 'CANARY-lookup-text' } }, { status: world.sessionLookup });
+      const id = decodeURIComponent(path.slice('/checkout/sessions/'.length));
+      const session = world.checkouts.get(id);
+      if (!session) return Response.json({ error: { type: 'invalid_request_error', code: 'resource_missing', param: 'id', message: 'No such checkout.session' } }, { status: 404 });
+      const status = session.status === 'open' && world.clock >= session.expires ? 'expired' : session.status;
+      return Response.json({
+        id,
+        object: 'checkout.session',
+        mode: session.mode,
+        status,
+        payment_status: status === 'complete' ? 'paid' : 'unpaid',
+        url: status === 'open' ? session.url : null,
+        payment_intent: session.paymentIntent,
+        subscription: session.subscription,
+      });
     }
     if (method === 'POST' && path === '/billing_portal/sessions') {
+      if (customer && world.deletedCustomers.has(customer)) return noSuchCustomer();
       world.portals.push(new URLSearchParams(body));
       return Response.json({ id: 'bps_1', object: 'billing_portal.session', url: 'https://billing.stripe.com/p/session/test_1' });
     }
@@ -589,6 +684,91 @@ function slowStore(inner) {
     },
   };
 }
+
+/**
+ * A store that holds one call (`op` on `key`, once armed) until `until` resolves, so that a
+ * deletion and a webhook can be interleaved exactly. `seen(op, key)` resolves when that call
+ * has been made and has returned.
+ * @param {import('./store.js').Store} inner
+ */
+function gatedStore(inner) {
+  /** @type {{ op: string, key: string, until: Promise<unknown> } | null} */
+  let gate = null;
+  /** @type {{ op: string, key: string, done: () => void }[]} */
+  const watches = [];
+  /**
+   * @param {string} op
+   * @param {string} key
+   */
+  const passed = (op, key) => {
+    for (const watch of watches.filter((w) => w.op === op && w.key === key)) {
+      watches.splice(watches.indexOf(watch), 1);
+      watch.done();
+    }
+  };
+  /**
+   * @param {string} op
+   * @param {string} key
+   */
+  const wait = async (op, key) => {
+    if (gate && gate.op === op && gate.key === key) {
+      const until = gate.until;
+      gate = null;
+      await until;
+    }
+  };
+  return {
+    /** @type {import('./store.js').Store} */
+    store: {
+      get: async (key) => {
+        await wait('get', key);
+        const value = await inner.get(key);
+        passed('get', key);
+        return value;
+      },
+      put: async (key, value, options) => {
+        await wait('put', key);
+        await inner.put(key, value, options);
+        passed('put', key);
+      },
+      delete: async (key) => {
+        await wait('delete', key);
+        await inner.delete(key);
+        passed('delete', key);
+      },
+    },
+    /**
+     * @param {string} op
+     * @param {string} key
+     * @param {Promise<unknown>} until
+     */
+    hold: (op, key, until) => {
+      gate = { op, key, until };
+    },
+    /**
+     * @param {string} op
+     * @param {string} key
+     * @returns {Promise<void>}
+     */
+    seen: (op, key) => new Promise((done) => watches.push({ op, key, done })),
+  };
+}
+
+/**
+ * `work`, or a failure after five seconds: a test that waits on the kit fails rather than hangs.
+ * @template T
+ * @param {Promise<T>} work
+ * @param {string} [stuckBecause]
+ * @returns {Promise<T>}
+ */
+const within = (work, stuckBecause = 'the deletion and the webhook wait on each other') => {
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+  const stuck = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(stuckBecause)), 5000);
+  });
+  return /** @type {Promise<T>} */ (Promise.race([work, stuck]).finally(() => clearTimeout(timer)));
+};
 
 /**
  * Workers KV across locations, as Cloudflare documents it: a write is seen at once where it was
@@ -1030,7 +1210,8 @@ describe('configuration', () => {
     const { app, logs } = makeApp(world, { store: null });
     assert.deepEqual(app.features, { signIn: false, shop: false });
     assert.deepEqual(await bodyOf(await browser(app).send('GET', 'api/config')), { auth: { google: false }, shop: { products: [] } });
-    assert.match(logs[0]?.message ?? '', /no store \(KIT_STORE\)/);
+    // A host that mounts createApp itself runs under Node, where the store is a directory.
+    assert.equal(logs[0]?.message, 'kit (demo): sign-in is off (no store (KIT_STORE on Cloudflare, KIT_DATA_DIR under Node)); the shop is off (sign-in is off)');
   });
 
   test('a price is cached for an hour; a failed lookup lists the product without one', async () => {
@@ -1053,6 +1234,85 @@ describe('configuration', () => {
     world.clock += 61_000;
     const back = await bodyOf(await client.send('GET', 'api/config'));
     assert.ok(back.shop.products.every((/** @type {any} */ p) => 'price' in p), 'retried after a minute');
+  });
+
+  test('config does not wait on a slow price: it answers within priceWaitMs without it, uncached, and the price follows', async () => {
+    // DD-INT-4: a cold process whose price lookup took 7 s answered config after 7 s, past the
+    // pages' 5 s first-frame limit, so the page drew the free build for the whole visit.
+    const world = createWorld();
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolve) => {
+      release = () => resolve(undefined);
+    });
+    /** @type {Promise<unknown>[]} */
+    const waited = [];
+    const app = createApp({
+      catalogue: CATALOGUE,
+      env: ENV,
+      store: createMemoryStore({ now: world.now }),
+      fetch: async (url, init) => {
+        if (url.endsWith('/prices/price_pro123')) await held;
+        return world.fetch(url, init);
+      },
+      now: world.now,
+      log: () => {},
+      priceWaitMs: 50,
+    });
+    const request = () => new Request(`${APP_URL}api/config`);
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), 2000);
+    });
+    const first = /** @type {Response | null} */ (await Promise.race([app.handle(request(), { waitUntil: (promise) => waited.push(promise) }), late]));
+    clearTimeout(timer);
+    try {
+      assert.ok(first, 'answered while the price lookup was still under way');
+      assert.deepEqual((await bodyOf(first)).shop.products.map((/** @type {any} */ p) => [p.id, p.price?.unit_amount ?? null]), [['pro', null], ['monthly', 199]]);
+      assert.equal(first.headers.get('cache-control'), 'no-store', 'an answer without a price is not kept');
+      assert.equal(waited.length, 1, "the lookup is handed to the host's waitUntil");
+    } finally {
+      release();
+    }
+    await Promise.all(waited);
+    const second = await app.handle(request());
+    assert.deepEqual((await bodyOf(second)).shop.products.map((/** @type {any} */ p) => [p.id, p.price?.unit_amount ?? null]), [['pro', 499], ['monthly', 199]]);
+    assert.equal(second.headers.get('cache-control'), 'public, max-age=60');
+    assert.equal(world.callsTo('https://api.stripe.com/v1/prices/price_pro123').length, 1, 'the one lookup filled it in');
+  });
+
+  test('a price lookup that never settles does not hold the next one: past its time limit a new one starts', async () => {
+    // A Function's work can be cut off once its answer has gone; a lookup it held then never
+    // settles, and every later config would have waited on it and gone without the price.
+    const world = createWorld();
+    let hang = true;
+    const app = createApp({
+      catalogue: CATALOGUE,
+      env: ENV,
+      store: createMemoryStore({ now: world.now }),
+      fetch: async (url, init) => {
+        if (hang && url.endsWith('/prices/price_pro123')) return new Promise(() => {});
+        return world.fetch(url, init);
+      },
+      now: world.now,
+      log: () => {},
+      priceWaitMs: 20,
+    });
+    const priced = async () => (await bodyOf(await within(app.handle(new Request(`${APP_URL}api/config`)), 'config waits on the lookup'))).shop.products.find((/** @type {any} */ p) => p.id === 'pro')?.price ?? null;
+    // The kit's wait is an AbortSignal's timer, which does not hold the event loop open; a
+    // server's socket does, and so does this, here.
+    const open = setInterval(() => {}, 1000);
+    try {
+      assert.equal(await priced(), null);
+      hang = false;
+      world.clock += 5_000;
+      assert.equal(await priced(), null, 'within its time limit the lookup under way is still the one');
+      world.clock += 5_001;
+      assert.deepEqual(await priced(), { unit_amount: 499, currency: 'eur' });
+    } finally {
+      clearInterval(open);
+    }
   });
 
   test('a price Stripe answers with that is not usable is neither listed nor sold', async () => {
@@ -1335,6 +1595,22 @@ describe('sign-in', () => {
       `/${'\u00e9'.repeat(1000)}`,
       `/${'\u{1F600}'.repeat(500)}`,
       `/a?${'\u00e9'.repeat(400)}`,
+      // Plain paths whose resolved form is another host (notenote's three), or decodes to one.
+      '/.//evil.example',
+      '/x/..//evil.example',
+      '/%2e//evil.example',
+      '/./%2Fevil.example',
+      '/./%5Cevil.example',
+      '/%252F/evil.example',
+      '/%252e%252e//evil.example',
+      '/a/%2e%2e/%2Fevil.example',
+      // Still decoding to something new after three decodings (a fourth makes '/aA').
+      '/a%25252541',
+      // The charter's rule on the input itself: not a plain path once decoded is the root,
+      // even where a dot segment would take the offending part away ('/play' otherwise).
+      '/%2F/../play',
+      '/x%5C/../play',
+      '/x%09/../play',
     ];
     for (const value of hostile) assert.equal(safeReturnPath(value, site), '/', JSON.stringify(value));
     assert.equal(safeReturnPath(null, site), '/');
@@ -1347,6 +1623,65 @@ describe('sign-in', () => {
     assert.equal(safeReturnPath('/other', sub), '/chess/');
     assert.equal(safeReturnPath('/chess/../admin', sub), '/chess/');
     assert.equal(safeReturnPath('/chess/api/me', sub), '/chess/');
+    // What stays: a literal percent, an encoded character, a double slash further on.
+    assert.equal(safeReturnPath('/x?q=100%25', site), '/x?q=100%25');
+    assert.equal(safeReturnPath('/%C3%A9t%C3%A9', site), '/%C3%A9t%C3%A9');
+    assert.equal(safeReturnPath('/a//b', site), '/a//b');
+    assert.equal(safeReturnPath('/a%252541', site), '/a%252541', 'three decodings to a fixed point');
+  });
+
+  test('no return path is read as another host, by a browser or a server, at any percent-decoding (generated inputs)', () => {
+    // Property: whatever the input, the result is the site's root or a path under it outside
+    // api/, and the result and every string percent-decoding it again and again makes (as the
+    // most forgiving decoder reads it, byte by byte) starts with exactly one '/' and no '\',
+    // holds no control character, is a path on the page's own host when a browser resolves it
+    // against any page, and does not resolve to a path that starts with '//'. Written apart
+    // from the kit's own check, and run over inputs built from the pieces that make hosts:
+    // slashes, backslashes, dot segments and their encodings, nested encodings, tabs.
+    const pieces = ['/', '//', '\\', '.', '..', '/./', '/../', '%2e', '%2E', '%2f', '%2F', '%5c', '%5C', '%25', '%252f', '%252F', '%255c', '%252e', '%25252f', '%09', '%0a', '\t', '\n', '?', '#', '@', ':', 'https:', 'evil.example', 'a', 'api', 'chess', '%', '%E0', '%C3%A9', '\u00e9', ' ', '%20'];
+    let seed = 0x5eed;
+    const next = () => {
+      // mulberry32: a fixed sequence, so a failure names an input that fails again.
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    /** @param {string} text */
+    const decodeOnce = (text) => text.replace(/%([0-9A-Fa-f]{2})/g, (_m, byte) => String.fromCharCode(parseInt(byte, 16)));
+    /** @param {string} text */
+    const stages = (text) => {
+      const out = [text];
+      for (let at = text, again = decodeOnce(at); again !== at; at = again, again = decodeOnce(at)) out.push(again);
+      return out;
+    };
+    for (const base of ['https://shop.example/', 'https://example.com/chess/']) {
+      const site = new URL(base);
+      let kept = 0;
+      for (let i = 0; i < 20_000; i += 1) {
+        const count = 1 + Math.floor(next() * 8);
+        let input = next() < 0.8 ? '/' : '';
+        if (next() < 0.5 && base.endsWith('/chess/')) input += 'chess/';
+        for (let j = 0; j < count; j += 1) input += pieces[Math.floor(next() * pieces.length)];
+        const result = safeReturnPath(input, site);
+        const where = `${JSON.stringify(input)} -> ${JSON.stringify(result)}`;
+        if (result !== site.pathname) {
+          kept += 1;
+          assert.ok(result.startsWith(site.pathname) && !result.startsWith(`${site.pathname}api/`), where);
+        }
+        assert.equal(new URL(`${site.origin}${result}`).origin, site.origin, where);
+        for (const stage of stages(result)) {
+          assert.ok(stage.startsWith('/') && stage[1] !== '/' && stage[1] !== '\\', `${where}: ${JSON.stringify(stage)} starts with one /`);
+          assert.ok(![...stage].some((c) => c < ' ' || c === '\u007f' || c === '\\'), `${where}: ${JSON.stringify(stage)} holds no control character or backslash`);
+          for (const page of ['https://page.invalid/', 'https://page.invalid/deep/er/path?q#f']) {
+            const read = new URL(stage, page);
+            assert.equal(read.host, 'page.invalid', `${where}: ${JSON.stringify(stage)} read on ${page}`);
+            assert.ok(!read.pathname.startsWith('//'), `${where}: ${JSON.stringify(stage)} resolves to ${read.pathname}`);
+          }
+        }
+      }
+      assert.ok(kept > 2_000, `${base}: the generator reaches paths that are kept (${kept})`);
+    }
   });
 
   test('a hostile return path through the flow lands on the root', async () => {
@@ -1797,6 +2132,10 @@ describe('checkout and the portal', () => {
     const { app } = makeApp(world);
     const anonymous = browser(app);
     assert.equal((await anonymous.postJson('api/checkout', { product: 'pro' })).status, 401);
+    // Signed out, nothing else is read: not the body, and not Stripe's price.
+    assert.equal((await anonymous.postJson('api/checkout', { product: 'nope' })).status, 401);
+    assert.equal((await anonymous.send('POST', 'api/checkout', { headers: { 'content-type': 'application/json' }, body: '{bad' })).status, 401);
+    assert.equal(world.callsTo('https://api.stripe.com/').length, 0, 'no Stripe call for a visitor not signed in');
     const forged = browser(app);
     forged.jar.set('__Host-demo-session', base64url(new Uint8Array(32).fill(9)));
     assert.equal((await forged.postJson('api/checkout', { product: 'pro' })).status, 401);
@@ -1824,11 +2163,15 @@ describe('checkout and the portal', () => {
   });
 
   test('ten checkouts per user per hour, then 429 until the next hour', async () => {
+    // Every press that reaches Stripe counts: the first makes a Checkout Session, each later one
+    // asks Stripe about it and is given it again (see the next describe).
     const world = createWorld();
     const { app } = makeApp(world);
     const client = browser(app);
     await signIn(world, client);
     for (let i = 0; i < 10; i += 1) assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 200, `checkout ${i + 1}`);
+    assert.equal(world.sessions.length, 1);
+    assert.equal(world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length, 9, 'nine lookups of the session');
     const limited = await client.postJson('api/checkout', { product: 'monthly' });
     assert.equal(limited.status, 429);
     assert.ok(Number(limited.headers.get('retry-after')) > 0);
@@ -1838,20 +2181,26 @@ describe('checkout and the portal', () => {
     assert.equal((await other.postJson('api/checkout', { product: 'pro' })).status, 200, 'per user');
     world.clock += 3_600_000;
     assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 200);
-    assert.equal(world.sessions.length, 12);
+    assert.equal(world.sessions.length, 3, 'the first expired unpaid within the hour, so a new one');
+    assert.equal(world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length, 10);
   });
 
   test('the limit holds for checkouts sent at once, on a store that answers a turn later', async () => {
+    // Two products at once, so two checkouts are always under way together and count against
+    // the one limit (each product's presses wait for each other: see the next describe).
     const world = createWorld();
     const { app } = makeApp(world, { store: slowStore(createMemoryStore({ now: world.now })) });
     const client = browser(app);
     await signIn(world, client);
-    const answers = await Promise.all(Array.from({ length: 20 }, () => client.postJson('api/checkout', { product: 'pro' })));
+    const answers = await Promise.all(Array.from({ length: 20 }, (_, i) => client.postJson('api/checkout', { product: i % 2 ? 'monthly' : 'pro' })));
     assert.deepEqual(answers.map((r) => r.status).sort(), [...Array(10).fill(200), ...Array(10).fill(429)]);
-    assert.equal(world.sessions.length, 10);
+    assert.equal(world.sessions.length, 2, 'one Checkout Session per product');
+    assert.equal(world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length, 8, 'and a lookup of it for each other press let through');
+    const urls = new Set(await Promise.all(answers.filter((r) => r.status === 200).map(async (r) => (await bodyOf(r)).url)));
+    assert.deepEqual([...urls].sort(), ['https://checkout.stripe.com/c/pay/cs_test_1', 'https://checkout.stripe.com/c/pay/cs_test_2']);
   });
 
-  test('a Stripe failure is a 502 with nothing from Stripe in it; a dropped connection is retried under the same key', async () => {
+  test('a Stripe failure is a 502 with nothing from Stripe in it, given again to a press that read the same within its five minutes; a dropped connection is retried under the same key', async () => {
     const world = createWorld();
     const { app, logs } = makeApp(world);
     const client = browser(app);
@@ -1862,6 +2211,14 @@ describe('checkout and the portal', () => {
     assert.ok(!(await failed.text()).includes('CANARY'));
     assert.ok(logs.some((line) => line.message.includes('checkout failed (Stripe 500)')));
     assert.ok(!logs.some((line) => line.message.includes('CANARY')));
+    // Stripe keeps the answer to a key, an error included (VERIFY-20: the key is what the press
+    // read), so the next press in the same five minutes is given that 500 again and nothing is
+    // made; the next five minutes ask afresh.
+    world.checkout = 'ok';
+    const again = await client.postJson('api/checkout', { product: 'pro' });
+    assert.equal(again.status, 502);
+    assert.deepEqual([world.replays, world.sessions.length], [1, 0]);
+    world.clock += 300_000;
     world.checkout = 'drop-once';
     world.calls.length = 0;
     const retried = await client.postJson('api/checkout', { product: 'pro' });
@@ -1875,13 +2232,18 @@ describe('checkout and the portal', () => {
     // Two Buy tabs, both paid before either webhook arrived: the kit knew no customer, so it
     // sent none, and Stripe made one for each. The second subscription becomes known from its
     // checkout's completion, or from its own update when that arrives first.
+    // (One process makes one Checkout Session for both presses, as the first assertions show;
+    // two locations of KV within its minute, or a subscription made in the dashboard, still give
+    // a visitor two.)
     for (const known of ['checkout', 'update']) {
       const world = createWorld();
       const { app, store } = makeApp(world);
       const client = browser(app);
       await signIn(world, client);
-      for (let i = 0; i < 2; i += 1) assert.equal((await client.postJson('api/checkout', { product: 'monthly' })).status, 200, known);
-      assert.deepEqual(world.sessions.map((form) => form.get('customer')), [null, null], `${known}: no customer known yet`);
+      const both = await Promise.all([0, 1].map(() => client.postJson('api/checkout', { product: 'monthly' })));
+      assert.deepEqual(both.map((r) => r.status), [200, 200], known);
+      assert.deepEqual(new Set(await Promise.all(both.map(async (r) => (await bodyOf(r)).url))).size, 1, `${known}: one session for both presses`);
+      assert.deepEqual(world.sessions.map((form) => form.get('customer')), [null], `${known}: no customer known yet`);
       await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription', sub: 'sub_a', customer: 'cus_test1' })));
       if (known === 'checkout') await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription', sub: 'sub_b', customer: 'cus_test2' })));
       else await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ id: 'sub_b', status: 'active', customer: 'cus_test2' })));
@@ -1910,6 +2272,124 @@ describe('checkout and the portal', () => {
     }
   });
 
+  test('a customer Stripe no longer knows is forgotten: Buy makes its session without it, Manage subscription answers 404', async () => {
+    // VERIFY-14: kept, the customer was sent with every Checkout and portal session, and each
+    // was a 502 for good once the owner deleted it in the dashboard.
+    const world = createWorld();
+    const { app, store, logs } = makeApp(world);
+    const client = await owner(world, app);
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription' })));
+    world.deletedCustomers.add('cus_test1');
+    // Manage subscription first: the subscription's customer, refused by Stripe.
+    const portal = await client.send('POST', 'api/portal');
+    assert.equal(portal.status, 404);
+    assert.deepEqual(await bodyOf(portal), { error: 'not_found' });
+    assert.deepEqual(await store.get(`demo:test:user:${USER}`), { refs: ['payment:pi_test1', 'subscription:sub_test1'] });
+    assert.deepEqual(await store.get('demo:test:subscription:sub_test1'), { user: USER, product: 'monthly', grants: 'supporter' });
+    const asked = world.callsTo('https://api.stripe.com/v1/billing_portal/sessions').length;
+    assert.equal((await client.send('POST', 'api/portal')).status, 404, 'nothing left to manage');
+    assert.equal(world.callsTo('https://api.stripe.com/v1/billing_portal/sessions').length, asked, 'and Stripe is not asked again');
+    const warned = logs.filter((line) => line.level === 'warn' && line.message.includes('no longer knows'));
+    assert.deepEqual(warned.map((line) => line.message), ['kit (demo): Stripe no longer knows the customer kept for an account (customer): it is forgotten, and the next checkout lets Stripe make a new one']);
+    assert.ok(!logs.some((line) => /cus_test1|CANARY/.test(line.message)), 'the customer and Stripe\'s message are never logged');
+
+    // Buy, with a user record that still names it (a fresh store, the same user and customer).
+    const second = makeApp(world);
+    const buyer = await owner(world, second.app);
+    const response = await buyer.postJson('api/checkout', { product: 'monthly' });
+    assert.equal(response.status, 200);
+    const posts = world.calls.filter((call) => call.method === 'POST' && call.url === 'https://api.stripe.com/v1/checkout/sessions').slice(-2);
+    assert.deepEqual(posts.map((call) => new URLSearchParams(call.body).get('customer')), ['cus_test1', null], 'refused with it, made without it');
+    assert.notEqual(posts[0]?.headers.get('idempotency-key'), posts[1]?.headers.get('idempotency-key'), 'a new key for the new request');
+    assert.deepEqual(await second.store.get(`demo:test:user:${USER}`), { refs: ['payment:pi_test1'] });
+    assert.ok(!second.logs.some((line) => line.level === 'error'), 'no failure to report');
+    // A customer Stripe knows is kept, and a 400 about anything else is a 502 that forgets nothing.
+    world.deletedCustomers.clear();
+    const third = makeApp(world);
+    const keeper = await owner(world, third.app);
+    world.checkout = 'error';
+    assert.equal((await keeper.postJson('api/checkout', { product: 'monthly' })).status, 502);
+    world.checkout = 'ok';
+    // Each in five minutes of its own: within them, Stripe gives a press that read the same the
+    // answer it kept for the first.
+    for (const error of [
+      { code: 'parameter_invalid_empty', param: 'customer' },
+      { code: 'resource_missing', param: 'line_items[0][price]' },
+      { code: 'resource_missing' },
+    ]) {
+      world.clock += 300_000;
+      world.checkoutRefusal = { status: 400, error };
+      assert.equal((await keeper.postJson('api/checkout', { product: 'monthly' })).status, 502, JSON.stringify(error));
+    }
+    world.clock += 300_000;
+    world.checkoutRefusal = { status: 404, error: { code: 'resource_missing', param: 'customer' } };
+    assert.equal((await keeper.postJson('api/checkout', { product: 'monthly' })).status, 502, 'a 404');
+    world.checkoutRefusal = null;
+    assert.deepEqual(await third.store.get(`demo:test:user:${USER}`), { refs: ['payment:pi_test1'], customer: 'cus_test1' }, 'nothing forgotten');
+    assert.ok(third.logs.some((line) => line.message === 'kit (demo): checkout failed (Stripe 400 resource_missing on line_items[0][price])'), "Stripe's code and param are logged");
+    assert.ok(!third.logs.some((line) => line.message.includes('no longer knows')));
+  });
+
+  test('a customer Stripe no longer knows is forgotten alone: the user record and every other subscription keep theirs, and a cancelled subscription stays bounded', async () => {
+    // VERIFY-19. Two subscriptions under two customers (see above). Manage subscription opens the
+    // second's, which Stripe no longer knows: forgetting it must not forget the first customer,
+    // which Stripe still knows and which Manage subscription needs while the first still charges.
+    const world = createWorld();
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription', sub: 'sub_a', customer: 'cus_test1' })));
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription', sub: 'sub_b', customer: 'cus_test2' })));
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ id: 'sub_a', status: 'active', customer: 'cus_test1' }), cancel_at_period_end: true }));
+    world.deletedCustomers.add('cus_test2');
+    assert.equal((await client.send('POST', 'api/portal')).status, 404, "the second's customer, refused");
+    assert.deepEqual(await store.get(`demo:test:user:${USER}`), { refs: ['subscription:sub_a', 'subscription:sub_b'], customer: 'cus_test1' });
+    assert.equal(/** @type {any} */ (await store.get('demo:test:subscription:sub_a')).customer, 'cus_test1');
+    assert.equal(/** @type {any} */ (await store.get('demo:test:subscription:sub_b')).customer, undefined);
+    // Renewed, the first still charges, and Manage subscription reaches it.
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ id: 'sub_a', status: 'active', customer: 'cus_test1' })));
+    assert.equal((await client.send('POST', 'api/portal')).status, 200);
+    assert.equal(world.portals.at(-1)?.get('customer'), 'cus_test1');
+
+    // Cancelled, the first's record goes 30 days on; forgetting its customer then keeps that bound.
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.deleted', subscriptionObject({ id: 'sub_a', status: 'canceled', customer: 'cus_test1' })));
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.deleted', subscriptionObject({ id: 'sub_b', status: 'canceled', customer: 'cus_test2' })));
+    world.deletedCustomers.add('cus_test1');
+    assert.equal((await client.send('POST', 'api/portal')).status, 404, "the user record's customer, refused");
+    assert.deepEqual(await store.get(`demo:test:user:${USER}`), { refs: ['subscription:sub_a', 'subscription:sub_b'] });
+    const forgotten = /** @type {any} */ (await store.get('demo:test:subscription:sub_a'));
+    assert.deepEqual([forgotten.status, forgotten.customer], ['canceled', undefined]);
+    world.clock += 31 * 86_400_000;
+    assert.equal(await store.get('demo:test:subscription:sub_a'), null, 'gone 30 days after it ended, its customer forgotten or not');
+  });
+
+  test("Stripe's error code and the parameter it names are kept when they are identifiers, and nothing else of its answer", async () => {
+    /** @param {unknown} error */
+    const answering = (error) => async () => Response.json({ error }, { status: 400 });
+    const cases = [
+      [{ code: 'resource_missing', param: 'customer', message: 'CANARY' }, 'resource_missing', 'customer'],
+      [{ code: 'parameter_invalid_integer', param: 'line_items[0][quantity]' }, 'parameter_invalid_integer', 'line_items[0][quantity]'],
+      [{ code: 'Resource Missing', param: 'customer; drop' }, null, null],
+      [{ code: 'x'.repeat(65), param: 7 }, null, null],
+      ['CANARY', null, null],
+    ];
+    for (const [error, code, param] of cases) {
+      const failed = await getPrice({ fetch: answering(error), key: STRIPE_KEY, price: 'price_x1', mode: 'payment' }).then(
+        () => null,
+        (thrown) => thrown,
+      );
+      assert.ok(failed instanceof StripeError, JSON.stringify(error));
+      assert.deepEqual([failed.status, failed.code, failed.param], [400, code, param], JSON.stringify(error));
+      assert.ok(!failed.message.includes('CANARY'));
+    }
+    const notJson = await getPrice({ fetch: async () => new Response('CANARY <html>', { status: 503 }), key: STRIPE_KEY, price: 'price_x1', mode: 'payment' }).catch((thrown) => thrown);
+    assert.deepEqual([notJson.status, notJson.code, notJson.param], [503, null, null]);
+  });
+
   test('the portal: 404 without a Stripe customer, a session returning to APP_URL with one', async () => {
     const world = createWorld();
     const { app } = makeApp(world);
@@ -1922,6 +2402,604 @@ describe('checkout and the portal', () => {
     assert.equal(portal.status, 200);
     assert.deepEqual(await bodyOf(portal), { url: 'https://billing.stripe.com/p/session/test_1' });
     assert.deepEqual(Object.fromEntries(world.portals[0] ?? []), { customer: 'cus_test1', return_url: APP_URL });
+  });
+});
+
+describe('one Checkout Session per visitor and product', () => {
+  const MARKER = `demo:test:checkout:${USER}:pro`;
+
+  test('a second Buy before the webhook reaches the same session; once it is paid, 409 payment_pending; once recorded, already_owned; once refunded, a new one', async () => {
+    // PG-INT-1: the page back from Checkout at ?purchase=success before the webhook, another
+    // tab, a reload. Before, each press made its own session, both could be paid, and both
+    // webhooks recorded a payment.
+    const world = createWorld();
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    const first = await bodyOf(await client.postJson('api/checkout', { product: 'pro' }));
+    const again = await client.postJson('api/checkout', { product: 'pro' });
+    assert.equal(again.status, 200);
+    assert.deepEqual(await bodyOf(again), first, 'the same session, still open');
+    assert.equal(world.sessions.length, 1);
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_1', url: first.url });
+    world.pay();
+    const pending = await client.postJson('api/checkout', { product: 'pro' });
+    assert.equal(pending.status, 409);
+    assert.deepEqual(await bodyOf(pending), { error: 'payment_pending' });
+    assertApiHeaders(pending);
+    assert.equal(world.sessions.length, 1, 'no second session to pay');
+    // The webhook records the purchase; the session stays remembered (VERIFY-16: a second Buy
+    // reads the purchase through it wherever the user record has not caught up).
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession(), id: 'cs_test_1' }));
+    assert.deepEqual(await entitlementsOf(client), ['pro']);
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_1', url: first.url });
+    assert.deepEqual(await bodyOf(await client.postJson('api/checkout', { product: 'pro' })), { error: 'already_owned' });
+    // Refunded in full, it can be bought again: Stripe still reports that session paid, and its
+    // purchase record says refunded, so a new session.
+    await postWebhook(client, world, stripeEvent(world, 'charge.refunded', refund('pi_test1')));
+    const rebuy = await client.postJson('api/checkout', { product: 'pro' });
+    assert.equal(rebuy.status, 200);
+    assert.equal((await bodyOf(rebuy)).url, 'https://checkout.stripe.com/c/pay/cs_test_2');
+  });
+
+  test('a session that expired unpaid, or that Stripe no longer has, gives way to a new one; a lookup that fails in any other way makes none', async () => {
+    const world = createWorld();
+    const { app, logs } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 200);
+    world.clock += 3_600_000;
+    assert.equal((await bodyOf(await client.postJson('api/checkout', { product: 'pro' }))).url, 'https://checkout.stripe.com/c/pay/cs_test_2', 'expired unpaid');
+    world.checkouts.delete('cs_test_2');
+    assert.equal((await bodyOf(await client.postJson('api/checkout', { product: 'pro' }))).url, 'https://checkout.stripe.com/c/pay/cs_test_3', 'not found');
+    // Only a 404 says Stripe has no such session. A 5xx, its rate or lock limit (429), or a
+    // refused key (401, 403) says nothing of whether it was paid (VERIFY-19).
+    for (const status of [500, 429, 401, 403]) {
+      world.sessionLookup = status;
+      const failed = await client.postJson('api/checkout', { product: 'pro' });
+      assert.equal(failed.status, 502, String(status));
+      assert.deepEqual(await bodyOf(failed), { error: 'upstream_unavailable' });
+      assert.ok(logs.some((line) => line.message === `kit (demo): checkout failed (Stripe ${status})`), String(status));
+    }
+    assert.equal(world.sessions.length, 3, 'whether the last one was paid is not known: no new one');
+    assert.ok(!logs.some((line) => line.message.includes('CANARY')));
+    // Paid, and its webhook never arrives (the endpoint removed, say): refused for 30 days, as
+    // long as Stripe keeps the event, then the session is forgotten.
+    world.sessionLookup = 'ok';
+    world.pay('cs_test_3');
+    world.clock += 29 * 86_400_000;
+    assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 409);
+    world.clock += 2 * 86_400_000;
+    await signIn(world, client);
+    assert.equal((await bodyOf(await client.postJson('api/checkout', { product: 'pro' }))).url, 'https://checkout.stripe.com/c/pay/cs_test_4');
+  });
+
+  test('a delayed payment holds the session until its webhook says how it ended; only that session is let go', async () => {
+    const world = createWorld();
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    await client.postJson('api/checkout', { product: 'pro' });
+    world.pay();
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession({ status: 'unpaid' }), id: 'cs_test_1' }));
+    assert.deepEqual(await entitlementsOf(client), []);
+    assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 409, 'a payment is on its way');
+    // A failure about another session (an older one) lets nothing go.
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.async_payment_failed', { ...paidSession({ status: 'unpaid' }), id: 'cs_test_0' }));
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_1', url: 'https://checkout.stripe.com/c/pay/cs_test_1' });
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.async_payment_failed', { ...paidSession({ status: 'unpaid' }), id: 'cs_test_1' }));
+    // Kept as failed (VERIFY-20): with no marker, the next press, in the five minutes the first
+    // was made in, would read what the first read and share its Idempotency-Key, and Stripe would
+    // give that session back, paid with a payment that failed: payment_pending for 30 days.
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_1', failed: true });
+    const next = await client.postJson('api/checkout', { product: 'pro' });
+    assert.equal(next.status, 200, 'the visitor may pay another way');
+    assert.equal((await bodyOf(next)).url, 'https://checkout.stripe.com/c/pay/cs_test_2');
+    assert.equal(world.replays, 0);
+    assert.equal(world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length, 1, 'a failed session is not asked about');
+    // Another app's failure, or a session naming another visitor, is not ours to let go.
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.async_payment_failed', { ...paidSession({ status: 'unpaid', app: 'other' }), id: 'cs_test_2' }));
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.async_payment_failed', { ...paidSession({ status: 'unpaid', user: 'google:2002' }), id: 'cs_test_2' }));
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_2', url: 'https://checkout.stripe.com/c/pay/cs_test_2' });
+    // A failed session is remembered for an hour, past the five minutes a key is shared in.
+    world.pay('cs_test_2');
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.async_payment_failed', { ...paidSession({ status: 'unpaid' }), id: 'cs_test_2' }));
+    world.clock += 3_599_000;
+    assert.deepEqual(await store.get(MARKER), { id: 'cs_test_2', failed: true });
+    world.clock += 1000;
+    assert.equal(await store.get(MARKER), null);
+  });
+
+  test('a Buy pressed while the webhook is recording the payment is refused: the session is let go only once it is recorded', async () => {
+    const world = createWorld();
+    const inner = createMemoryStore({ now: world.now });
+    const gated = gatedStore(inner);
+    const { app } = makeApp(world, { store: gated.store });
+    const client = browser(app);
+    await signIn(world, client);
+    await client.postJson('api/checkout', { product: 'pro' });
+    world.pay();
+    /** @type {() => void} */
+    let answered = () => {};
+    const done = new Promise((resolve) => {
+      answered = () => resolve(undefined);
+    });
+    gated.hold('put', 'demo:test:payment:pi_test1', Promise.race([done, new Promise((resolve) => setTimeout(resolve, 100))]));
+    const reading = gated.seen('get', 'demo:test:payment:pi_test1');
+    const hook = postWebhook(browser(app), world, stripeEvent(world, 'checkout.session.completed', { ...paidSession(), id: 'cs_test_1' }));
+    await reading;
+    const press = await client.postJson('api/checkout', { product: 'pro' });
+    answered();
+    assert.equal((await hook).status, 200);
+    assert.deepEqual([press.status, await bodyOf(press)], [409, { error: 'payment_pending' }]);
+    assert.equal(world.sessions.length, 1);
+    assert.deepEqual(await entitlementsOf(client), ['pro']);
+  });
+
+  test('presses sent at once make one session for each product, a subscription as a payment', async () => {
+    const world = createWorld();
+    const { app } = makeApp(world, { store: slowStore(createMemoryStore({ now: world.now })) });
+    const client = browser(app);
+    await signIn(world, client);
+    for (const product of ['pro', 'monthly']) {
+      const answers = await Promise.all(Array.from({ length: 4 }, () => client.postJson('api/checkout', { product })));
+      assert.deepEqual(answers.map((r) => r.status), [200, 200, 200, 200], product);
+      assert.equal(new Set(await Promise.all(answers.map(async (r) => (await bodyOf(r)).url))).size, 1, `${product}: one session`);
+    }
+    assert.deepEqual(world.sessions.map((form) => form.get('metadata[product]')), ['pro', 'monthly']);
+  });
+
+  test('deleting the account lets go of the sessions remembered for it', async () => {
+    const world = createWorld();
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    await client.postJson('api/checkout', { product: 'pro' });
+    await client.postJson('api/checkout', { product: 'monthly' });
+    await store.put(`demo:live:checkout:${USER}:pro`, { id: 'cs_live_1', url: 'https://checkout.stripe.com/c/pay/cs_live_1' });
+    assert.equal((await client.send('DELETE', 'api/me')).status, 204);
+    for (const key of store.keys()) {
+      if (/^demo:test:ratelimit:/.test(key)) continue;
+      assert.ok(!key.includes('1001'), `${key} outlives the account`);
+    }
+  });
+
+  test('on KV, a Buy handled away from where the webhook lands is still refused once the session is paid, however long the visitor took to pay', async () => {
+    // VERIFY-16. The visitor's requests land in one location, Stripe's webhooks in another.
+    // When the webhook let go of the session once it had recorded the payment, the visitor's
+    // location could still serve the user record its page had read before the webhook (the poll
+    // after ?purchase=success) while its read of the session had expired (a minute or more spent
+    // paying): it found neither, and made a second, payable Checkout Session. The session is now
+    // kept, and a paid one is answered from the purchase record its webhook writes.
+    /**
+     * @param {{ product: string, tookS: number, pressS: number[], free?: boolean, early?: boolean, lapsed?: boolean }} plan
+     *   presses `pressS` seconds after paying (`early`: one before the webhook too), the webhook
+     *   landing 5 s after paying (`lapsed`: the subscription past due a second later)
+     */
+    const play = async (plan) => {
+      const world = createWorld();
+      const kv = geoKv(world.now);
+      const visitorAt = kv.location();
+      const webhooksAt = kv.location();
+      const client = browser(makeApp(world, { store: kvStore(() => /** @type {any} */ (visitorAt)) }).app);
+      const webhooks = browser(makeApp(world, { store: kvStore(() => /** @type {any} */ (webhooksAt)) }).app);
+      await signIn(world, client);
+      assert.equal((await client.postJson('api/checkout', { product: plan.product })).status, 200);
+      const t0 = world.clock;
+      world.clock += plan.tookS * 1000;
+      world.pay('cs_test_1', plan.free ? { paymentIntent: null } : {});
+      const paid = world.clock;
+      world.clock += 2000;
+      assert.deepEqual(await entitlementsOf(client), [], 'the page polls before the webhook');
+      /** @type {unknown[]} */
+      const answers = [];
+      const press = async () => {
+        const response = await client.postJson('api/checkout', { product: plan.product });
+        answers.push(response.status === 409 ? (await bodyOf(response)).error : response.status);
+      };
+      if (plan.early) await press();
+      world.clock = paid + 5000;
+      const subscription = plan.product === 'monthly';
+      const completed = { ...paidSession(subscription ? { mode: 'subscription' } : plan.free ? { pi: null, status: 'no_payment_required' } : {}), id: 'cs_test_1' };
+      assert.equal((await postWebhook(webhooks, world, stripeEvent(world, 'checkout.session.completed', completed))).status, 200);
+      if (plan.lapsed) {
+        world.clock += 1000;
+        assert.equal((await postWebhook(webhooks, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ status: 'past_due' })))).status, 200);
+      }
+      for (const after of plan.pressS) {
+        world.clock = paid + after * 1000;
+        await press();
+      }
+      assert.ok(t0 < paid);
+      return { answers, sessions: world.sessions.length };
+    };
+    for (const product of ['pro', 'monthly']) {
+      for (const tookS of [30, 100, 300]) {
+        const { answers, sessions } = await play({ product, tookS, pressS: [20, 40, 64] });
+        assert.deepEqual(answers, ['already_owned', 'already_owned', 'already_owned'], `${product}, paid ${tookS} s after Buy`);
+        assert.equal(sessions, 1, `${product}, paid ${tookS} s after Buy: one Checkout Session`);
+      }
+      // Pressed before the webhook too: that press reads the purchase record before it exists,
+      // and the visitor's location serves that read for a minute; each answer is a 409.
+      const early = await play({ product, tookS: 100, early: true, pressS: [20, 70] });
+      assert.deepEqual(early, { answers: ['payment_pending', 'payment_pending', 'already_owned'], sessions: 1 }, `${product}, pressed early`);
+    }
+    // A free checkout (a 100% coupon) is recorded under the session's own id.
+    assert.deepEqual(await play({ product: 'pro', free: true, tookS: 100, pressS: [20] }), { answers: ['already_owned'], sessions: 1 }, 'free');
+    // A subscription past due by then charges again once paid: Manage subscription, not a second.
+    assert.deepEqual(await play({ product: 'monthly', lapsed: true, tookS: 100, pressS: [20] }), { answers: ['subscription_active'], sessions: 1 }, 'lapsed');
+  });
+
+  test('Buy is refused while a subscription to it will still charge without granting (past due, unpaid, paused, incomplete); once it has ended, a new one is sold', async () => {
+    // VERIFY-17. Past due, it granted nothing, so Buy sold a second subscription, under the same
+    // customer; Stripe's retry of the first then succeeded and both charged every period. Delete
+    // account already counted it as one that will charge.
+    /** @param {number} days how long after the purchase its renewal lapses */
+    const lapsed = async (days, status = 'past_due') => {
+      const world = createWorld();
+      const { app } = makeApp(world);
+      const client = browser(app);
+      await signIn(world, client);
+      assert.equal((await client.postJson('api/checkout', { product: 'monthly' })).status, 200);
+      world.pay();
+      await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession({ mode: 'subscription' }), id: 'cs_test_1' }));
+      assert.deepEqual(await entitlementsOf(client), ['supporter'], status);
+      world.clock += days * 86_400_000;
+      await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ status })));
+      await signIn(world, client);
+      assert.deepEqual(await entitlementsOf(client), [], status);
+      const refused = await client.postJson('api/checkout', { product: 'monthly' });
+      assert.deepEqual([refused.status, await bodyOf(refused)], [409, { error: 'subscription_active' }], status);
+      assertApiHeaders(refused);
+      assert.equal(world.sessions.length, 1, `${status}: no second subscription`);
+      assert.deepEqual(await bodyOf(await client.send('DELETE', 'api/me')), { error: 'subscription_active' }, `${status}: as Delete account says`);
+      const manage = await client.send('POST', 'api/portal');
+      assert.equal(manage.status, 200, `${status}: Manage subscription reaches it`);
+      assert.equal(world.portals.at(-1)?.get('customer'), 'cus_test1');
+      // Cancelled there, it can be bought again.
+      world.clock += 1000;
+      await postWebhook(client, world, stripeEvent(world, 'customer.subscription.deleted', subscriptionObject({ status: 'canceled' })));
+      const lookups = world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length;
+      const again = await client.postJson('api/checkout', { product: 'monthly' });
+      assert.equal(again.status, 200, `${status}, then cancelled`);
+      assert.equal((await bodyOf(again)).url, 'https://checkout.stripe.com/c/pay/cs_test_2', `${status}, then cancelled: a new session`);
+      return world.callsTo('https://api.stripe.com/v1/checkout/sessions/').length - lookups;
+    };
+    // Weeks on, its Checkout Session is no longer remembered: the user's purchase records decide.
+    for (const status of ['past_due', 'unpaid', 'paused', 'incomplete']) assert.equal(await lapsed(40, status), 0, `${status}: Stripe is not asked`);
+    // Within the 30 days, the session the visitor was given is asked about once it has ended:
+    // Stripe reports it paid, and the subscription it made has ended.
+    assert.equal(await lapsed(10), 1);
+  });
+
+  test('a Buy whose sign-in was read before Delete account, and that reaches its marker after the deletion, is 401 and makes nothing', async () => {
+    // VERIFY-18. Held at the first price lookup of a cold process (a body slow to arrive opens
+    // the same window), the Buy ran on after the deletion with the sign-in it had read, made a
+    // payable Checkout Session and wrote a marker naming the deleted account for 30 days.
+    const world = createWorld();
+    /** @type {() => void} */
+    let reached = () => {};
+    const atPrice = new Promise((resolve) => {
+      reached = () => resolve(undefined);
+    });
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolve) => {
+      release = () => resolve(undefined);
+    });
+    const outbound = world.fetch;
+    world.fetch = async (url, init) => {
+      if (url.startsWith('https://api.stripe.com/v1/prices/')) {
+        reached();
+        await held;
+      }
+      return outbound(url, init);
+    };
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    const buy = client.postJson('api/checkout', { product: 'pro' });
+    await atPrice;
+    assert.equal((await client.send('DELETE', 'api/me')).status, 204);
+    release();
+    const bought = await within(buy, 'the Buy never answered');
+    assert.deepEqual([bought.status, await bodyOf(bought)], [401, { error: 'unauthorized' }]);
+    assertApiHeaders(bought);
+    assert.equal(world.sessions.length, 0, 'no Checkout Session for a deleted account');
+    for (const key of store.keys()) assert.ok(!key.includes('1001'), `${key} names the deleted account`);
+  });
+
+  test('deleting the account lets go of the sessions remembered for every product the catalogue lists, with the shop off too; one for a product no longer listed goes within 30 days', async () => {
+    // VERIFY-18. With the Stripe variables removed (sign-in still on), the deletion looked for no
+    // marker at all, and a marker written while the shop was on outlived the account.
+    const world = createWorld();
+    const store = createMemoryStore({ now: world.now });
+    const client = browser(makeApp(world, { store }).app);
+    await signIn(world, client);
+    assert.equal((await client.postJson('api/checkout', { product: 'pro' })).status, 200);
+    assert.equal((await client.postJson('api/checkout', { product: 'monthly' })).status, 200);
+    /** @type {string[]} */
+    const deleted = [];
+    /** @type {import('./store.js').Store} */
+    const recording = { get: (key) => store.get(key), put: (key, value, options) => store.put(key, value, options), delete: (key) => (deleted.push(key), store.delete(key)) };
+    const off = browser(makeApp(world, { store: recording, env: Object.fromEntries(Object.entries(ENV).filter(([name]) => !name.startsWith('STRIPE_'))) }).app);
+    for (const [name, value] of client.jar) off.jar.set(name, value);
+    assert.equal((await off.send('DELETE', 'api/me')).status, 204);
+    for (const key of store.keys()) if (!/^demo:test:ratelimit:/.test(key)) assert.ok(!key.includes('1001'), `${key} outlives the account`);
+    // Only the markers there are deleted: each delete counts against KV's daily allowance.
+    assert.deepEqual(deleted.filter((key) => key.includes(':checkout:')).sort(), [`demo:test:checkout:${USER}:monthly`, `demo:test:checkout:${USER}:pro`]);
+    // A product taken out of the catalogue is not looked for: its marker names the account until
+    // it expires, 30 days after the Buy that wrote it, as the README says.
+    const visitor = browser(makeApp(world, { store }).app);
+    await signIn(world, visitor);
+    assert.equal((await visitor.postJson('api/checkout', { product: 'monthly' })).status, 200);
+    const written = world.clock;
+    const retired = { ...CATALOGUE, products: CATALOGUE.products.filter((product) => product.id !== 'monthly') };
+    const later = browser(makeApp(world, { store, catalogue: retired }).app);
+    for (const [name, value] of visitor.jar) later.jar.set(name, value);
+    assert.equal((await later.send('DELETE', 'api/me')).status, 204);
+    const left = store.keys().filter((key) => key.includes('1001') && !/^demo:test:ratelimit:/.test(key));
+    assert.deepEqual(left, [`demo:test:checkout:${USER}:monthly`]);
+    world.clock = written + 30 * 86_400_000;
+    assert.deepEqual(store.keys().filter((key) => key.includes('1001') && !/^demo:test:ratelimit:/.test(key)), []);
+  });
+
+  test("a Buy that reaches its product's turn while Delete account holds it waits, then finds the sign-in ended: 401, and nothing made or left", async () => {
+    // VERIFY-21. The sign-in is read again once the Buy holds the marker's lock. Read before the
+    // lock, while the deletion held it (here, at its read of the other Stripe mode's user record,
+    // which only a deletion reads), the sign-in was still there, and once the deletion let go the
+    // Buy made a session and a marker naming the deleted account.
+    const world = createWorld();
+    const inner = createMemoryStore({ now: world.now });
+    /** @type {() => void} */
+    let reached = () => {};
+    const atDeletion = new Promise((resolve) => {
+      reached = () => resolve(undefined);
+    });
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolve) => {
+      release = () => resolve(undefined);
+    });
+    /** @type {import('./store.js').Store} */
+    const store = {
+      get: async (key) => {
+        if (key === `demo:live:user:${USER}`) {
+          reached();
+          await held;
+        }
+        return inner.get(key);
+      },
+      put: (key, value, options) => inner.put(key, value, options),
+      delete: (key) => inner.delete(key),
+    };
+    const { app } = makeApp(world, { store });
+    const client = browser(app);
+    await signIn(world, client);
+    assert.equal((await client.send('GET', 'api/config')).status, 200, 'the price is known: the Buy goes straight to its turn');
+    const deletion = client.send('DELETE', 'api/me');
+    await atDeletion;
+    const buy = client.postJson('api/checkout', { product: 'pro' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    const [deleted, bought] = await within(Promise.all([deletion, buy]), 'the deletion and the Buy wait on each other');
+    assert.equal(deleted.status, 204);
+    assert.deepEqual([bought.status, await bodyOf(bought)], [401, { error: 'unauthorized' }]);
+    assert.equal(world.sessions.length, 0, 'no Checkout Session for a deleted account');
+    assert.deepEqual(inner.keys().filter((key) => key.includes('1001')), [], 'nothing names the deleted account');
+  });
+
+  test('a subscription that will still charge refuses Buy for its own entitlement, and no other', async () => {
+    // VERIFY-21: refusing every product while any subscription of the visitor's would still
+    // charge passed every test, and a visitor whose subscription lapsed could buy nothing else.
+    const world = createWorld();
+    const { app } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    assert.equal((await client.postJson('api/checkout', { product: 'monthly' })).status, 200);
+    world.pay();
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession({ mode: 'subscription' }), id: 'cs_test_1' }));
+    world.clock += 40 * 86_400_000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ status: 'past_due' })));
+    await signIn(world, client);
+    const monthly = await client.postJson('api/checkout', { product: 'monthly' });
+    assert.deepEqual([monthly.status, await bodyOf(monthly)], [409, { error: 'subscription_active' }]);
+    const pro = await client.postJson('api/checkout', { product: 'pro' });
+    assert.deepEqual([pro.status, await bodyOf(pro)], [200, { url: 'https://checkout.stripe.com/c/pay/cs_test_2' }], 'pro grants another entitlement');
+  });
+
+  test('a paid subscription session whose lookup names no subscription is a payment on its way: 409 payment_pending, and no second session', async () => {
+    // VERIFY-21, as the README's Testing section tells a site's own fake Stripe: without the id
+    // its webhook records the purchase under, a paid session is a payment still on its way. (The
+    // payment-mode half: a free checkout's record is its session's own id, pinned above.)
+    const world = createWorld();
+    const { app } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    assert.equal((await client.postJson('api/checkout', { product: 'monthly' })).status, 200);
+    world.pay('cs_test_1', { subscription: null });
+    for (const seconds of [20, 40, 70]) {
+      world.clock += seconds * 1000;
+      const press = await client.postJson('api/checkout', { product: 'monthly' });
+      assert.deepEqual([press.status, await bodyOf(press)], [409, { error: 'payment_pending' }], `${seconds} s on`);
+    }
+    assert.equal(world.sessions.length, 1);
+  });
+});
+
+describe('one Checkout Session across isolates and locations', () => {
+  const MARKER = `demo:test:checkout:${USER}:pro`;
+  const SESSION_1 = { url: 'https://checkout.stripe.com/c/pay/cs_test_1' };
+
+  /**
+   * The world's way out, with the first Checkout Session request held at the door until
+   * `release()`, as a slow call to Stripe holds it; `reached` resolves once it is there.
+   * Installed before the apps are made, which take the world's fetch as they are made.
+   * @param {World} world
+   */
+  const holdFirstCheckout = (world) => {
+    const outbound = world.fetch;
+    /** @type {() => void} */
+    let arrived = () => {};
+    const reached = new Promise((resolve) => {
+      arrived = () => resolve(undefined);
+    });
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolve) => {
+      release = () => resolve(undefined);
+    });
+    let waiting = true;
+    world.fetch = async (url, init) => {
+      if (waiting && url === 'https://api.stripe.com/v1/checkout/sessions' && init?.method === 'POST') {
+        waiting = false;
+        arrived();
+        await held;
+      }
+      return outbound(url, init);
+    };
+    return { reached, release };
+  };
+
+  test('a double click handled by two isolates makes one session: Stripe refuses the press that comes while the first is being made, and it is given that session when pressed again', async () => {
+    // VERIFY-20. Each isolate has locks of its own, so both presses read no session and each
+    // made one under a random key: the page followed the first, the marker kept the second, and
+    // a Buy pressed back from Checkout before the webhook was given the second, still payable.
+    // Both presses now send Stripe the same request under the same key (Stripe's idempotency:
+    // the one that comes while the first is running is refused, 409 idempotency_key_in_use).
+    const world = createWorld();
+    world.making = () => new Promise((resolve) => setTimeout(resolve, 30));
+    const kv = geoKv(world.now);
+    const here = kv.location();
+    const isolate = () => makeApp(world, { store: kvStore(() => /** @type {any} */ (here)) });
+    const [first, second] = [isolate(), isolate()];
+    const a = browser(first.app);
+    await signIn(world, a);
+    const b = browser(second.app);
+    for (const [name, value] of a.jar) b.jar.set(name, value);
+    await a.send('GET', 'api/config');
+    await b.send('GET', 'api/config');
+    const presses = await Promise.all([a, b].map((client) => client.postJson('api/checkout', { product: 'pro' })));
+    const answers = await Promise.all(presses.map(async (response) => [response.status, await bodyOf(response)]));
+    assert.deepEqual(answers.sort((x, y) => x[0] - y[0]), [[200, SESSION_1], [502, { error: 'upstream_unavailable' }]]);
+    assert.equal(world.sessions.length, 1);
+    assert.ok([...first.logs, ...second.logs].some((line) => line.message === 'kit (demo): checkout failed (Stripe 409 idempotency_key_in_use)'));
+    assert.deepEqual(await bodyOf(await b.postJson('api/checkout', { product: 'pro' })), SESSION_1, 'pressed again: the first one made');
+    // Paid, and back from Checkout before the webhook: refused in either isolate.
+    world.clock += 90_000;
+    world.pay('cs_test_1');
+    world.clock += 3000;
+    for (const client of [a, b]) assert.deepEqual(await bodyOf(await client.postJson('api/checkout', { product: 'pro' })), { error: 'payment_pending' });
+    world.clock += 5000;
+    const webhooks = browser(makeApp(world, { store: kvStore(() => /** @type {any} */ (kv.location())) }).app);
+    assert.equal((await postWebhook(webhooks, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession(), id: 'cs_test_1' }))).status, 200);
+    world.clock += 120_000;
+    for (const client of [a, b]) assert.deepEqual(await bodyOf(await client.postJson('api/checkout', { product: 'pro' })), { error: 'already_owned' });
+    assert.equal(world.sessions.length, 1, 'one Checkout Session, one payment');
+  });
+
+  test("a press that read no session before another isolate remembered one, and reaches Stripe after it was made, is given it; KV's one write a second to the marker refuses nothing then, and anything else is a 500", async () => {
+    // Same sign-in: the same key, so Stripe gives the second press the first one's session, and
+    // KV refuses its write of the marker (the first wrote it within the second), which already
+    // names that session. Two sign-ins (another browser) read different states: their keys
+    // differ, Stripe makes a second session, and the press whose marker write KV refuses, which
+    // names the other session, is a 500 that hands its session to no one.
+    for (const twoSignIns of [false, true]) {
+      const world = createWorld();
+      const door = holdFirstCheckout(world);
+      const namespace = strictKv(world.now);
+      const isolate = () => makeApp(world, { store: kvStore(() => /** @type {any} */ (namespace)) });
+      const [first, second] = [isolate(), isolate()];
+      const a = browser(first.app);
+      await signIn(world, a);
+      const b = browser(second.app);
+      if (twoSignIns) {
+        world.clock += 1000;
+        await signIn(world, b);
+      } else for (const [name, value] of a.jar) b.jar.set(name, value);
+      await a.send('GET', 'api/config');
+      await b.send('GET', 'api/config');
+      const late = b.postJson('api/checkout', { product: 'pro' });
+      await door.reached;
+      world.clock += 2000;
+      assert.deepEqual(await bodyOf(await a.postJson('api/checkout', { product: 'pro' })), SESSION_1);
+      door.release();
+      const answer = await within(late, 'the held press never answered');
+      if (twoSignIns) {
+        assert.deepEqual([answer.status, await bodyOf(answer)], [500, { error: 'internal' }], 'two sign-ins');
+        assert.equal(world.sessions.length, 2, 'two sign-ins: a second session, handed to no one');
+        assert.ok(second.logs.some((line) => line.message === 'kit (demo): POST failed (Error)'));
+      } else {
+        assert.deepEqual([answer.status, await bodyOf(answer)], [200, SESSION_1], 'one sign-in');
+        assert.deepEqual([world.sessions.length, world.replays], [1, 1], 'one sign-in: one session, given back by Stripe');
+      }
+      assert.deepEqual(await kvStore(() => /** @type {any} */ (namespace)).get(MARKER), { id: 'cs_test_1', url: SESSION_1.url });
+    }
+  });
+
+  test('on KV, presses in two locations that read the same within five minutes are given one session; either side of five minutes, each makes its own', async () => {
+    // The press in V read no session and its call to Stripe was slow; the press in W, ten seconds
+    // later, read none either (it had not been made) and made one. The five minutes the press is
+    // handled in, not its moment, fix the request (expires_at included), so V's is W's request.
+    const world = createWorld();
+    const door = holdFirstCheckout(world);
+    const kv = geoKv(world.now);
+    const [v, w] = [kv.location(), kv.location()];
+    /** @param {any} binding */
+    const at = (binding) => browser(makeApp(world, { store: kvStore(() => binding) }).app);
+    const [atV, atW] = [at(v), at(w)];
+    await signIn(world, atV);
+    for (const [name, value] of atV.jar) atW.jar.set(name, value);
+    await atV.send('GET', 'api/config');
+    await atW.send('GET', 'api/config');
+    world.clock = T0 + 55_000;
+    const late = atV.postJson('api/checkout', { product: 'pro' });
+    await door.reached;
+    world.clock = T0 + 65_000;
+    assert.deepEqual(await bodyOf(await atW.postJson('api/checkout', { product: 'pro' })), SESSION_1);
+    world.clock = T0 + 100_000;
+    door.release();
+    assert.deepEqual(await bodyOf(await within(late)), SESSION_1, 'within the five minutes: the same session');
+    assert.deepEqual([world.sessions.length, world.replays], [1, 1]);
+    assert.equal(world.sessions[0]?.get('expires_at'), String(T0 / 1000 + 3600), 'the window fixes expires_at');
+    // Handled either side of the end of those five minutes, two presses send two requests.
+    const next = holdFirstCheckout(world);
+    const [atV2, atW2] = [at(v), at(w)];
+    for (const [name, value] of atV.jar) {
+      atV2.jar.set(name, value);
+      atW2.jar.set(name, value);
+    }
+    await atV2.send('GET', 'api/config');
+    await atW2.send('GET', 'api/config');
+    world.clock = T0 + 299_000;
+    const straddling = atV2.postJson('api/checkout', { product: 'monthly' });
+    await next.reached;
+    world.clock = T0 + 301_000;
+    assert.deepEqual(await bodyOf(await atW2.postJson('api/checkout', { product: 'monthly' })), { url: 'https://checkout.stripe.com/c/pay/cs_test_2' });
+    next.release();
+    assert.deepEqual(await bodyOf(await within(straddling)), { url: 'https://checkout.stripe.com/c/pay/cs_test_3' }, 'across five minutes: a session of its own');
+    assert.deepEqual(world.sessions.map((form) => form.get('expires_at')), [T0 / 1000 + 3600, T0 / 1000 + 300 + 3600, T0 / 1000 + 3600].map(String));
+  });
+
+  test("a deleted account's next sign-in makes a new session: its first Buy does not share the key of a Buy made before the deletion", async () => {
+    // Deletion lets go of the marker and the user record, so the first Buy after it reads what
+    // the account's first Buy read; its sign-in is new, and the key names the sign-in. Shared,
+    // Stripe gave back the session paid before the deletion, whose purchase record the deletion
+    // removed: payment_pending for the 30 days its marker is kept.
+    const world = createWorld();
+    const { app } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    assert.deepEqual(await bodyOf(await client.postJson('api/checkout', { product: 'pro' })), SESSION_1);
+    world.pay();
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession(), id: 'cs_test_1' }));
+    assert.deepEqual(await entitlementsOf(client), ['pro']);
+    assert.equal((await client.send('DELETE', 'api/me')).status, 204);
+    await signIn(world, client);
+    const again = await client.postJson('api/checkout', { product: 'pro' });
+    assert.deepEqual([again.status, await bodyOf(again)], [200, { url: 'https://checkout.stripe.com/c/pay/cs_test_2' }]);
+    assert.deepEqual([world.sessions.length, world.replays], [2, 0]);
+    assert.deepEqual(await bodyOf(await client.postJson('api/checkout', { product: 'pro' })), { url: 'https://checkout.stripe.com/c/pay/cs_test_2' }, 'and it is remembered');
   });
 });
 
@@ -2207,7 +3285,9 @@ describe('the webhook', () => {
     assert.deepEqual(await entitlementsOf(client), []);
 
     // Two products grant one entitlement: a subscription that lapses, a one-time purchase
-    // meanwhile, then the subscription recovers and is cancelled.
+    // meanwhile (its Checkout made before the lapse and paid after: Buy itself refuses it while
+    // the lapsed subscription will still charge, VERIFY-17), then the subscription recovers and
+    // is cancelled.
     const both = { ...CATALOGUE, products: [...CATALOGUE.products, { id: 'once', name: 'Once', description: 'Support once', mode: 'payment', grants: 'supporter' }] };
     const world2 = createWorld();
     const shop = makeApp(world2, { catalogue: both, env: { ...ENV, STRIPE_PRICE_ONCE: 'price_pro123' } });
@@ -2217,7 +3297,9 @@ describe('the webhook', () => {
     world2.clock += 1000;
     await postWebhook(visitor, world2, stripeEvent(world2, 'customer.subscription.updated', subscriptionObject({ status: 'past_due' })));
     assert.deepEqual(await entitlementsOf(visitor), []);
-    assert.equal((await visitor.postJson('api/checkout', { product: 'once' })).status, 200, 'a lapsed subscription does not block buying');
+    const refused = await visitor.postJson('api/checkout', { product: 'once' });
+    assert.deepEqual([refused.status, await bodyOf(refused)], [409, { error: 'subscription_active' }], 'a lapsed subscription that will still charge blocks buying what it grants');
+    assert.equal(world2.sessions.length, 0);
     await postWebhook(visitor, world2, stripeEvent(world2, 'checkout.session.completed', paidSession({ product: 'once', pi: 'pi_once' })));
     world2.clock += 1000;
     await postWebhook(visitor, world2, stripeEvent(world2, 'customer.subscription.updated', subscriptionObject({ status: 'active' })));
@@ -2355,6 +3437,24 @@ describe('the webhook', () => {
     assert.equal((await client.send('POST', 'api/auth/logout')).status, 204);
   });
 
+  test('on KV, a webhook that adds nothing to the user record does not write it: webhooks for two purchases within a second all apply', async () => {
+    // VERIFY-19. KV refuses a second write to a key within a second. A subscription's update adds
+    // nothing to the user record its completion wrote; written anyway, it was refused (a 500, and
+    // Stripe's retry later) whenever another purchase's webhook had just written that record.
+    const world = createWorld();
+    const kv = strictKv(world.now);
+    const { app } = makeApp(world, { store: kvStore(() => /** @type {any} */ (kv)) });
+    const client = browser(app);
+    await signIn(world, client);
+    world.clock += 1000;
+    assert.equal((await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription' })))).status, 200);
+    world.clock += 2000;
+    assert.equal((await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession()))).status, 200);
+    world.clock += 500;
+    assert.equal((await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', subscriptionObject({ status: 'active' })))).status, 200, "the subscription's update, half a second after the payment's completion");
+    assert.deepEqual(await entitlementsOf(client), ['pro', 'supporter']);
+  });
+
   test('a store failure is a 500, so Stripe retries, and the retry applies', async () => {
     const world = createWorld();
     const inner = createMemoryStore({ now: world.now });
@@ -2407,6 +3507,164 @@ describe('deleting the account', () => {
 });
 
 describe('deleting the account, with a subscription', () => {
+  for (const flight of ['set to end, the event that allows the deletion', 'a later update, still set to end', "its checkout's delayed payment, reported after the set to end"]) {
+    test(`a webhook about the subscription handled while Delete account runs does not write the account back (${flight})`, async () => {
+      // VERIFY-13, one process. Delete account is held at its first read (the live-mode user
+      // record, which a test-mode webhook never reads) until the webhook has written the
+      // subscription's record. Before, the webhook then waited, inside that record's lock, for
+      // the user record's, and wrote the user record back (Google id, Stripe customer) after the
+      // deletion had removed it, for good.
+      const world = createWorld();
+      const inner = createMemoryStore({ now: world.now });
+      const gated = gatedStore(inner);
+      const { app } = makeApp(world, { store: gated.store });
+      const client = browser(app);
+      await signIn(world, client);
+      await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription' })));
+      world.clock += 1000;
+      if (flight.startsWith('a later')) {
+        await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ status: 'active' }), cancel_at_period_end: true }));
+        world.clock += 1000;
+      }
+      if (flight.startsWith('its checkout')) {
+        await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ status: 'active' }), cancel_at_period_end: true }));
+        world.clock += 1000;
+      }
+      const event = flight.startsWith('its checkout')
+        ? stripeEvent(world, 'checkout.session.async_payment_succeeded', paidSession({ mode: 'subscription' }))
+        : stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ status: 'active' }), cancel_at_period_end: true });
+      gated.hold('get', `demo:live:user:${USER}`, gated.seen('put', 'demo:test:subscription:sub_test1'));
+      const [deleted, hook] = await within(Promise.all([client.send('DELETE', 'api/me'), postWebhook(browser(app), world, event)]));
+      assert.deepEqual([deleted.status, hook.status], [204, 200]);
+      assert.equal(await inner.get(`demo:test:user:${USER}`), null, 'the user record stays deleted');
+      const at = Math.floor(world.clock / 1000);
+      const eventAt = flight.startsWith('its checkout') ? at - 1 : at;
+      assert.deepEqual(await inner.get('demo:test:subscription:sub_test1'), { status: 'active', eventAt, ending: true, deletedAt: at });
+      world.clock += 400 * 86_400_000;
+      for (const key of inner.keys()) assert.ok(!/1001|cus_test1/.test(`${key} ${JSON.stringify(await inner.get(key))}`), `${key} names the account`);
+    });
+  }
+
+  test('a webhook that read the subscription before Delete account rewrote it is applied wholly first: the deletion takes the record\'s lock', async () => {
+    // The webhook has read the subscription and its write is held until Delete account has
+    // rewritten that record (or 100 ms, which is how long Delete account then waits for the
+    // record's lock). Without the lock the deletion rewrote it naming no one between the
+    // webhook's read and its write, the webhook's write named the account again, and its addRef,
+    // finding the record naming the account, wrote the user record back.
+    const world = createWorld();
+    const inner = createMemoryStore({ now: world.now });
+    const gated = gatedStore(inner);
+    const { app } = makeApp(world, { store: gated.store });
+    const client = browser(app);
+    await signIn(world, client);
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription' })));
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ status: 'active' }), cancel_at_period_end: true }));
+    world.clock += 1000;
+    const event = stripeEvent(world, 'customer.subscription.updated', { ...subscriptionObject({ status: 'active' }), cancel_at_period_end: true });
+    const rewritten = gated.seen('put', 'demo:test:subscription:sub_test1');
+    const orLater = new Promise((resolve) => setTimeout(resolve, 100));
+    gated.hold('put', 'demo:test:subscription:sub_test1', Promise.race([rewritten, orLater]));
+    const reading = gated.seen('get', 'demo:test:subscription:sub_test1');
+    const hook = postWebhook(browser(app), world, event);
+    await reading;
+    const [deleted, hooked] = await within(Promise.all([client.send('DELETE', 'api/me'), hook]));
+    assert.deepEqual([deleted.status, hooked.status], [204, 200]);
+    assert.equal(await inner.get(`demo:test:user:${USER}`), null);
+    const at = Math.floor(world.clock / 1000);
+    assert.deepEqual(await inner.get('demo:test:subscription:sub_test1'), { status: 'active', eventAt: at, ending: true, deletedAt: at });
+  });
+
+  test('a Buy under way while the account is deleted leaves no session remembered for it', async () => {
+    // Delete account takes the markers' locks first, so it waits for a Checkout being made and
+    // then lets it go; without them the marker was written after the deletion, naming the account.
+    const world = createWorld();
+    /** @type {() => void} */
+    let reached = () => {};
+    const atStripe = new Promise((resolve) => {
+      reached = () => resolve(undefined);
+    });
+    /** @type {Promise<unknown>} */
+    let gate = Promise.resolve();
+    const outbound = world.fetch;
+    world.fetch = async (url, init) => {
+      if (url === 'https://api.stripe.com/v1/checkout/sessions' && init?.method === 'POST') {
+        reached();
+        await gate;
+      }
+      return outbound(url, init);
+    };
+    const inner = createMemoryStore({ now: world.now });
+    const gated = gatedStore(inner);
+    const { app } = makeApp(world, { store: gated.store });
+    const client = browser(app);
+    await signIn(world, client);
+    /** @type {() => void} */
+    let answered = () => {};
+    gate = Promise.race([new Promise((resolve) => (answered = () => resolve(undefined))), new Promise((resolve) => setTimeout(resolve, 100))]);
+    const buy = client.postJson('api/checkout', { product: 'pro' });
+    await atStripe;
+    // Stripe answers once the deletion has (or after 100 ms, which is how long the deletion
+    // waits for the marker's lock): without that lock the marker was written after it.
+    const deletion = client.send('DELETE', 'api/me').finally(() => answered());
+    const [bought, deleted] = await within(Promise.all([buy, deletion]));
+    assert.deepEqual([bought.status, deleted.status], [200, 204]);
+    for (const key of inner.keys()) {
+      if (/^demo:test:ratelimit:/.test(key)) continue;
+      assert.ok(!key.includes('1001'), `${key} outlives the account`);
+    }
+  });
+
+  test("a subscription's record that names its account goes 30 days after the subscription ends, as one naming no one does", async () => {
+    // So a record written back after a deletion (KV, two locations: see the README's Limits)
+    // does not keep the account's Google id and Stripe customer for good.
+    const world = createWorld();
+    const { app, store } = makeApp(world);
+    const client = browser(app);
+    await signIn(world, client);
+    await postWebhook(client, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription' })));
+    world.clock += 1000;
+    await postWebhook(client, world, stripeEvent(world, 'customer.subscription.deleted', subscriptionObject({ status: 'canceled' })));
+    assert.equal(/** @type {any} */ (await store.get('demo:test:subscription:sub_test1')).user, USER);
+    world.clock += 29 * 86_400_000;
+    assert.notEqual(await store.get('demo:test:subscription:sub_test1'), null, 'kept while Stripe may resend an older event');
+    world.clock += 2 * 86_400_000;
+    assert.equal(await store.get('demo:test:subscription:sub_test1'), null);
+    // The user record still lists it, which costs nothing: it reads as nothing held, and the
+    // account can still go.
+    const again = browser(app);
+    await signIn(world, again);
+    assert.deepEqual(await entitlementsOf(again), []);
+    assert.equal((await again.send('DELETE', 'api/me')).status, 204);
+    // A completion that arrives after the cancellation keeps it over, and bounded too.
+    const late = makeApp(world);
+    const visitor = browser(late.app);
+    await signIn(world, visitor);
+    await postWebhook(visitor, world, stripeEvent(world, 'customer.subscription.deleted', subscriptionObject({ status: 'canceled', id: 'sub_test2' })));
+    await postWebhook(visitor, world, stripeEvent(world, 'checkout.session.completed', paidSession({ mode: 'subscription', sub: 'sub_test2' })));
+    assert.equal(/** @type {any} */ (await late.store.get('demo:test:subscription:sub_test2')).status, 'canceled');
+    world.clock += 31 * 86_400_000;
+    assert.equal(await late.store.get('demo:test:subscription:sub_test2'), null);
+  });
+
+  test('on a namespace Preview and Production share, Preview refuses Delete account for a live subscription and has no portal for it; Production reaches it', async () => {
+    // VERIFY-15 pins what the README says of this case: the subscription is cancelled from the
+    // deployment whose key is of its mode.
+    const world = createWorld();
+    const store = createMemoryStore({ now: world.now });
+    const production = makeApp(world, { store, env: { ...ENV, STRIPE_SECRET_KEY: LIVE_KEY } });
+    const preview = makeApp(world, { store });
+    const live = browser(production.app);
+    await signIn(world, live);
+    await postWebhook(live, world, stripeEvent(world, 'checkout.session.completed', { ...paidSession({ mode: 'subscription', customer: 'cus_live1' }), livemode: true }, { livemode: true }));
+    const onPreview = browser(preview.app);
+    await signIn(world, onPreview);
+    assert.deepEqual(await bodyOf(await onPreview.send('DELETE', 'api/me')), { error: 'subscription_active' });
+    assert.equal((await onPreview.send('POST', 'api/portal')).status, 404);
+    assert.equal((await live.send('POST', 'api/portal')).status, 200);
+    assert.equal(world.portals.at(-1)?.get('customer'), 'cus_live1');
+  });
+
   test('a subscription that will charge again must be cancelled first: 409, and nothing is deleted', async () => {
     const world = createWorld();
     const { app, store } = makeApp(world);
@@ -2943,6 +4201,53 @@ describe('adapters', () => {
     }
   });
 
+  test("Cloudflare Pages: config hands a price lookup it did not wait for to the context's waitUntil", async () => {
+    const world = createWorld();
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolve) => {
+      release = () => resolve(undefined);
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = /** @type {typeof fetch} */ (
+      /** @type {unknown} */ (
+        /** @param {string} url @param {RequestInit} [init] */
+        async (url, init) => {
+          if (url.endsWith('/prices/price_pro123')) await held;
+          return world.fetch(url, init);
+        }
+      )
+    );
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    /** @type {Promise<unknown>[]} */
+    const waited = [];
+    try {
+      const onRequest = pagesHandler(CATALOGUE);
+      const kv = { get: async () => null, put: async () => {}, delete: async () => {} };
+      const context = { request: new Request(`${APP_URL}api/config`), env: { ...ENV, KIT_STORE: kv }, waitUntil: (/** @type {Promise<unknown>} */ promise) => waited.push(promise) };
+      // The 2.5 s wait is an AbortSignal's timer, which does not hold the event loop open.
+      const open = setInterval(() => {}, 1000);
+      /** @type {ReturnType<typeof setTimeout> | undefined} */
+      let timer;
+      const late = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), 6000);
+      });
+      const answer = /** @type {Response | null} */ (await Promise.race([onRequest(context), late]).finally(() => {
+        clearInterval(open);
+        clearTimeout(timer);
+      }));
+      assert.ok(answer, 'answered while the price lookup was still under way');
+      assert.equal(answer.headers.get('cache-control'), 'no-store');
+      assert.equal(waited.length, 1);
+    } finally {
+      release();
+      await Promise.all(waited);
+      globalThis.fetch = originalFetch;
+      console.warn = originalWarn;
+    }
+  });
+
   describe('Node over a loopback socket, with the file store', () => {
     /** @type {string} */
     let dataDir;
@@ -3144,11 +4449,32 @@ describe('the kit itself', () => {
   test('outside node.js and this file, only the globals the charter lists, each through globalThis', () => {
     const allowed = new Set(['fetch', 'Request', 'Response', 'URL', 'crypto', 'TextEncoder', 'TextDecoder', 'ReadableStream', 'AbortSignal', 'console']);
     const here = fileURLToPath(new URL('.', import.meta.url));
-    for (const file of ['crypto.js', 'http.js', 'google.js', 'stripe.js', 'store.js', 'app.js', 'cloudflare.js']) {
+    for (const file of ['crypto.js', 'http.js', 'google.js', 'stripe.js', 'store.js', 'config.js', 'app.js', 'cloudflare.js']) {
       const source = readFileSync(join(here, file), 'utf8');
       assert.doesNotMatch(source, /\bprocess\.|\bBuffer\.|\brequire\(|from ['"]node:|import\(['"]node:/, `${file} uses nothing Node-only`);
       for (const [, name] of source.matchAll(/globalThis\.([A-Za-z]+)/g)) assert.ok(allowed.has(name ?? ''), `${file}: globalThis.${name}`);
       if (file !== 'cloudflare.js') assert.doesNotMatch(source, /globalThis\.console/, `${file} logs only through the injected log`);
+    }
+  });
+
+  test('config.js is what a server that keeps its own accounts imports: no app.js, no store, no state; app.js gives the same functions', async () => {
+    const here = fileURLToPath(new URL('.', import.meta.url));
+    /** @param {string} file @returns {string[]} the kit modules it imports, and theirs */
+    const reach = (file, seen = new Set()) => {
+      for (const [, name] of readFileSync(join(here, file), 'utf8').matchAll(/^import [^;]*? from '\.\/([a-z]+\.js)';$/gm)) {
+        if (name && !seen.has(name)) {
+          seen.add(name);
+          reach(name, seen);
+        }
+      }
+      return [...seen].sort();
+    };
+    assert.deepEqual(reach('config.js'), ['crypto.js', 'http.js', 'stripe.js']);
+    const config = await import('./config.js');
+    const app = await import('./app.js');
+    for (const name of ['ID', 'validateCatalogue', 'priceVariable', 'readConfig', 'safeReturnPath']) {
+      assert.ok(name in config, name);
+      assert.equal(/** @type {Record<string, unknown>} */ (app)[name], /** @type {Record<string, unknown>} */ (config)[name], `app.js re-exports ${name}`);
     }
   });
 
@@ -3193,5 +4519,85 @@ describe('the kit itself', () => {
     for (const part of ['rather than dropping the rule', 'allows exactly `location ^~ /api/`', "its one `add_header` is the server block's Strict-Transport-Security line", 'still refuses an `add_header` in every other location', 'learns `^~`', 'expects what is under `api/` to be proxied']) {
       assert.ok(note.includes(part), part);
     }
+  });
+
+  /** The README's fenced blocks of one language. @param {string} language */
+  const blocks = (language) => [...readFileSync(fileURLToPath(new URL('README.md', import.meta.url)), 'utf8').matchAll(new RegExp('```' + language + '\\n([\\s\\S]*?)```', 'g'))].map((m) => m[1] ?? '');
+
+  test("the README's proxies answer a stopped API with the site's not-found page, and let the kit's own answers through", () => {
+    // Without these, nginx sent its own 502 page with HSTS alone and Apache its 503 page with
+    // none of the site's headers (measured by the lanes on nginx 1.24.0 and Apache 2.4.58).
+    const nginx = blocks('nginx').find((text) => text.includes('location ^~ /api/'));
+    assert.ok(nginx);
+    const directives = nginx.split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+    assert.ok(directives.includes('error_page 502 504 /404.html;'), 'nginx: error_page');
+    assert.ok(!directives.some((line) => line.startsWith('proxy_intercept_errors')), 'nginx: the kit\'s own errors pass through');
+    const apache = blocks('apache').map((text) => text.trim().split('\n').map((line) => line.trim()));
+    assert.deepEqual(apache, [['ProxyPass "/api/" "http://127.0.0.1:8788/api/"', 'ErrorDocument 502 /404.html', 'ErrorDocument 503 /404.html', 'ErrorDocument 504 /404.html']]);
+    const said = paragraphs().join('\n');
+    assert.ok(said.includes('`ProxyPass` is server configuration, so the API goes in the virtual host'), 'Apache: what is server configuration');
+    assert.ok(said.includes('An `.htaccess` can proxy as well, through `RewriteRule'), 'Apache: what .htaccess can do');
+    assert.ok(said.includes('A site that does not run the API deletes the block'), 'nginx: a site with no API');
+  });
+
+  test('the README says when a second Buy is refused, what holds across isolates and locations, and what a deletion leaves of a remembered Checkout Session', () => {
+    // VERIFY-16 to VERIFY-18: "a page that reads every 409 as owned still never sells twice" was
+    // contradicted on KV, and deletion was said to remove every remembered session.
+    const said = paragraphs().join('\n');
+    for (const part of [
+      "409 `subscription_active` when it is not held but a subscription of the visitor's to it will still charge",
+      'A 409 `subscription_active` means a subscription to it is past due or paused and will charge again once paid or resumed: offer Manage subscription rather than Buy',
+      'A 409 never comes with a Checkout address, so a page that reads every 409 as owned offers no second payment',
+      // VERIFY-20: two isolates of one location took two presses at once, which the README said
+      // only two KV locations could.
+      'Send one Buy at a time: keep the control disabled while a press is out',
+      'is answered 502 (pressed again, it is given that session), so read a 502 as "try again"',
+      'send Delete account only while no Buy is out',
+      'presses that read the same within the same five minutes, wherever they are handled, are given one session',
+      'two sign-ins to the account at once (two browsers or devices), presses on either side of a five-minute boundary',
+      'a press so failed is answered the same 502 when pressed again within those five minutes',
+      'Delete account waits only for a Buy handled by its own isolate (or Node process)',
+      'its marker then names the account until it expires, 30 days after that Buy',
+      'else a new one, which expires 55 to 60 minutes after it is made',
+      '`{ id, failed: true }` for an hour',
+      'A fake that makes a new session for every `POST /v1/checkout/sessions` passes tests Stripe would answer otherwise',
+      'The session the visitor was given for the product stays remembered',
+      'only a 404 says Stripe has no such session',
+      'finds the sign-in ended, is answered 401 and makes nothing',
+      'one remembered for a product since taken out of the catalogue is not found',
+      "A site's own fake Stripe whose tests press Buy for a product a second time",
+      'once it is complete the `payment_intent` (payment mode, `null` for a free checkout) or the `subscription` (subscription mode) it made',
+    ]) {
+      assert.ok(said.includes(part), part);
+    }
+    assert.ok(!said.includes('never sells twice'));
+    assert.ok(!said.includes('the one way to two payments'), 'two KV locations are not the one way to two payments');
+  });
+
+  test("the README's static api/config is what the kit answers when nothing is set, byte for byte", async () => {
+    const [published] = blocks('json').filter((text) => text.includes('"auth"'));
+    assert.ok(published, 'the README gives the file');
+    const { app } = makeApp(createWorld(), { env: {} });
+    const answer = await app.handle(new Request(`${APP_URL}api/config`));
+    assert.equal(published.trim(), await answer.text());
+  });
+
+  test('the README says what a start script, a server of your own and the privacy sentence need', () => {
+    const said = paragraphs().join('\n');
+    for (const part of [
+      'Beside it, `server/package.json` holding `{"type":"module"}`',
+      '`MODULE_TYPELESS_PACKAGE_JSON`',
+      'Stripe handles the payment, and is told the account id (`google:<sub>`) with it',
+      'the email in the session record while the visitor is signed in',
+      'the payment itself stays with Stripe, with the account id it was made under',
+      'route `**/api/auth/google/start*`, take the kit\'s answer with `route.fetch({ maxRedirects: 0 })`',
+      'Mount it after any gate that refuses a foreign `Origin`',
+      'before any gate that wants a bearer token',
+      'Pass `createFileStore(KIT_DATA_DIR)` from `node.js` as `store`',
+    ]) {
+      assert.ok(said.includes(part), part);
+    }
+    const proxy = blocks('nginx').find((text) => text.includes('x5c'));
+    assert.deepEqual(proxy?.trim().split('\n').map((line) => line.trim()), ['if ($request_uri ~ "^[^?]*\\x5c") { return 400; }', 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;']);
   });
 });

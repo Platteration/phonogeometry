@@ -40,13 +40,18 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   own server and renders its own photographs, and skips itself when Playwright is absent, so it is safe to run anywhere:
   `REQUIRE_BROWSER=1` turns that skip into a failure, which is how CI runs it (the workflow
   installs a pinned Playwright with `npm install --no-save`, so the repository keeps no
-  dependencies; `test/ci.test.js` holds that pin at 1.61.0 or later, the first release with a
-  Chromium build for Ubuntu 26.04, which `ubuntu-latest` becomes from 2026-10-19 and on which
-  1.56.1's install stopped). After the browser suite, `test/hosts.mjs` runs `deploy/nginx.conf`
+  dependencies). Every job runs on `ubuntu-24.04`, never `ubuntu-latest`, which GitHub moves to
+  Ubuntu 26.04 from 2026-10-19, where 1.56.1's browser install stopped; `test/ci.test.js` reads
+  the release the job that installs the browser names and holds the pin to the first Playwright
+  with a Chromium build for it (1.45.0 for 24.04, 1.61.0 for 26.04, read off each release's
+  playwright-core), so moving the runner and raising Playwright are one change. After the
+  browser suite, `test/hosts.mjs` runs `deploy/nginx.conf`
   in the nginx installed here and the site's `.htaccess` in Apache, each serving the copied
   site with a checkout's files planted in it, Apache over TLS and behind a stand-in for a
   TLS-ending proxy: every site file 200 with `_headers`' headers, everything else the not-found
-  page with them, plain http a 301. Neither showed in any other suite: `http2 on;` stopped nginx
+  page with them, plain http a 301, and a `Server` header naming no version (nginx's
+  `server_tokens off`, the `ServerTokens Prod` README gives Apache's server configuration).
+  Neither showed in any other suite: `http2 on;` stopped nginx
   1.24 loading the file, and Apache's `env=HTTPS` dropped HSTS behind a proxy. It also runs the
   API (`server/start.mjs`) behind nginx's `/api/` location and an Apache `ProxyPass`, then stops
   it: nginx must then answer as a site with no API (the folder's `api/config`, the not-found page
@@ -70,7 +75,9 @@ textured 3D meshes on-device. Plain ES modules, no build step, no runtime depend
   `tools/site.js` (the files beside the shell), and to `node tools/site.js --list`, so a module
   added to one and not the other fails `npm test`, and pins the
   workflow line for line: the build job is checkout (no persisted credentials), Node, the
-  tests, the assembly and the upload, and only the deploy job holds `pages: write` and
+  tests, the assembly and the upload (with `include-hidden-files: true`: from v4 the upload
+  action leaves out every path that starts with a dot, `.well-known/security.txt` with it), and
+  only the deploy job holds `pages: write` and
   `id-token: write`, so a step, scope or trigger added to it fails there first. `sw.js` goes
   out as committed, not re-stamped per deploy: its `VERSION` is a hash of the shell files'
   contents, which `test/sw.test.js` recomputes (printing the value to paste in), so a deploy
@@ -293,15 +300,12 @@ one thing, "Support this app" (one-time, granting `supporter`), which changes no
 of thanks in About. The specification is the kit's README (`server/kit/README.md`).
 
 - **The kit is shared and not ours to edit.** `server/kit/` is the canonical copy, byte for byte,
-  but for its eight `.d.ts` declaration files, which this repository does not carry: the
-  conventions test counts any tracked `.d.ts` as a TypeScript source that `npm run typecheck`
-  must reach, which needs `typescript` installed, so a lockfile and a bare `npm ci` in CI, which
-  `test/workflow.test.js` refuses (every install there carries `--ignore-scripts`) and which this
-  repository's no-dependency posture rules out. Nothing here reads them (they are types for the
-  TypeScript apps that import the kit). Copy them in once the shared conventions test stops
-  counting declaration files; until then `diff -r` against the canonical copy lists exactly those
-  eight. A change the kit needs is made to the canonical copy and copied to every app.
-  `npm test` runs its self-test here.
+  its nine `.d.ts` declaration files included (21 files; `diff -r` against the canonical copy is
+  empty, and the conventions test holds the copy to the canonical hash). The declarations are
+  types for the TypeScript apps that import the kit, and nothing here reads them; they need no
+  TypeScript here either, since the conventions count a declaration file as no source for
+  `npm run typecheck` to reach, so the repository keeps no dependencies. A change the kit needs
+  is made to the canonical copy and copied to every app. `npm test` runs its self-test here.
 - **Off until configured, and drawing nothing then.** `src/account.js` asks `api/config` once,
   from `init()` after the frame check, and not at all when `navigator.onLine` is false (a request
   bound to fail would be a console error on every offline load). A 404, a network error, a body
@@ -318,14 +322,20 @@ of thanks in About. The specification is the kit's README (`server/kit/README.md
   `https://checkout.stripe.com/` address; Delete account is confirmed with `window.confirm` (the
   app's confirm), saying the support goes with it.
 - **No second Checkout for a payment on its way.** Stripe's webhook can land after the visitor
-  is back, and Cloudflare KV can take a minute more to reach every location, while the kit's own
-  guard against buying twice (409 for an owned product) reads the record only the webhook writes.
-  So after `?purchase=success`, for a signed-in visitor, the product reads "Payment received —
+  is back, and Cloudflare KV can take a minute more to reach every location. So after
+  `?purchase=success`, for a signed-in visitor, the product reads "Payment received —
   processing" where Buy was until `api/me` reports it: for the life of the page, and across a
   reload within `PENDING_MS` through the sessionStorage record above. Before, Buy came back after
   the fifteen-second poll and a second press charged the visitor twice. A `?purchase=success`
-  link opened by someone not signed in says nothing and asks nothing. The canonical fix belongs
-  in the kit (refuse or reuse a Checkout while one is in flight), and is asked for there.
+  link opened by someone not signed in says nothing and asks nothing. The kit now guards the API
+  side as well (its README, Limits): it remembers the Checkout it gave a visitor for a product,
+  gives a second Buy that same session while it is open, and once Stripe reports it paid answers
+  409 `payment_pending` until the webhook's record is there, so a press from another tab, or after
+  the page's hold has lapsed, is never a second payment; `test/api.test.js` holds that with this
+  catalogue, against a fake Stripe that serves the session lookup and answers a repeated
+  Idempotency-Key with its first answer. The page reads every 409 as owned and asks `api/me`
+  again. Presses from two sign-ins of the account at once can still each make a session (the
+  kit's README says when); the page's hold stays for those.
 - **The service worker leaves `api/` alone.** `sw.js` returns before `respondWith` for anything
   under `api/` beside it (`API`, from its own address, so a sub-path deploy works): no cache
   is opened, nothing is written, and the sign-in navigations (the start, Google's redirect back

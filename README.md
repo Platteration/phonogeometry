@@ -179,7 +179,10 @@ Apache reads `.htaccess` only where `AllowOverride All` lets it (Ubuntu's defaul
 is `None`, under which the file is ignored without a word), and it needs mod_rewrite and
 mod_headers, which a stock Debian or Ubuntu Apache does not load: `a2enmod rewrite headers`.
 Nothing in the file is optional, so a server without either module answers every request with a
-500 and says why in its error log, rather than serving the site without its rules.
+500 and says why in its error log, rather than serving the site without its rules. Set
+`ServerTokens Prod` in the server configuration as well, which no `.htaccess` can: Ubuntu's
+default names Apache's version and the system in every answer's `Server` header, where with it
+the header says `Apache` alone, as the nginx settings' `server_tokens off` makes it `nginx`.
 
 **Response headers.** The same set is in `_headers`, `.htaccess` and `deploy/nginx.conf`, and
 `test/website.test.js` fails when one of them says something the others do not; `test/hosts.mjs`
@@ -302,10 +305,14 @@ the page draws nothing then either, but the browser logs the failed request, so 
   within ten minutes: the webhook can land after the visitor is back, and on Cloudflare KV a
   purchase can take up to a minute more to reach every location, so Buy used to be offered again
   there, and a second press opened a second Checkout that charged twice. Another tab, or a reload
-  after ten minutes with the purchase still not reported, offers Buy again: the API itself does
-  not yet refuse a second Checkout for a payment on its way. Checkout's return address carries
-  nothing to tell a real return from a copied one, so a signed-in visitor sent that link reads
-  "processing" (and nothing is bought); to anyone not signed in it says nothing and asks nothing.
+  after ten minutes with the purchase still not reported, offers Buy again, and the API answers
+  that press itself: it gives back the Checkout it already gave the visitor while that is open,
+  and once Stripe reports it paid refuses a new one until the webhook's record is there, so the
+  press asks `api/me` again rather than opening a second payment (two sign-ins of one account
+  pressing at once can still each open one: `server/kit/README.md`, Limits). Checkout's return
+  address carries nothing to tell a real return from a copied one, so a signed-in visitor sent
+  that link reads "processing" (and nothing is bought); to anyone not signed in it says nothing
+  and asks nothing.
 - **The service worker** answers nothing under `api/` and keeps none of it: the sign-in start and
   Google's redirect back are navigations in its scope, and it leaves them, like every API
   request, to the browser.

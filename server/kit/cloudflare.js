@@ -66,13 +66,13 @@ const FIXED = ['APP_URL', 'SESSION_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_S
 /**
  * The Pages Functions handler for an app's catalogue.
  * @param {unknown} catalogueInput
- * @returns {(context: { request: Request, env: Record<string, unknown> }) => Promise<Response>}
+ * @returns {(context: { request: Request, env: Record<string, unknown>, waitUntil?: (promise: Promise<unknown>) => void }) => Promise<Response>}
  */
 export function pagesHandler(catalogueInput) {
   const catalogue = validateCatalogue(catalogueInput);
   /** @type {KvNamespace | null} */
   let binding = null;
-  /** @type {{ fingerprint: string, handle: (request: Request) => Promise<Response> } | null} */
+  /** @type {{ fingerprint: string, handle: import('./app.js').App['handle'] } | null} */
   let current = null;
   const output = globalThis.console;
   return async (context) => {
@@ -91,6 +91,8 @@ export function pagesHandler(catalogueInput) {
       });
       current = { fingerprint, handle: app.handle };
     }
-    return current.handle(context.request);
+    // waitUntil lets a price lookup that GET config did not wait for finish after the answer.
+    const waitUntil = typeof context.waitUntil === 'function' ? context.waitUntil.bind(context) : undefined;
+    return current.handle(context.request, waitUntil ? { waitUntil } : undefined);
   };
 }

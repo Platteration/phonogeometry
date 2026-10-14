@@ -7,8 +7,10 @@
 // Google: an RSA key made with Web Crypto, its JWKS, an authorization step (`consent`) that turns
 // the authorize URL the kit sent the browser to into the callback URL Google would send it back
 // to, and a token endpoint that checks the code, the client and the PKCE verifier before it signs
-// an ID token for the nonce. Stripe: a Price, Checkout Sessions recorded as the kit created them,
-// and webhook events signed as Stripe signs them, with node:crypto rather than the kit's code.
+// an ID token for the nonce. Stripe: a Price, Checkout Sessions recorded as the kit created them
+// and looked up as Stripe answers (open until `paid` pays one, complete after), a request under an
+// Idempotency-Key answered before given that first answer, as Stripe gives it, and webhook events
+// signed as Stripe signs them, with node:crypto rather than the kit's code.
 import { createHash, createHmac } from 'node:crypto';
 
 export const CLIENT_ID = 'fake-client.apps.googleusercontent.com';
@@ -33,6 +35,9 @@ export function envFor(appUrl) {
   };
 }
 
+/** The PaymentIntent a paid Checkout Session `id` made, as its webhook and its lookup name it. */
+const paymentIntentOf = (id) => `pi_fake${id.replace(/[^0-9A-Za-z]/g, '')}`;
+
 const b64 = (data) => Buffer.from(typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data)).toString('base64url');
 
 /** A fake Google and a fake Stripe. `fetch` is what the kit is given; the rest is for the test
@@ -42,6 +47,8 @@ export async function createFakes() {
   const jwk = { ...(await crypto.subtle.exportKey('jwk', keys.publicKey)), kid: 'fake-key', alg: 'RS256', use: 'sig' };
   const codes = new Map();      // code -> { challenge, redirectUri, nonce, person }
   const sessions = new Map();   // Checkout Session id -> the form the kit posted
+  const complete = new Set();   // the Checkout Sessions paid, which Stripe reports complete
+  const answered = new Map();   // Idempotency-Key -> the session first made under it
   const unexpected = [];
   const calls = [];
   let seq = 0;
@@ -77,10 +84,24 @@ export async function createFakes() {
       return Response.json({ id: PRICE, object: 'price', active: true, currency: 'eur', unit_amount: 400, recurring: null, type: 'one_time' });
     }
     if (method === 'POST' && path === '/checkout/sessions') {
+      const key = headers.get('idempotency-key');
+      if (key && answered.has(key)) return Response.json(answered.get(key));
       seq += 1;
       const id = `cs_test_fake${seq}`;
       sessions.set(id, new URLSearchParams(body));
-      return Response.json({ id, object: 'checkout.session', url: `https://checkout.stripe.com/c/pay/${id}` });
+      const made = { id, object: 'checkout.session', url: `https://checkout.stripe.com/c/pay/${id}` };
+      if (key) answered.set(key, made);
+      return Response.json(made);
+    }
+    const lookup = method === 'GET' ? /^\/checkout\/sessions\/([^/]+)$/.exec(path) : null;
+    if (lookup) {
+      const id = decodeURIComponent(lookup[1]);
+      if (!sessions.has(id)) return Response.json({ error: { type: 'invalid_request_error', code: 'resource_missing', message: 'No such checkout.session' } }, { status: 404 });
+      const done = complete.has(id);
+      return Response.json({
+        id, object: 'checkout.session', mode: sessions.get(id).get('mode'), status: done ? 'complete' : 'open',
+        url: done ? null : `https://checkout.stripe.com/c/pay/${id}`, payment_intent: done ? paymentIntentOf(id) : null, subscription: null,
+      });
     }
     unexpected.push(`${method} stripe ${path}`);
     return Response.json({ error: { message: 'unknown endpoint' } }, { status: 404 });
@@ -127,12 +148,14 @@ export async function createFakes() {
       back.searchParams.set('state', params.get('state') ?? '');
       return back;
     },
-    /** The `checkout.session.completed` event Stripe sends once the session `checkoutUrl` names is
-     *  paid, built from what the kit asked for when it created that session. */
+    /** Pays the session `checkoutUrl` names, which Stripe then reports complete, and returns the
+     *  `checkout.session.completed` event Stripe sends for it, built from what the kit asked for
+     *  when it created that session. */
     paid(checkoutUrl) {
       const id = new URL(checkoutUrl).pathname.split('/').pop() ?? '';
       const asked = sessions.get(id);
       if (!asked) throw new Error(`no Checkout Session ${id}`);
+      complete.add(id);
       return {
         id: `evt_fake${id.replace(/[^0-9A-Za-z]/g, '')}`,
         object: 'event',
@@ -147,7 +170,7 @@ export async function createFakes() {
             payment_status: 'paid',
             client_reference_id: asked.get('client_reference_id'),
             metadata: { app: asked.get('metadata[app]'), user: asked.get('metadata[user]'), product: asked.get('metadata[product]') },
-            payment_intent: `pi_fake${id.replace(/[^0-9A-Za-z]/g, '')}`,
+            payment_intent: paymentIntentOf(id),
             customer: 'cus_fake1',
           },
         },
