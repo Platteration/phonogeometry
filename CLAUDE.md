@@ -316,8 +316,9 @@ of thanks in About. The specification is the kit's README (`server/kit/README.md
   change nothing here; a visitor still signed in from before gets the section, to sign out or
   delete the account. Where it is on, Settings shows the Account section and the product, About's
   privacy sentence is swapped for the one that says what an account sends where (the email kept
-  while signed in, the account id Stripe is told with a payment: `test/api.test.js` holds the kit
-  to both), and a supporter reads the thank-you. Everything from the server is read field by
+  while signed in, the account id Stripe is told with a payment, the Checkout last given kept 30
+  days and deleted with the account: `test/api.test.js` holds the kit to all three), and a
+  supporter reads the thank-you. Everything from the server is read field by
   field and drawn with `createElement` and `textContent`; Buy follows only a
   `https://checkout.stripe.com/` address; Delete account is confirmed with `window.confirm` (the
   app's confirm), saying the support goes with it.

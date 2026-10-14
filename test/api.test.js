@@ -306,6 +306,15 @@ describe('a host of its own: server/start.mjs through the Node adapter', () => {
     const owned = await buy();
     assert.equal(owned.status, 409);
     assert.deepEqual(await owned.json(), { error: 'already_owned' });
+    // What About and the README say of it: the site keeps the Checkout it last gave the visitor
+    // for 30 days, and Delete account takes it with the rest.
+    const kept = fs.readdirSync(dataDir).filter((name) => name.endsWith('.json'))
+      .map((name) => JSON.parse(fs.readFileSync(path.join(dataDir, name), 'utf8'))).filter((entry) => JSON.stringify(entry.value).includes(url));
+    assert.deepEqual(kept.map((entry) => entry.key), ['phonogeometry:test:checkout:google:3003:supporter']);
+    const days = (kept[0].expires - Date.now()) / 86_400_000;
+    assert.ok(days > 29.9 && days <= 30, `the Checkout is kept ${days} days`);
+    assert.equal((await visitor.send('DELETE', 'api/me')).status, 204);
+    assert.deepEqual(recordsWith(url), [], 'Delete account takes the Checkout it remembered with it');
     assert.deepEqual(fakes.unexpected, []);
   });
 

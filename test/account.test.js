@@ -588,5 +588,5 @@ test('the page holds the Account section and About\'s account lines hidden until
   assert.match(html, /<p id="about-thanks" class="tip" hidden>Thank you for supporting Phonogeometry\.<\/p>/);
   const account = html.match(/<p id="about-privacy-account"[^>]*>([^<]*)<\/p>/)[1];
   assert.match(account, /nothing else leaves it unless you sign in or buy/);
-  assert.match(account, /Google tells this site an account id and your email, Stripe handles the payment and is told that account id with it, and the site keeps the account id, your email while you are signed in, what was bought and Stripe's customer id\.$/);
+  assert.match(account, /Google tells this site an account id and your email, Stripe handles the payment and is told that account id with it, and the site keeps the account id, your email while you are signed in, what was bought, Stripe's customer id and, for 30 days, the Checkout it last sent you to\.$/);
 });

@@ -292,9 +292,11 @@ the page draws nothing then either, but the browser logs the failed request, so 
   visit to Stripe's Checkout, which handles the payment and is told that account id with it
   (the site sends it with every Checkout, so each payment can be traced to the account that
   made it). The site keeps the account id, the email while the visitor is signed in (to say
-  "Signed in as …"; signing out removes it), what was bought and Stripe's customer id, and
-  Delete account removes them all; the payment itself stays with Stripe, with the account id it
-  was made under. The photographs, shots and meshes never leave the device either way.
+  "Signed in as …"; signing out removes it), what was bought, Stripe's customer id and, for 30
+  days, the Checkout it last sent the visitor to for the product (so that a second Buy is given
+  that one rather than a second payment), and Delete account removes them all; the payment
+  itself stays with Stripe, with the account id it was made under. The photographs, shots and
+  meshes never leave the device either way.
 - **What grants a purchase**: Stripe's signed webhook, and nothing the page says. The thank-you
   line is drawn from `api/me`; a visitor who edits the page can show it to themselves without
   paying, and since it unlocks nothing, there is nothing for that to take.
